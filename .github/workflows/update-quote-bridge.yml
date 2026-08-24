@@ -1,0 +1,149 @@
+name: Update A-H quote bridge
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Beijing 08:55 — pre-open snapshot
+    - cron: "55 0 * * 1-5"
+    # Beijing 09:40/43/46/49, 10:40/43/46/49, 11:40/43/46/49,
+    # 13:40/43/46/49, 14:40/43/46/49 — cover Core/Growth task windows
+    - cron: "40,43,46,49 1,2,3,5,6 * * 1-5"
+    # Beijing 15:25/15:30 — A-share close review preparation
+    - cron: "25,30 7 * * 1-5"
+    # Beijing 15:55 / 16:05 — HK close-side snapshots
+    - cron: "55 7 * * 1-5"
+    - cron: "5 8 * * 1-5"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: a-h-quote-bridge
+  cancel-in-progress: true
+
+jobs:
+  update-bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Fetch quotes and update bridge issue
+        uses: actions/github-script@v7
+        env:
+          SOURCE_URL: https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes
+          ISSUE_NUMBER: "1"
+        with:
+          script: |
+            const source = process.env.SOURCE_URL;
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const now = new Date().toISOString();
+
+            const { owner, repo } = context.repo;
+            const current = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: issueNumber,
+            });
+
+            let previousSnapshot = null;
+            let previousLastSuccess = null;
+            const oldBody = current.data.body || "";
+            const match = oldBody.match(/```json\s*([\s\S]*?)\s*```/i);
+            if (match) {
+              try {
+                const oldPayload = JSON.parse(match[1]);
+                previousSnapshot = oldPayload.snapshot ?? null;
+                previousLastSuccess = oldPayload.bridge?.last_success_at ?? null;
+              } catch (_) {}
+            }
+
+            let payload;
+            let fetchError = null;
+
+            try {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 15000);
+              const sep = source.includes("?") ? "&" : "?";
+              const response = await fetch(`${source}${sep}_bridge_ts=${Date.now()}`, {
+                method: "GET",
+                headers: {
+                  Accept: "application/json",
+                  "Cache-Control": "no-cache",
+                  "User-Agent": "cn-hk-quotes-github-bridge/1.0",
+                },
+                signal: controller.signal,
+              });
+              clearTimeout(timer);
+
+              const raw = await response.text();
+              if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${raw.slice(0, 500)}`);
+              }
+
+              const snapshot = JSON.parse(raw);
+              if (!snapshot || typeof snapshot !== "object") {
+                throw new Error("upstream returned non-object JSON");
+              }
+              if (!snapshot.snapshot_time || !snapshot.system_quality || !snapshot.summary || !Array.isArray(snapshot.stocks)) {
+                throw new Error("upstream JSON missing required fields: snapshot_time/system_quality/summary/stocks");
+              }
+              if (snapshot.summary.total !== snapshot.stocks.length) {
+                throw new Error(`summary.total=${snapshot.summary.total} but stocks.length=${snapshot.stocks.length}`);
+              }
+
+              payload = {
+                schema_version: "1.0",
+                bridge: {
+                  last_attempt_at: now,
+                  last_attempt_status: "SUCCESS",
+                  last_success_at: now,
+                  workflow_run_id: String(context.runId),
+                  workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"),
+                  source,
+                  error: null,
+                },
+                snapshot,
+              };
+            } catch (error) {
+              fetchError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+              payload = {
+                schema_version: "1.0",
+                bridge: {
+                  last_attempt_at: now,
+                  last_attempt_status: "FAIL",
+                  last_success_at: previousLastSuccess,
+                  workflow_run_id: String(context.runId),
+                  workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"),
+                  source,
+                  error: fetchError,
+                },
+                snapshot: previousSnapshot,
+              };
+            }
+
+            const body = [
+              "# A/H 行情计划任务数据桥",
+              "",
+              "> 机器数据。由 GitHub Actions 自动刷新，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。请勿手工编辑 JSON 区域。",
+              "",
+              "```json",
+              JSON.stringify(payload, null, 2),
+              "```",
+            ].join("\n");
+
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body,
+            });
+
+            core.info(`bridge_status=${payload.bridge.last_attempt_status}`);
+            core.info(`snapshot_time=${payload.snapshot?.snapshot_time ?? "null"}`);
+            core.info(`system_quality=${payload.snapshot?.system_quality ?? "null"}`);
+            core.info(`total=${payload.snapshot?.summary?.total ?? "null"}`);
+            core.info(`usable=${payload.snapshot?.summary?.usable ?? "null"}`);
+
+            if (fetchError) {
+              core.setFailed(fetchError);
+            }
