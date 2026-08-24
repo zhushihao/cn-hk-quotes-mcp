@@ -2,6 +2,10 @@ name: Update A-H quote bridge
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/update-quote-bridge.yml"
   schedule:
     # Beijing 08:55 — pre-open snapshot
     - cron: "55 0 * * 1-5"
