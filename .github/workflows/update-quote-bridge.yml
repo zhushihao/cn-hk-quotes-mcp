@@ -2,21 +2,6 @@ name: Update A-H quote bridge
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/update-quote-bridge.yml"
-  schedule:
-    # Beijing 08:55 — pre-open snapshot
-    - cron: "55 0 * * 1-5"
-    # Beijing 09:39/44/49, 10:39/44/49, 11:39/44/49,
-    # 13:39/44/49, 14:39/44/49 — 5-minute cadence, covering Core/Growth task windows
-    - cron: "39,44,49 1,2,3,5,6 * * 1-5"
-    # Beijing 15:24/15:29 — A-share close review preparation
-    - cron: "24,29 7 * * 1-5"
-    # Beijing 15:54/15:59/16:04/16:09 — HK close-side snapshots
-    - cron: "54,59 7 * * 1-5"
-    - cron: "4,9 8 * * 1-5"
 
 permissions:
   contents: read
@@ -128,7 +113,7 @@ jobs:
             const body = [
               "# A/H 行情计划任务数据桥",
               "",
-              "> 机器数据。由 GitHub Actions 自动刷新，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。请勿手工编辑 JSON 区域。",
+              "> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。请勿手工编辑 JSON 区域。",
               "",
               "```json",
               JSON.stringify(payload, null, 2),

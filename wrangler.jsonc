@@ -8,9 +8,18 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-07-02",
 	"compatibility_flags": [
-  	"nodejs_compat",
-  	"global_fetch_strictly_public"
+	  "nodejs_compat",
+	  "global_fetch_strictly_public"
 	],
+	"triggers": {
+		"crons": [
+			"55 0 * * 1-5",
+			"39,44,49 1,2,3,5,6 * * 1-5",
+			"24,29 7 * * 1-5",
+			"54,59 7 * * 1-5",
+			"4,9 8 * * 1-5",
+		],
+	},
 	"observability": {
 		"enabled": true,
 	},
