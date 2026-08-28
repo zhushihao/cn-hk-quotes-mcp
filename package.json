@@ -8,6 +8,8 @@
 		"format": "oxfmt --write .",
 		"lint:fix": "oxlint --fix",
 		"start": "wrangler dev",
+		"test": "node --experimental-strip-types --test",
+		"test:coverage": "node --experimental-strip-types --test --experimental-test-coverage",
 		"cf-typegen": "wrangler types",
 		"type-check": "tsc --noEmit"
 	},

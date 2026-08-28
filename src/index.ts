@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
+import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
 
 const PORTFOLIO_QUOTES_URL =
 	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
@@ -13,17 +14,6 @@ const GITHUB_API_VERSION = "2022-11-28";
 interface Env {
 	GITHUB_TOKEN: string;
 }
-
-type QuoteSnapshot = {
-	snapshot_time: string;
-	system_quality: string;
-	summary: {
-		total: number;
-		[key: string]: unknown;
-	};
-	stocks: unknown[];
-	[key: string]: unknown;
-};
 
 type BridgePayload = {
 	schema_version: "1.0";
@@ -91,37 +81,11 @@ function parsePreviousBridge(body: string | null | undefined): {
 	}
 }
 
-function validateSnapshot(value: unknown): asserts value is QuoteSnapshot {
-	if (!value || typeof value !== "object") {
-		throw new Error("upstream returned non-object JSON");
-	}
-
-	const snapshot = value as Partial<QuoteSnapshot>;
-	if (
-		typeof snapshot.snapshot_time !== "string" ||
-		typeof snapshot.system_quality !== "string" ||
-		!snapshot.summary ||
-		typeof snapshot.summary !== "object" ||
-		typeof snapshot.summary.total !== "number" ||
-		!Array.isArray(snapshot.stocks)
-	) {
-		throw new Error(
-			"upstream JSON missing required fields: snapshot_time/system_quality/summary.total/stocks",
-		);
-	}
-
-	if (snapshot.summary.total !== snapshot.stocks.length) {
-		throw new Error(
-			`summary.total=${snapshot.summary.total} but stocks.length=${snapshot.stocks.length}`,
-		);
-	}
-}
-
 function createIssueBody(payload: BridgePayload): string {
 	return [
 		"# A/H 行情计划任务数据桥",
 		"",
-		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。请勿手工编辑 JSON 区域。",
+		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照包含 Core、Growth、Watch 全量标的；请勿手工编辑 JSON 区域。",
 		"",
 		"```json",
 		JSON.stringify(payload, null, 2),
@@ -234,8 +198,14 @@ async function fetchUpstreamSnapshot(
 				source_url: source,
 			});
 			validateSnapshot(snapshot);
+			const counts = getSnapshotCounts(snapshot);
 			logBridgeStage(context, "payload_validation_success", {
-				stock_count: snapshot.stocks.length,
+				stock_count: counts.total,
+				active_quote_count: counts.activeQuoteTotal,
+				active_holding_count: counts.activeHoldingTotal,
+				watch_count: counts.watchTotal,
+				core_count: counts.coreTotal,
+				growth_count: counts.growthTotal,
 			});
 			return { snapshot, source };
 		} catch (error) {
@@ -432,76 +402,26 @@ function createServer() {
 		"get_portfolio_quotes",
 		{
 			description:
-				"获取当前 Core 和 Growth 投资组合的 A 股和港股结构化行情快照。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态等。仅用于只读行情查询。",
+				"获取 Site 返回的全部 Core、Growth 和 Watch 标的结构化行情快照。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组和持仓状态等。仅用于只读行情查询。",
 			inputSchema: z.object({}),
 		},
 		async () => {
-			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), 10000);
-
+			const context = bridgeContext("mcp:get_portfolio_quotes");
 			try {
-				const response = await fetch(PORTFOLIO_QUOTES_URL, {
-					method: "GET",
-					headers: {
-						Accept: "application/json",
-					},
-					signal: controller.signal,
-				});
-
-				const raw = await response.text();
-
-				if (!response.ok) {
-					return {
-						isError: true,
-						content: [
-							{
-								type: "text",
-								text: JSON.stringify(
-									{
-										error: "UPSTREAM_HTTP_ERROR",
-										status: response.status,
-										body: raw,
-									},
-									null,
-									2,
-								),
-							},
-						],
-					};
-				}
-
-				let data: unknown;
-
-				try {
-					data = JSON.parse(raw);
-				} catch {
-					return {
-						isError: true,
-						content: [
-							{
-								type: "text",
-								text: JSON.stringify(
-									{
-										error: "UPSTREAM_INVALID_JSON",
-										body: raw,
-									},
-									null,
-									2,
-								),
-							},
-						],
-					};
-				}
-
+				const upstream = await fetchUpstreamSnapshot(
+					[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+					context,
+				);
 				return {
 					content: [
 						{
 							type: "text",
-							text: JSON.stringify(data, null, 2),
+							text: JSON.stringify(upstream.snapshot, null, 2),
 						},
 					],
 				};
 			} catch (error) {
+				logBridgeFailure(context, error, "upstream_fetch");
 				return {
 					isError: true,
 					content: [
@@ -510,7 +430,7 @@ function createServer() {
 							text: JSON.stringify(
 								{
 									error: "UPSTREAM_FETCH_ERROR",
-									message: error instanceof Error ? error.message : String(error),
+									message: safeErrorMessage(error),
 								},
 								null,
 								2,
@@ -518,8 +438,6 @@ function createServer() {
 						},
 					],
 				};
-			} finally {
-				clearTimeout(timeout);
 			}
 		},
 	);
