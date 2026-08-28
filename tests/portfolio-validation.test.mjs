@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+	getActiveQuoteCodes,
 	getSnapshotCounts,
 	validateSnapshot,
 } from "../src/portfolio-validation.ts";
@@ -77,6 +78,10 @@ test("accepts a full snapshot and derives separate active/watch counts", () => {
 	const snapshot = makeSnapshot([...activeStocks, ...watchStocks]);
 
 	assert.doesNotThrow(() => validateSnapshot(snapshot));
+	assert.deepEqual(
+		getActiveQuoteCodes(snapshot),
+		activeStocks.map((stock) => stock.code),
+	);
 	assert.deepEqual(getSnapshotCounts(snapshot), {
 		total: 15,
 		activeQuoteTotal: 10,
@@ -89,22 +94,32 @@ test("accepts a full snapshot and derives separate active/watch counts", () => {
 });
 
 test("rejects a legacy active-only snapshot when Watch coverage is required", () => {
-	assert.throws(
-		() => validateSnapshot(makeSnapshot(activeStocks)),
-		/Watch/i,
-	);
+	assert.throws(() => validateSnapshot(makeSnapshot(activeStocks)), /Watch/i);
 });
 
 test("rejects snapshots whose active quote count is not ten", () => {
-	const snapshot = makeSnapshot([
-		...activeStocks.slice(0, -1),
-		...watchStocks,
-	]);
+	const snapshot = makeSnapshot([...activeStocks.slice(0, -1), ...watchStocks]);
 
-	assert.throws(
-		() => validateSnapshot(snapshot),
-		/active.*10|10.*active/i,
-	);
+	assert.throws(() => validateSnapshot(snapshot), /active.*10|10.*active/i);
+});
+
+test("rejects a ten-record active set when one code is substituted", () => {
+	const substituted = [
+		...activeStocks.slice(0, -1),
+		makeStock("999999", "Growth", "ACTIVE"),
+		...watchStocks,
+	];
+
+	assert.throws(() => validateSnapshot(makeSnapshot(substituted)), /active quote set|unexpected active/i);
+});
+
+test("requires every baseline Watch code to remain present", () => {
+	const missingWatch = [
+		...activeStocks,
+		...watchStocks.filter((stock) => stock.code !== "600096"),
+	];
+
+	assert.throws(() => validateSnapshot(makeSnapshot(missingWatch)), /required Watch|600096/i);
 });
 
 test("rejects inconsistent group and holding status combinations", () => {
@@ -137,6 +152,7 @@ test("rejects summary totals that do not equal the returned stock array", () => 
 test("checks optional derived summary fields when the Site provides them", () => {
 	const valid = makeSnapshot([...activeStocks, ...watchStocks], {
 		active_quote_total: 10,
+		active_holding_total: 9,
 		watch_total: 5,
 		core_total: 5,
 		growth_total: 5,
@@ -147,4 +163,27 @@ test("checks optional derived summary fields when the Site provides them", () =>
 		active_quote_total: 9,
 	});
 	assert.throws(() => validateSnapshot(invalid), /active_quote_total/i);
+});
+
+test("keeps a Watch source failure as a valid, explicitly degraded record", () => {
+	const failedWatch = makeStock("601872", "Watch", "WATCH", {
+		price: null,
+		pre_close: null,
+		open: null,
+		high: null,
+		low: null,
+		pct_change: null,
+		volume: null,
+		amount: null,
+		market_data_time: null,
+		source_update_time: null,
+		age_seconds: null,
+		source_status: "FAILED",
+		quality: "UNAVAILABLE",
+		source_errors: { tencent: "timeout" },
+	});
+
+	assert.doesNotThrow(() =>
+		validateSnapshot(makeSnapshot([...activeStocks, failedWatch, ...watchStocks.slice(1)])),
+	);
 });

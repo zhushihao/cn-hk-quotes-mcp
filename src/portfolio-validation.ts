@@ -39,12 +39,32 @@ export type SnapshotValidationOptions = {
 	requireWatch?: boolean;
 };
 
+// The active quote set is intentionally explicit: the H-share mapping counts
+// as an active quote record, while the five baseline Watch records must remain
+// queryable without being counted as active.
+export const EXPECTED_ACTIVE_QUOTE_CODES = [
+	"300308",
+	"03308",
+	"300502",
+	"300394",
+	"688676",
+	"605376",
+	"301183",
+	"300433",
+	"688596",
+	"588170",
+] as const;
+
+export const REQUIRED_WATCH_CODES = [
+	"601872",
+	"09988",
+	"02228",
+	"603893",
+	"600096",
+] as const;
+
 const GROUPS = new Set<QuoteGroup>(["Core", "Growth", "Watch"]);
-const HOLDING_STATUSES = new Set<HoldingStatus>([
-	"ACTIVE",
-	"MAPPING_ONLY",
-	"WATCH",
-]);
+const HOLDING_STATUSES = new Set<HoldingStatus>(["ACTIVE", "MAPPING_ONLY", "WATCH"]);
 
 const REQUIRED_STOCK_FIELDS = [
 	"code",
@@ -74,6 +94,7 @@ const REQUIRED_STOCK_FIELDS = [
 
 const DERIVED_SUMMARY_FIELDS: Array<keyof SnapshotCounts | string> = [
 	"active_quote_total",
+	"active_holding_total",
 	"watch_total",
 	"core_total",
 	"growth_total",
@@ -87,11 +108,7 @@ function isFiniteNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value);
 }
 
-function requireString(
-	record: Record<string, unknown>,
-	field: string,
-	context: string,
-): string {
+function requireString(record: Record<string, unknown>, field: string, context: string): string {
 	const value = record[field];
 	if (typeof value !== "string" || value.length === 0) {
 		throw new Error(`${context}.${field} must be a non-empty string`);
@@ -111,9 +128,9 @@ function validateStock(value: unknown, index: number): QuoteStock {
 		}
 	}
 
-	const code = requireString(value, "code", context);
-	const market = requireString(value, "market", context);
-	const name = requireString(value, "name", context);
+	requireString(value, "code", context);
+	requireString(value, "market", context);
+	requireString(value, "name", context);
 	const group = value.group;
 	const holdingStatus = value.holding_status;
 	if (typeof group !== "string" || !GROUPS.has(group as QuoteGroup)) {
@@ -123,9 +140,7 @@ function validateStock(value: unknown, index: number): QuoteStock {
 		typeof holdingStatus !== "string" ||
 		!HOLDING_STATUSES.has(holdingStatus as HoldingStatus)
 	) {
-		throw new Error(
-			`${context}.holding_status must be ACTIVE, MAPPING_ONLY, or WATCH`,
-		);
+		throw new Error(`${context}.holding_status must be ACTIVE, MAPPING_ONLY, or WATCH`);
 	}
 
 	const normalizedGroup = group as QuoteGroup;
@@ -141,18 +156,14 @@ function validateStock(value: unknown, index: number): QuoteStock {
 			);
 		}
 	} else if (mappingTo !== null) {
-		throw new Error(
-			`${context}.mapping_to is only allowed for MAPPING_ONLY records`,
-		);
+		throw new Error(`${context}.mapping_to is only allowed for MAPPING_ONLY records`);
 	}
 
 	if (normalizedGroup === "Watch" && normalizedStatus !== "WATCH") {
 		throw new Error(`${context}.Watch records must use holding_status WATCH`);
 	}
 	if (normalizedGroup !== "Watch" && normalizedStatus === "WATCH") {
-		throw new Error(
-			`${context}.Core/Growth records cannot use holding_status WATCH`,
-		);
+		throw new Error(`${context}.Core/Growth records cannot use holding_status WATCH`);
 	}
 
 	const numericFields = [
@@ -174,12 +185,7 @@ function validateStock(value: unknown, index: number): QuoteStock {
 		}
 	}
 
-	for (const field of [
-		"market_status",
-		"freshness_basis",
-		"source_status",
-		"quality",
-	] as const) {
+	for (const field of ["market_status", "freshness_basis", "source_status", "quality"] as const) {
 		requireString(value, field, context);
 	}
 
@@ -217,8 +223,7 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 		}
 		if (
 			(stock.group === "Core" || stock.group === "Growth") &&
-			(stock.holding_status === "ACTIVE" ||
-				stock.holding_status === "MAPPING_ONLY")
+			(stock.holding_status === "ACTIVE" || stock.holding_status === "MAPPING_ONLY")
 		) {
 			activeQuoteTotal += 1;
 			if (stock.holding_status === "ACTIVE") {
@@ -236,6 +241,16 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 		growthTotal,
 		mappingOnlyTotal,
 	};
+}
+
+export function getActiveQuoteCodes(snapshot: QuoteSnapshot): string[] {
+	return snapshot.stocks
+		.filter(
+			(stock) =>
+				(stock.group === "Core" || stock.group === "Growth") &&
+				(stock.holding_status === "ACTIVE" || stock.holding_status === "MAPPING_ONLY"),
+		)
+		.map((stock) => stock.code);
 }
 
 export function validateSnapshot(
@@ -281,14 +296,32 @@ export function validateSnapshot(
 		codes.add(stock.code);
 	}
 
-	const validatedSnapshot = value as unknown as QuoteSnapshot;
-	validatedSnapshot.stocks = stocks;
+	const validatedSnapshot = { ...value, stocks } as unknown as QuoteSnapshot;
 	const counts = getSnapshotCounts(validatedSnapshot);
 	const expectedActiveQuoteTotal = options.expectedActiveQuoteTotal ?? 10;
 	if (counts.activeQuoteTotal !== expectedActiveQuoteTotal) {
 		throw new Error(
 			`active quote count must be ${expectedActiveQuoteTotal}, got ${counts.activeQuoteTotal}`,
 		);
+	}
+	const activeCodes = getActiveQuoteCodes(validatedSnapshot);
+	const expectedActiveCodes = new Set<string>(EXPECTED_ACTIVE_QUOTE_CODES);
+	const actualActiveCodes = new Set(activeCodes);
+	for (const code of EXPECTED_ACTIVE_QUOTE_CODES) {
+		if (!actualActiveCodes.has(code)) {
+			throw new Error(`active quote set is missing ${code}`);
+		}
+	}
+	for (const code of activeCodes) {
+		if (!expectedActiveCodes.has(code)) {
+			throw new Error(`unexpected active quote code: ${code}`);
+		}
+	}
+	for (const code of REQUIRED_WATCH_CODES) {
+		const stock = stocks.find((candidate) => candidate.code === code);
+		if (!stock || stock.group !== "Watch" || stock.holding_status !== "WATCH") {
+			throw new Error(`required Watch record is missing or misclassified: ${code}`);
+		}
 	}
 	if ((options.requireWatch ?? true) && counts.watchTotal === 0) {
 		throw new Error("snapshot must include at least one Watch record");
@@ -297,6 +330,7 @@ export function validateSnapshot(
 	const summary = value.summary;
 	const derivedSummaryValues: Record<string, number> = {
 		active_quote_total: counts.activeQuoteTotal,
+		active_holding_total: counts.activeHoldingTotal,
 		watch_total: counts.watchTotal,
 		core_total: counts.coreTotal,
 		growth_total: counts.growthTotal,

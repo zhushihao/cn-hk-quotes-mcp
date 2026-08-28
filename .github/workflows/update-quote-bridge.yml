@@ -20,10 +20,14 @@ jobs:
         uses: actions/github-script@v7
         env:
           SOURCE_URL: https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes
+          FALLBACK_SOURCE_URL: https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes
           ISSUE_NUMBER: "1"
         with:
           script: |
-            const source = process.env.SOURCE_URL;
+            const sources = [
+              process.env.SOURCE_URL,
+              process.env.FALLBACK_SOURCE_URL,
+            ].filter(Boolean);
             const issueNumber = Number(process.env.ISSUE_NUMBER);
             const now = new Date().toISOString();
 
@@ -37,7 +41,8 @@ jobs:
             let previousSnapshot = null;
             let previousLastSuccess = null;
             const oldBody = current.data.body || "";
-            const match = oldBody.match(/```json\s*([\s\S]*?)\s*```/i);
+            const fence = String.fromCharCode(96).repeat(3);
+            const match = oldBody.match(new RegExp(fence + "json\\s*([\\s\\S]*?)\\s*" + fence, "i"));
             if (match) {
               try {
                 const oldPayload = JSON.parse(match[1]);
@@ -46,55 +51,334 @@ jobs:
               } catch (_) {}
             }
 
-            let payload;
-            let fetchError = null;
+            const requiredStockFields = [
+              "code",
+              "market",
+              "name",
+              "group",
+              "holding_status",
+              "mapping_to",
+              "price",
+              "pre_close",
+              "open",
+              "high",
+              "low",
+              "pct_change",
+              "volume",
+              "amount",
+              "market_status",
+              "market_data_time",
+              "source_update_time",
+              "freshness_basis",
+              "quote_time",
+              "fetch_time",
+              "age_seconds",
+              "source_status",
+              "quality",
+            ];
+            const numericStockFields = [
+              "price",
+              "pre_close",
+              "open",
+              "high",
+              "low",
+              "pct_change",
+              "volume",
+              "amount",
+              "age_seconds",
+            ];
+            const expectedActiveCodes = new Set([
+              "300308",
+              "03308",
+              "300502",
+              "300394",
+              "688676",
+              "605376",
+              "301183",
+              "300433",
+              "688596",
+              "588170",
+            ]);
+            const requiredWatchCodes = [
+              "601872",
+              "09988",
+              "02228",
+              "603893",
+              "600096",
+            ];
 
-            try {
-              const controller = new AbortController();
-              const timer = setTimeout(() => controller.abort(), 15000);
-              const sep = source.includes("?") ? "&" : "?";
-              const response = await fetch(`${source}${sep}_bridge_ts=${Date.now()}`, {
-                method: "GET",
-                headers: {
-                  Accept: "application/json",
-                  "Cache-Control": "no-cache",
-                  "User-Agent": "cn-hk-quotes-github-bridge/1.0",
-                },
-                signal: controller.signal,
-              });
-              clearTimeout(timer);
-
-              const raw = await response.text();
-              if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${raw.slice(0, 500)}`);
-              }
-
-              const snapshot = JSON.parse(raw);
-              if (!snapshot || typeof snapshot !== "object") {
+            function validateSnapshot(snapshot) {
+              if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
                 throw new Error("upstream returned non-object JSON");
               }
-              if (!snapshot.snapshot_time || !snapshot.system_quality || !snapshot.summary || !Array.isArray(snapshot.stocks)) {
-                throw new Error("upstream JSON missing required fields: snapshot_time/system_quality/summary/stocks");
+              if (
+                typeof snapshot.snapshot_time !== "string" ||
+                typeof snapshot.system_quality !== "string" ||
+                !snapshot.summary ||
+                typeof snapshot.summary !== "object" ||
+                !Number.isInteger(snapshot.summary.total) ||
+                snapshot.summary.total < 0 ||
+                !Array.isArray(snapshot.stocks)
+              ) {
+                throw new Error("upstream JSON missing or invalid snapshot fields");
               }
               if (snapshot.summary.total !== snapshot.stocks.length) {
-                throw new Error(`summary.total=${snapshot.summary.total} but stocks.length=${snapshot.stocks.length}`);
+                throw new Error(
+                  "summary.total=" + snapshot.summary.total +
+                    " but stocks.length=" + snapshot.stocks.length,
+                );
               }
 
-              payload = {
-                schema_version: "1.0",
-                bridge: {
-                  last_attempt_at: now,
-                  last_attempt_status: "SUCCESS",
-                  last_success_at: now,
-                  workflow_run_id: String(context.runId),
-                  workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"),
-                  source,
-                  error: null,
-                },
-                snapshot,
+              const codes = new Set();
+              let activeQuoteTotal = 0;
+              let activeHoldingTotal = 0;
+              let watchTotal = 0;
+              let coreTotal = 0;
+              let growthTotal = 0;
+              for (const [index, stock] of snapshot.stocks.entries()) {
+                if (!stock || typeof stock !== "object" || Array.isArray(stock)) {
+                  throw new Error("stocks[" + index + "] must be an object");
+                }
+                for (const field of requiredStockFields) {
+                  if (!Object.prototype.hasOwnProperty.call(stock, field)) {
+                    throw new Error("stocks[" + index + "]." + field + " is required");
+                  }
+                }
+                if (typeof stock.code !== "string" || !stock.code) {
+                  throw new Error("stocks[" + index + "].code must be a non-empty string");
+                }
+                if (codes.has(stock.code)) {
+                  throw new Error("duplicate stock code: " + stock.code);
+                }
+                codes.add(stock.code);
+                if (!["Core", "Growth", "Watch"].includes(stock.group)) {
+                  throw new Error("stocks[" + index + "].group is invalid");
+                }
+                if (!["ACTIVE", "MAPPING_ONLY", "WATCH"].includes(stock.holding_status)) {
+                  throw new Error("stocks[" + index + "].holding_status is invalid");
+                }
+                if (stock.mapping_to !== null && typeof stock.mapping_to !== "string") {
+                  throw new Error("stocks[" + index + "].mapping_to must be a string or null");
+                }
+                if (
+                  stock.holding_status === "MAPPING_ONLY" &&
+                  (stock.group === "Watch" || !stock.mapping_to)
+                ) {
+                  throw new Error("stocks[" + index + "] MAPPING_ONLY mapping_to is invalid");
+                }
+                if (
+                  stock.holding_status !== "MAPPING_ONLY" &&
+                  stock.mapping_to !== null
+                ) {
+                  throw new Error(
+                    "stocks[" + index + "].mapping_to is only allowed for MAPPING_ONLY",
+                  );
+                }
+                if (stock.group === "Watch" && stock.holding_status !== "WATCH") {
+                  throw new Error("stocks[" + index + "] Watch status is invalid");
+                }
+                if (stock.group !== "Watch" && stock.holding_status === "WATCH") {
+                  throw new Error("stocks[" + index + "] Core/Growth status is invalid");
+                }
+
+                for (const field of numericStockFields) {
+                  const fieldValue = stock[field];
+                  const nullableWatchField =
+                    stock.holding_status === "WATCH" && fieldValue === null;
+                  if (!Number.isFinite(fieldValue) && !nullableWatchField) {
+                    throw new Error(
+                      "stocks[" + index + "]." + field + " must be numeric or null for Watch",
+                    );
+                  }
+                }
+                for (const field of [
+                  "market_status",
+                  "freshness_basis",
+                  "source_status",
+                  "quality",
+                ]) {
+                  if (typeof stock[field] !== "string" || !stock[field]) {
+                    throw new Error(
+                      "stocks[" + index + "]." + field + " must be a non-empty string",
+                    );
+                  }
+                }
+                for (const field of [
+                  "market_data_time",
+                  "quote_time",
+                  "source_update_time",
+                ]) {
+                  if (stock[field] !== null && typeof stock[field] !== "string") {
+                    throw new Error(
+                      "stocks[" + index + "]." + field + " must be a string or null",
+                    );
+                  }
+                }
+                if (typeof stock.fetch_time !== "string" || !stock.fetch_time) {
+                  throw new Error(
+                    "stocks[" + index + "].fetch_time must be a non-empty string",
+                  );
+                }
+
+                if (stock.group === "Core") coreTotal += 1;
+                if (stock.group === "Growth") growthTotal += 1;
+                if (stock.group === "Watch") watchTotal += 1;
+                if (
+                  (stock.group === "Core" || stock.group === "Growth") &&
+                  ["ACTIVE", "MAPPING_ONLY"].includes(stock.holding_status)
+                ) {
+                  activeQuoteTotal += 1;
+                  if (stock.holding_status === "ACTIVE") activeHoldingTotal += 1;
+                }
+              }
+
+              if (activeQuoteTotal !== 10) {
+                throw new Error(
+                  "active quote count must be 10, got " + activeQuoteTotal,
+                );
+              }
+              const activeCodes = new Set(
+                snapshot.stocks
+                  .filter(
+                    (stock) =>
+                      (stock.group === "Core" || stock.group === "Growth") &&
+                      ["ACTIVE", "MAPPING_ONLY"].includes(stock.holding_status),
+                  )
+                  .map((stock) => stock.code),
+              );
+              for (const code of expectedActiveCodes) {
+                if (!activeCodes.has(code)) {
+                  throw new Error("active quote set is missing " + code);
+                }
+              }
+              for (const code of activeCodes) {
+                if (!expectedActiveCodes.has(code)) {
+                  throw new Error("unexpected active quote code: " + code);
+                }
+              }
+              for (const code of requiredWatchCodes) {
+                const watch = snapshot.stocks.find((stock) => stock.code === code);
+                if (!watch || watch.group !== "Watch" || watch.holding_status !== "WATCH") {
+                  throw new Error("required Watch record is missing or misclassified: " + code);
+                }
+              }
+              if (watchTotal === 0) {
+                throw new Error("snapshot must include at least one Watch record");
+              }
+
+              const derived = {
+                active_quote_total: activeQuoteTotal,
+                active_holding_total: activeHoldingTotal,
+                watch_total: watchTotal,
+                core_total: coreTotal,
+                growth_total: growthTotal,
               };
+              for (const [field, expected] of Object.entries(derived)) {
+                if (field in snapshot.summary) {
+                  if (
+                    !Number.isInteger(snapshot.summary[field]) ||
+                    snapshot.summary[field] !== expected
+                  ) {
+                    throw new Error(
+                      "summary." + field + " does not match derived value " + expected,
+                    );
+                  }
+                }
+              }
+              return {
+                total: snapshot.stocks.length,
+                activeQuoteTotal,
+                activeHoldingTotal,
+                watchTotal,
+                coreTotal,
+                growthTotal,
+              };
+            }
+
+            async function fetchSnapshot(source) {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 15000);
+              try {
+                const separator = source.includes("?") ? "&" : "?";
+                const response = await fetch(
+                  source + separator + "_bridge_ts=" + Date.now(),
+                  {
+                    method: "GET",
+                    headers: {
+                      Accept: "application/json",
+                      "Cache-Control": "no-cache",
+                      "User-Agent": "cn-hk-quotes-github-bridge/1.0",
+                    },
+                    signal: controller.signal,
+                  },
+                );
+                const raw = await response.text();
+                if (!response.ok) {
+                  const error = new Error(
+                    "HTTP " + response.status + ": " + raw.slice(0, 500),
+                  );
+                  error.httpStatus = response.status;
+                  throw error;
+                }
+                try {
+                  return JSON.parse(raw);
+                } catch {
+                  throw new Error("upstream returned invalid JSON");
+                }
+              } finally {
+                clearTimeout(timer);
+              }
+            }
+
+            let payload;
+            let fetchError = null;
+            let usedSource = null;
+            let counts = null;
+
+            try {
+              if (sources.length === 0) {
+                throw new Error("no upstream source configured");
+              }
+              let lastError = null;
+              for (const [index, source] of sources.entries()) {
+                try {
+                  const candidate = await fetchSnapshot(source);
+                  counts = validateSnapshot(candidate);
+                  payload = {
+                    schema_version: "1.0",
+                    bridge: {
+                      last_attempt_at: now,
+                      last_attempt_status: "SUCCESS",
+                      last_success_at: now,
+                      workflow_run_id: String(context.runId),
+                      workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"),
+                      source,
+                      error: null,
+                    },
+                    snapshot: candidate,
+                  };
+                  usedSource = source;
+                  break;
+                } catch (error) {
+                  lastError = error;
+                  if (error?.httpStatus === 404 && index < sources.length - 1) {
+                    core.info(
+                      "upstream 404 at " + source +
+                        "; retrying " + sources[index + 1],
+                    );
+                    continue;
+                  }
+                  throw error;
+                }
+              }
+              if (!payload) {
+                throw lastError || new Error("all upstream sources failed");
+              }
             } catch (error) {
-              fetchError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+              fetchError =
+                error instanceof Error
+                  ? error.name + ": " + error.message
+                  : String(error);
               payload = {
                 schema_version: "1.0",
                 bridge: {
@@ -103,7 +387,7 @@ jobs:
                   last_success_at: previousLastSuccess,
                   workflow_run_id: String(context.runId),
                   workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"),
-                  source,
+                  source: usedSource || sources[0] || "unknown",
                   error: fetchError,
                 },
                 snapshot: previousSnapshot,
@@ -113,11 +397,11 @@ jobs:
             const body = [
               "# A/H 行情计划任务数据桥",
               "",
-              "> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。请勿手工编辑 JSON 区域。",
+              "> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照包含 Core、Growth、Watch 全量标的；请勿手工编辑 JSON 区域。",
               "",
-              "```json",
+              fence + "json",
               JSON.stringify(payload, null, 2),
-              "```",
+              fence,
             ].join("\n");
 
             await github.rest.issues.update({
@@ -127,11 +411,14 @@ jobs:
               body,
             });
 
-            core.info(`bridge_status=${payload.bridge.last_attempt_status}`);
-            core.info(`snapshot_time=${payload.snapshot?.snapshot_time ?? "null"}`);
-            core.info(`system_quality=${payload.snapshot?.system_quality ?? "null"}`);
-            core.info(`total=${payload.snapshot?.summary?.total ?? "null"}`);
-            core.info(`usable=${payload.snapshot?.summary?.usable ?? "null"}`);
+            core.info("bridge_status=" + payload.bridge.last_attempt_status);
+            core.info("snapshot_time=" + (payload.snapshot?.snapshot_time ?? "null"));
+            core.info("system_quality=" + (payload.snapshot?.system_quality ?? "null"));
+            core.info("total=" + (payload.snapshot?.summary?.total ?? "null"));
+            core.info("active_quote_total=" + (counts?.activeQuoteTotal ?? "null"));
+            core.info("watch_total=" + (counts?.watchTotal ?? "null"));
+            core.info("core_total=" + (counts?.coreTotal ?? "null"));
+            core.info("growth_total=" + (counts?.growthTotal ?? "null"));
 
             if (fetchError) {
               core.setFailed(fetchError);
