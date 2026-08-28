@@ -7,17 +7,15 @@
 	"name": "cn-hk-quotes-mcp",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-07-02",
-	"compatibility_flags": [
-	  "nodejs_compat",
-	  "global_fetch_strictly_public"
-	],
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 	"triggers": {
+		// Cloudflare cron weekdays use 1=Sunday; names make the intended weekdays explicit.
 		"crons": [
-			"55 0 * * 1-5",
-			"39,44,49 1,2,3,5,6 * * 1-5",
-			"24,29 7 * * 1-5",
-			"54,59 7 * * 1-5",
-			"4,9,24,29 8 * * 1-5",
+			"55 0 * * mon-fri",
+			"39,44,49 1,2,3,5,6 * * mon-fri",
+			"24,29 7 * * mon-fri",
+			"54,59 7 * * mon-fri",
+			"4,9,24,29 8 * * mon-fri",
 		],
 	},
 	"observability": {
