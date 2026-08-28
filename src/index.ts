@@ -4,6 +4,8 @@ import { z } from "zod";
 
 const PORTFOLIO_QUOTES_URL =
 	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
+const PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL =
+	"https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes";
 const GITHUB_REPOSITORY = "zhushihao/cn-hk-quotes-mcp";
 const GITHUB_ISSUE_NUMBER = 1;
 const GITHUB_API_VERSION = "2022-11-28";
@@ -39,6 +41,11 @@ type BridgePayload = {
 
 type GitHubIssue = {
 	body?: string | null;
+};
+
+type UpstreamSnapshotResult = {
+	snapshot: QuoteSnapshot;
+	source: string;
 };
 
 type BridgeStageContext = {
@@ -178,52 +185,76 @@ function logBridgeFailure(
 }
 
 async function fetchUpstreamSnapshot(
-	source: string,
+	sources: string[],
 	context: BridgeStageContext,
-): Promise<QuoteSnapshot> {
-	logBridgeStage(context, "upstream_fetch_start");
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), 15000);
+): Promise<UpstreamSnapshotResult> {
+	let lastError: BridgeError | null = null;
 
-	try {
-		const separator = source.includes("?") ? "&" : "?";
-		const response = await fetch(`${source}${separator}_bridge_ts=${Date.now()}`, {
-			method: "GET",
-			headers: {
-				Accept: "application/json",
-				"Cache-Control": "no-cache",
-				"User-Agent": "cn-hk-quotes-cloudflare-bridge/1.0",
-			},
-			signal: controller.signal,
+	for (const [index, source] of sources.entries()) {
+		logBridgeStage(context, "upstream_fetch_start", {
+			source_url: source,
 		});
-		const raw = await response.text();
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 15000);
 
-		if (!response.ok) {
-			throw new BridgeError(
-				"upstream_fetch",
-				`upstream request failed with HTTP ${response.status}`,
-				response.status,
-			);
-		}
-
-		let snapshot: unknown;
 		try {
-			snapshot = JSON.parse(raw);
-		} catch {
-			throw new BridgeError("upstream_fetch", "upstream returned invalid JSON");
-		}
+			const separator = source.includes("?") ? "&" : "?";
+			const response = await fetch(`${source}${separator}_bridge_ts=${Date.now()}`, {
+				method: "GET",
+				headers: {
+					Accept: "application/json",
+					"Cache-Control": "no-cache",
+					"User-Agent": "cn-hk-quotes-cloudflare-bridge/1.0",
+				},
+				signal: controller.signal,
+			});
+			const raw = await response.text();
 
-		logBridgeStage(context, "upstream_fetch_success", {
-			http_status: response.status,
-		});
-		validateSnapshot(snapshot);
-		logBridgeStage(context, "payload_validation_success", {
-			stock_count: snapshot.stocks.length,
-		});
-		return snapshot;
-	} finally {
-		clearTimeout(timer);
+			if (!response.ok) {
+				throw new BridgeError(
+					"upstream_fetch",
+					`upstream request failed with HTTP ${response.status}`,
+					response.status,
+				);
+			}
+
+			let snapshot: unknown;
+			try {
+				snapshot = JSON.parse(raw);
+			} catch {
+				throw new BridgeError("upstream_fetch", "upstream returned invalid JSON");
+			}
+
+			logBridgeStage(context, "upstream_fetch_success", {
+				http_status: response.status,
+				source_url: source,
+			});
+			validateSnapshot(snapshot);
+			logBridgeStage(context, "payload_validation_success", {
+				stock_count: snapshot.stocks.length,
+			});
+			return { snapshot, source };
+		} catch (error) {
+			lastError =
+				error instanceof BridgeError
+					? error
+					: new BridgeError("upstream_fetch", safeErrorMessage(error));
+			const canRetryWithPublicSite =
+				lastError.httpStatus === 404 && index < sources.length - 1;
+			if (!canRetryWithPublicSite) {
+				throw lastError;
+			}
+			logBridgeStage(context, "upstream_fetch_retry", {
+				failed_source_url: source,
+				http_status: lastError.httpStatus,
+				next_source_url: sources[index + 1],
+			});
+		} finally {
+			clearTimeout(timer);
+		}
 	}
+
+	throw lastError ?? new BridgeError("upstream_fetch", "no upstream source configured");
 }
 
 export async function updateQuoteBridge(
@@ -266,7 +297,10 @@ export async function updateQuoteBridge(
 	let upstreamError: BridgeError | null = null;
 
 	try {
-		const snapshot = await fetchUpstreamSnapshot(PORTFOLIO_QUOTES_URL, context);
+		const upstream = await fetchUpstreamSnapshot(
+			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+			context,
+		);
 		payload = {
 			schema_version: "1.0",
 			bridge: {
@@ -275,10 +309,10 @@ export async function updateQuoteBridge(
 				last_success_at: now,
 				workflow_run_id: workflowRunId,
 				workflow_run_attempt: workflowRunAttempt,
-				source: PORTFOLIO_QUOTES_URL,
+				source: upstream.source,
 				error: null,
 			},
-			snapshot,
+			snapshot: upstream.snapshot,
 		};
 	} catch (error) {
 		upstreamError =
