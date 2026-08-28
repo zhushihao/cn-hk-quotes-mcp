@@ -141,7 +141,11 @@ function githubHeaders(token: string): HeadersInit {
 function bridgeContext(workflowRunId: string): BridgeStageContext {
 	return {
 		runId: workflowRunId,
-		cron: workflowRunId.startsWith("cron:") ? workflowRunId.slice("cron:".length) : "manual",
+		cron: workflowRunId.startsWith("cron:")
+			? workflowRunId.slice("cron:".length) || "manual-test"
+			: workflowRunId === "test:scheduled"
+				? "manual-test"
+				: "manual",
 	};
 }
 
@@ -530,7 +534,8 @@ export default {
 		return handler(request, env, ctx);
 	},
 	async scheduled(controller: ScheduledController, env: Env) {
-		const context = bridgeContext(`cron:${controller.cron}`);
+		const runId = controller.cron ? `cron:${controller.cron}` : "test:scheduled";
+		const context = bridgeContext(runId);
 		logBridgeStage(context, "scheduled_enter");
 
 		try {
