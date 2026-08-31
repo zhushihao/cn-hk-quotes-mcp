@@ -1,168 +1,102 @@
 # 持仓行情同步规范
 
-## 架构原则
+## 架构和配置口径
 
-行情服务必须查询 Site 的全量标的。主动行情数量为 10 只是当前 Core/Growth 行情池的数量，不是 Site 返回总数。
+Site 的 `lib/stocks.ts` 中 `PORTFOLIO_UNIVERSE` 是运行时唯一标的配置源。它生成 Site 的全量 `/api/portfolio-quotes` 快照；Cloudflare Worker 和 GitHub 行情桥只负责刷新、校验和转存，不再维护一份可供调仓编辑的名单。
 
-唯一真实配置源是上游 Site 的 `PORTFOLIO` 对象：
+桥接层保留固定的 17 个市场+完整代码校验，是防止旧 Site 或半更新响应进入 GitHub 的安全护栏，不是持仓配置。以后调仓仍应先改 Site 的 `PORTFOLIO_UNIVERSE`，再同步部署 Site；如果标的数量或代码发生变化，需要同时更新桥接护栏和验收测试。
 
-```text
-PORTFOLIO { core, growth, watch }
-  → STOCKS（全量）
-  → /api/portfolio-quotes（全量快照）
-  → MCP get_portfolio_quotes（全量快照）
-  → Cloudflare Worker Cron
-  → GitHub Issue #1
-  → ChatGPT 监控任务按分组消费
-```
-
-MCP、GitHub 行情桥和 ChatGPT Prompt 不得维护第二份股票名单。
-
-## 三层标的定义
-
-### Core
-
-当前主动行情标的：
-
-- `300308.SZ` 中际旭创，`ACTIVE`
-- `03308.HK` 中际旭创 H 股映射，`MAPPING_ONLY`，`mapping_to: 300308.SZ`
-- `300502.SZ` 新易盛，`ACTIVE`
-- `300394.SZ` 天孚通信，`ACTIVE`
-- `688676.SH` 金盘科技，`ACTIVE`
-
-### Growth
-
-当前主动行情标的：
-
-- `605376.SH` 博迁新材，`ACTIVE`
-- `301183.SZ` 东田微，`ACTIVE`
-- `300433.SZ` 蓝思科技，`ACTIVE`
-- `688596.SH` 正帆科技，`ACTIVE`
-- `588170.SH` 科创半导体材料设备 ETF，`ACTIVE`
-
-主动行情代码顺序必须为：
+唯一标识始终是 `market + code`，例如 `CN:603308` 和 `HK:03308`。任何只用纯数字的匹配都不允许，以免把应流股份和中际旭创 H 股混淆。
 
 ```text
-300308,03308,300502,300394,688676,605376,301183,300433,688596,588170
+PORTFOLIO_UNIVERSE（Site 单一运行时源）
+  → /api/portfolio-quotes（17 只全量快照）
+  → Cloudflare Worker/Cron（按原频率刷新）
+  → GitHub Issue #1（行情桥）
+  → ChatGPT 监控任务
 ```
 
-其中 03308 是映射观察标的，不作为独立正式持仓统计；但它属于 Core 行情返回，因此主动行情条目数仍为 10，正式 ACTIVE 持仓数为 9。
+## 当前 17 只标的
 
-### Watch
+### Core（6）
 
-继续保留在 Site、MCP 和 GitHub 全量快照中，但不属于主动盘中价格与资金监控。至少包括：
+正式持仓：
 
-- `601872.SH` 招商轮船
+- `300308.SZ` 中际旭创，400 股
+- `300502.SZ` 新易盛，1500 股
+- `300394.SZ` 天孚通信，1800 股
+- `688676.SH` 金盘科技，2000 股
+- `601872.SH` 招商轮船，5000 股
+- `588080.SH` 科创板50ETF，30000 份
+
+H 股价格映射单列：
+
+- `03308.HK` 中际旭创 H 股，`MAPPING_ONLY`，`mapping_to: 300308.SZ`，不计入正式持仓
+
+### Growth（3）
+
+- `300433.SZ` 蓝思科技，3000 股
+- `588170.SH` 科创半导体材料设备ETF，150000 份
+- `603308.SH` 应流股份，1000 股
+
+### Watch（4）
+
+- `600096.SH` 云天化
 - `09988.HK` 阿里巴巴
 - `02228.HK` 晶泰控股
 - `603893.SH` 瑞芯微
-- `600096.SH` 云天化
 
-开盘助手、收盘复盘、产业趋势监控、资本侧与财报公告监控中的其他观察标的也必须继续保留。退出主动持仓不能通过从 Site 删除来实现。
+### Exited Watch（3）
 
-## Site 与接口契约
+下面标的已经退出正式持仓，但仍必须返回行情：
 
-上游 `PORTFOLIO` 必须包含 `core`、`growth`、`watch`，并统一生成全量 `STOCKS`。
+- `605376.SH` 博迁新材
+- `301183.SZ` 东田微
+- `688596.SH` 正帆科技
 
-`/api/portfolio-quotes` 必须返回全部分组，单条结果至少明确：
+总行情代码为 17；正式持仓证券为 9；加上 H 股映射后的主动行情条目为 10。
 
-- `group: Core | Growth | Watch`
-- `holding_status: ACTIVE | MAPPING_ONLY | WATCH`
-- `mapping_to`（仅 H 股映射使用）
-- 价格、昨收、开盘、最高、最低、涨跌幅、成交量、成交额
-- `market_status`、`source_status`、`quality`
-- `market_data_time`、`source_update_time`、`fetch_time`、`quote_time`、`freshness_basis`、`age_seconds`
+## 字段和状态契约
 
-闭市快照可以是 `market_status: CLOSED`、`quality: CLOSED_SNAPSHOT`。源故障必须如实标记 `source_status: FALLBACK` 或错误状态，不得为了健康检查强行标记为 `OK`。
+Site 和桥接层保留原有行情字段，并新增或校验以下持仓字段：
 
-## 数量与校验口径
+- `code`、`name`、`market`、`exchange`
+- `group: Core | Growth | Watch`（旧字段，保持兼容）
+- `portfolio_group: core | growth | watch | exited_watch | mapping`（新规范字段）
+- `holding_status: ACTIVE | WATCH | EXITED | MAPPING_ONLY`
+- `position_qty`、`is_position`、`mapping_to`
 
-正确口径：
+Core/Growth 的正式持仓 `is_position=true` 且数量大于零；Watch、Exited Watch 和 H 股 Mapping 的 `is_position=false` 且数量为零。`03308.HK` 只能作为 `300308.SZ` 的价格映射，不能被算作独立持仓。`601872.SH` 是 Core 的 `ACTIVE`，不能再标记为 `EXITED` 或 Watch。
 
-- `summary.total === stocks.length`，表示 Site 全量返回数
-- 当前主动行情条目数为 10
-- Watch 数量由实际配置决定，必须大于 0
-- Watch 不得计入主动价格与资金监控数量
-- `MAPPING_ONLY` 必须有 `mapping_to`，且不能被当作独立正式持仓
+行情时间语义保持不变：
 
-如果 Site 提供以下字段，消费方必须校验它们与实际分组一致：
+- `market_status` 只有 `OPEN` 或 `CLOSED`
+- 闭市后使用 `quality: CLOSED_SNAPSHOT`
+- `market_data_time` 只填可以确认的真实成交/市场数据时间
+- `source_update_time` 只表示供应商更新时间
+- `fetch_time` 表示本系统抓取时间
+- `quote_time` 只有确认是真实成交时间时填写，否则为 `null`
+- `freshness_basis` 必须说明采用的时间依据
 
-- `summary.active_quote_total`
-- `summary.active_holding_total`（如果提供）
-- `summary.watch_total`
-- `summary.core_total`
-- `summary.growth_total`
+不得把收盘后的供应商更新时间冒充最后成交时间，也不得把港股正常公开延迟、A 股上一交易日收盘快照误判为失败。
 
-不能再使用“`summary.total = stocks.length = 10`”作为 Site 验收标准。
+## ETF 和市场适配
 
-## MCP 与 GitHub 行情桥
+`588080.SH` 与 `588170.SH` 使用完整的 SH 市场标识，并经过腾讯、 新浪、 东方财富适配器；它们必须返回最新价、昨收、涨跌幅、成交额/成交量、日高、日低和收盘状态。ETF 不能因为证券类型不同而走普通股票失败分支。
 
-MCP `get_portfolio_quotes` 和 GitHub Issue #1 必须保存 Site 的全量快照。桥接校验必须分别确认：
+## Worker 和 GitHub 行情桥
 
-- Core/Growth 主动行情条目数恰好为 10
-- Watch 标的仍然存在
-- 分组和 `holding_status` 正确
-- 退出标的没有被错误标记为 `ACTIVE`
-- `summary.total === stocks.length`
-- 所有行情字段和时间字段有真实值或明确的 `null` 语义
-- Watch 单个行情源失败时，保留该标的错误质量，不阻断其他主动行情
+Cloudflare Worker 继续使用 `wrangler.jsonc` 中已有的 Cron 表达式，不修改调度频率或时间语义。Worker 读取 Site 的 17 只全量响应，验证通过后更新 GitHub `zhushihao/cn-hk-quotes-mcp` 的 Issue #1；任一 Watch 或 Exited Watch 没有持仓不能成为删除它的理由。
 
-Worker 内部访问代理地址收到 HTTP 404 时，可以回退公开 Site 地址；500、超时和公开地址不可用时必须记录失败并保留上一份成功快照，等待下次重试。
+GitHub Actions 的 `workflow_dispatch` 只用于手工补跑，和 Worker 使用相同的字段及 17 只护栏。上游失败时沿用上一份成功快照并记录失败状态，不伪造行情。
 
-## Prompt 使用规则
+## 验收清单
 
-- 盘中价格与资金监控-Core 只消费 Core。
-- 盘中价格与资金监控-Growth 只消费 Growth。
-- 盘中任务不主动消费 Watch。
-- 开盘助手、收盘复盘、产业趋势、资本侧与财报公告监控可以同时消费三组，但必须明确 Watch 是低优先级观察，不得报成正式持仓。
+验收必须实际调用：
 
-## 持仓变更规则
+1. Site `/api/portfolio-quotes`，确认 17/17 和五层数量。
+2. `/api/quote?code=` 单股接口，至少覆盖 `300308`、`03308`、`300394`、`588080`、`588170`、`601872`、`603308`、`605376`。
+3. Cloudflare Worker 的一次手工刷新或等价计划事件，确认读取 Site 并写桥。
+4. GitHub Issue #1 最新正文，确认 17 个 `market:code` 都存在。
 
-每次变更先记录：
-
-```text
-新增：
-退出：
-分组变化：
-A/H 映射：
-```
-
-退出主动持仓时：
-
-```text
-Core/Growth + ACTIVE → Watch + WATCH
-```
-
-新增主动持仓时，加入 Core 或 Growth 并标记 `ACTIVE`。A/H 映射单独标记 `MAPPING_ONLY`，保留映射行情但不增加正式持仓数。
-
-## 最终一致性验收
-
-### 主动行情一致性
-
-```text
-Active Core/Growth
-  ↕
-主动行情子集（10 条）
-  ↕
-Core/Growth 盘中 Prompt
-```
-
-### 全量覆盖一致性
-
-```text
-Site 全量标的
-  ↕
-MCP 全量标的
-  ↕
-GitHub Issue #1 全量快照
-```
-
-### 观察覆盖一致性
-
-```text
-Watch 标的
-  ↕
-开盘助手 / 收盘复盘 / 产业趋势 / 资本公告监控
-```
-
-验收时必须分别列出主动代码和 Watch 代码，不能只报告一个总数。
+最终报告必须列出 Core 6、Growth 3、Watch 4、Exited Watch 3、H 股 Mapping 1，以及正式持仓 9。

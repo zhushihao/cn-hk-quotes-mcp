@@ -7,14 +7,39 @@ import {
 	validateSnapshot,
 } from "../src/portfolio-validation.ts";
 
-function makeStock(code, group, holdingStatus, overrides = {}) {
+const universeDefinitions = [
+	["300308", "CN", "SZ", "Core", "core", "ACTIVE", 400, true],
+	["03308", "HK", "HK", "Core", "mapping", "MAPPING_ONLY", 0, false, "300308.SZ"],
+	["300502", "CN", "SZ", "Core", "core", "ACTIVE", 1500, true],
+	["300394", "CN", "SZ", "Core", "core", "ACTIVE", 1800, true],
+	["688676", "CN", "SH", "Core", "core", "ACTIVE", 2000, true],
+	["601872", "CN", "SH", "Core", "core", "ACTIVE", 5000, true],
+	["588080", "CN", "SH", "Core", "core", "ACTIVE", 30000, true],
+	["300433", "CN", "SZ", "Growth", "growth", "ACTIVE", 3000, true],
+	["588170", "CN", "SH", "Growth", "growth", "ACTIVE", 150000, true],
+	["603308", "CN", "SH", "Growth", "growth", "ACTIVE", 1000, true],
+	["600096", "CN", "SH", "Watch", "watch", "WATCH", 0, false],
+	["605376", "CN", "SH", "Watch", "exited_watch", "EXITED", 0, false],
+	["301183", "CN", "SZ", "Watch", "exited_watch", "EXITED", 0, false],
+	["688596", "CN", "SH", "Watch", "exited_watch", "EXITED", 0, false],
+	["09988", "HK", "HK", "Watch", "watch", "WATCH", 0, false],
+	["02228", "HK", "HK", "Watch", "watch", "WATCH", 0, false],
+	["603893", "CN", "SH", "Watch", "watch", "WATCH", 0, false],
+];
+
+function makeStock(definition, overrides = {}) {
+	const [code, market, exchange, group, portfolioGroup, holdingStatus, positionQty, isPosition, mappingTo] = definition;
 	return {
 		code,
-		market: code.startsWith("0") ? "HK" : "CN",
+		market,
+		exchange,
 		name: code,
 		group,
+		portfolio_group: portfolioGroup,
 		holding_status: holdingStatus,
-		mapping_to: null,
+		mapping_to: mappingTo ?? null,
+		position_qty: positionQty,
+		is_position: isPosition,
 		price: 10,
 		pre_close: 9,
 		open: 9.5,
@@ -39,6 +64,18 @@ function makeStock(code, group, holdingStatus, overrides = {}) {
 }
 
 function makeSnapshot(stocks, summary = {}) {
+	const portfolioUniverse = stocks.map((stock) => ({
+		code: stock.code,
+		market: stock.market,
+		exchange: stock.exchange,
+		name: stock.name,
+		group: stock.group,
+		portfolio_group: stock.portfolio_group,
+		holding_status: stock.holding_status,
+		mapping_to: stock.mapping_to,
+		position_qty: stock.position_qty,
+		is_position: stock.is_position,
+	}));
 	return {
 		snapshot_time: "2026-08-28T15:01:00+08:00",
 		market_status: "CLOSED",
@@ -49,141 +86,102 @@ function makeSnapshot(stocks, summary = {}) {
 			usable: stocks.length,
 			...summary,
 		},
+		portfolio_universe: portfolioUniverse,
 		stocks,
 	};
 }
 
-const activeStocks = [
-	makeStock("300308", "Core", "ACTIVE"),
-	makeStock("03308", "Core", "MAPPING_ONLY", { mapping_to: "300308.SZ" }),
-	makeStock("300502", "Core", "ACTIVE"),
-	makeStock("300394", "Core", "ACTIVE"),
-	makeStock("688676", "Core", "ACTIVE"),
-	makeStock("605376", "Growth", "ACTIVE"),
-	makeStock("301183", "Growth", "ACTIVE"),
-	makeStock("300433", "Growth", "ACTIVE"),
-	makeStock("688596", "Growth", "ACTIVE"),
-	makeStock("588170", "Growth", "ACTIVE"),
-];
+const allStocks = universeDefinitions.map((definition) => makeStock(definition));
+const activeStocks = allStocks.filter((stock) => stock.is_position || stock.holding_status === "MAPPING_ONLY");
 
-const watchStocks = [
-	makeStock("601872", "Watch", "WATCH"),
-	makeStock("09988", "Watch", "WATCH"),
-	makeStock("02228", "Watch", "WATCH"),
-	makeStock("603893", "Watch", "WATCH"),
-	makeStock("600096", "Watch", "WATCH"),
-];
-
-test("accepts a full snapshot and derives separate active/watch counts", () => {
-	const snapshot = makeSnapshot([...activeStocks, ...watchStocks]);
+test("accepts the complete 17-instrument snapshot and derives five layer counts", () => {
+	const snapshot = makeSnapshot(allStocks);
 
 	assert.doesNotThrow(() => validateSnapshot(snapshot));
-	assert.deepEqual(
-		getActiveQuoteCodes(snapshot),
-		activeStocks.map((stock) => stock.code),
-	);
+	assert.deepEqual(getActiveQuoteCodes(snapshot), activeStocks.map((stock) => stock.code));
 	assert.deepEqual(getSnapshotCounts(snapshot), {
-		total: 15,
+		total: 17,
 		activeQuoteTotal: 10,
 		activeHoldingTotal: 9,
-		watchTotal: 5,
-		coreTotal: 5,
-		growthTotal: 5,
-		mappingOnlyTotal: 1,
+		watchTotal: 4,
+		exitedWatchTotal: 3,
+		coreTotal: 6,
+		growthTotal: 3,
+		mappingTotal: 1,
 	});
 });
 
-test("rejects a legacy active-only snapshot when Watch coverage is required", () => {
-	assert.throws(() => validateSnapshot(makeSnapshot(activeStocks)), /Watch/i);
+test("rejects a legacy or partial snapshot without the Site universe", () => {
+	assert.throws(() => validateSnapshot(makeSnapshot(activeStocks)), /portfolio_universe|17|instruments/i);
 });
 
-test("rejects snapshots whose active quote count is not ten", () => {
-	const snapshot = makeSnapshot([...activeStocks.slice(0, -1), ...watchStocks]);
-
-	assert.throws(() => validateSnapshot(snapshot), /active.*10|10.*active/i);
-});
-
-test("rejects a ten-record active set when one code is substituted", () => {
-	const substituted = [
-		...activeStocks.slice(0, -1),
-		makeStock("999999", "Growth", "ACTIVE"),
-		...watchStocks,
-	];
-
-	assert.throws(() => validateSnapshot(makeSnapshot(substituted)), /active quote set|unexpected active/i);
-});
-
-test("requires every baseline Watch code to remain present", () => {
-	const missingWatch = [
-		...activeStocks,
-		...watchStocks.filter((stock) => stock.code !== "600096"),
-	];
-
-	assert.throws(() => validateSnapshot(makeSnapshot(missingWatch)), /required Watch|600096/i);
-});
-
-test("rejects inconsistent group and holding status combinations", () => {
-	const snapshot = makeSnapshot([
-		...activeStocks,
-		...watchStocks.slice(0, -1),
-		makeStock("600096", "Growth", "WATCH"),
-	]);
-
-	assert.throws(() => validateSnapshot(snapshot), /Watch|holding_status|group/i);
-});
-
-test("requires an H-share mapping target for MAPPING_ONLY records", () => {
-	const invalidMapping = activeStocks.map((stock) =>
-		stock.code === "03308" ? { ...stock, mapping_to: null } : stock,
+test("rejects a snapshot with an unexpected or missing market-qualified code", () => {
+	const replaced = allStocks.map((stock) =>
+		stock.code === "603308" ? { ...stock, code: "999999" } : stock,
 	);
+	const replacedSnapshot = makeSnapshot(replaced);
+	assert.throws(() => validateSnapshot(replacedSnapshot), /603308|unexpected|missing/i);
 
-	assert.throws(
-		() => validateSnapshot(makeSnapshot([...invalidMapping, ...watchStocks])),
-		/mapping_to/i,
+	const missing = makeSnapshot(allStocks.filter((stock) => stock.code !== "603308"));
+	assert.throws(() => validateSnapshot(missing), /17|missing/i);
+});
+
+test("requires Watch and Exited Watch records to remain present and correctly classified", () => {
+	const missingExited = makeSnapshot(allStocks.filter((stock) => stock.code !== "605376"));
+	assert.throws(() => validateSnapshot(missingExited), /605376|17|missing/i);
+
+	const misclassified = allStocks.map((stock) =>
+		stock.code === "601872"
+			? { ...stock, portfolio_group: "watch", group: "Watch", holding_status: "WATCH", position_qty: 0, is_position: false }
+			: stock,
 	);
+	assert.throws(() => validateSnapshot(makeSnapshot(misclassified)), /active|group|portfolio|Watch/i);
 });
 
-test("rejects summary totals that do not equal the returned stock array", () => {
-	const snapshot = makeSnapshot([...activeStocks, ...watchStocks], { total: 10 });
-
-	assert.throws(() => validateSnapshot(snapshot), /summary\.total/i);
-});
-
-test("checks optional derived summary fields when the Site provides them", () => {
-	const valid = makeSnapshot([...activeStocks, ...watchStocks], {
+test("checks derived summary totals and allows null quote values for non-positions", () => {
+	const valid = makeSnapshot(allStocks, {
 		active_quote_total: 10,
 		active_holding_total: 9,
-		watch_total: 5,
-		core_total: 5,
-		growth_total: 5,
+		watch_total: 4,
+		exited_watch_total: 3,
+		mapping_total: 1,
+		core_total: 6,
+		growth_total: 3,
 	});
 	assert.doesNotThrow(() => validateSnapshot(valid));
 
-	const invalid = makeSnapshot([...activeStocks, ...watchStocks], {
-		active_quote_total: 9,
-	});
-	assert.throws(() => validateSnapshot(invalid), /active_quote_total/i);
+	const invalid = makeSnapshot(allStocks, { core_total: 7 });
+	assert.throws(() => validateSnapshot(invalid), /core_total/i);
+
+	const failedWatch = allStocks.map((stock) =>
+		stock.code === "600096"
+			? {
+				...stock,
+				price: null,
+				pre_close: null,
+				open: null,
+				high: null,
+				low: null,
+				pct_change: null,
+				volume: null,
+				amount: null,
+				market_data_time: null,
+				source_update_time: null,
+				age_seconds: null,
+				source_status: "ERROR",
+				quality: "SOURCE_ERROR",
+			}
+			: stock,
+	);
+	assert.doesNotThrow(() => validateSnapshot(makeSnapshot(failedWatch)));
 });
 
-test("keeps a Watch source failure as a valid, explicitly degraded record", () => {
-	const failedWatch = makeStock("601872", "Watch", "WATCH", {
-		price: null,
-		pre_close: null,
-		open: null,
-		high: null,
-		low: null,
-		pct_change: null,
-		volume: null,
-		amount: null,
-		market_data_time: null,
-		source_update_time: null,
-		age_seconds: null,
-		source_status: "FAILED",
-		quality: "UNAVAILABLE",
-		source_errors: { tencent: "timeout" },
-	});
-
-	assert.doesNotThrow(() =>
-		validateSnapshot(makeSnapshot([...activeStocks, failedWatch, ...watchStocks.slice(1)])),
-	);
+test("does not use pure numeric code matching for 03308 and 603308", () => {
+	const mapping = allStocks.find((stock) => stock.code === "03308");
+	const yingliu = allStocks.find((stock) => stock.code === "603308");
+	assert.equal(mapping?.market, "HK");
+	assert.equal(yingliu?.market, "CN");
+	assert.equal(mapping?.portfolio_group, "mapping");
+	assert.equal(yingliu?.portfolio_group, "growth");
+	assert.equal(new Set(allStocks.map((stock) => `${stock.market}:${stock.code}`)).size, 17);
 });

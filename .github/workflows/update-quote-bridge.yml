@@ -24,19 +24,11 @@ jobs:
           ISSUE_NUMBER: "1"
         with:
           script: |
-            const sources = [
-              process.env.SOURCE_URL,
-              process.env.FALLBACK_SOURCE_URL,
-            ].filter(Boolean);
+            const sources = [process.env.SOURCE_URL, process.env.FALLBACK_SOURCE_URL].filter(Boolean);
             const issueNumber = Number(process.env.ISSUE_NUMBER);
             const now = new Date().toISOString();
-
             const { owner, repo } = context.repo;
-            const current = await github.rest.issues.get({
-              owner,
-              repo,
-              issue_number: issueNumber,
-            });
+            const current = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
 
             let previousSnapshot = null;
             let previousLastSuccess = null;
@@ -51,248 +43,104 @@ jobs:
               } catch (_) {}
             }
 
-            const requiredStockFields = [
-              "code",
-              "market",
-              "name",
-              "group",
-              "holding_status",
-              "mapping_to",
-              "price",
-              "pre_close",
-              "open",
-              "high",
-              "low",
-              "pct_change",
-              "volume",
-              "amount",
-              "market_status",
-              "market_data_time",
-              "source_update_time",
-              "freshness_basis",
-              "quote_time",
-              "fetch_time",
-              "age_seconds",
-              "source_status",
-              "quality",
-            ];
-            const numericStockFields = [
-              "price",
-              "pre_close",
-              "open",
-              "high",
-              "low",
-              "pct_change",
-              "volume",
-              "amount",
-              "age_seconds",
-            ];
-            const expectedActiveCodes = new Set([
-              "300308",
-              "03308",
-              "300502",
-              "300394",
-              "688676",
-              "605376",
-              "301183",
-              "300433",
-              "688596",
-              "588170",
+            // Fixed acceptance guards, not an editable portfolio list.
+            // The Site emits the runtime PORTFOLIO_UNIVERSE used below.
+            const expectedKeys = new Set([
+              "CN:300308", "HK:03308", "CN:300502", "CN:300394", "CN:688676",
+              "CN:601872", "CN:588080", "CN:300433", "CN:588170", "CN:603308",
+              "CN:600096", "CN:605376", "CN:301183", "CN:688596", "HK:09988",
+              "HK:02228", "CN:603893",
             ]);
-            const requiredWatchCodes = [
-              "601872",
-              "09988",
-              "02228",
-              "603893",
-              "600096",
+            const expectedActiveKeys = new Set([
+              "CN:300308", "HK:03308", "CN:300502", "CN:300394", "CN:688676",
+              "CN:601872", "CN:588080", "CN:300433", "CN:588170", "CN:603308",
+            ]);
+            const requiredWatchKeys = ["CN:600096", "HK:09988", "HK:02228", "CN:603893"];
+            const requiredExitedKeys = ["CN:605376", "CN:301183", "CN:688596"];
+            const stockFields = [
+              "code", "market", "exchange", "name", "group", "portfolio_group",
+              "holding_status", "mapping_to", "position_qty", "is_position", "price",
+              "pre_close", "open", "high", "low", "pct_change", "volume", "amount",
+              "market_status", "market_data_time", "source_update_time", "freshness_basis",
+              "quote_time", "fetch_time", "age_seconds", "source_status", "quality",
             ];
+            const numericFields = ["price", "pre_close", "open", "high", "low", "pct_change", "volume", "amount", "age_seconds"];
+            const identityFields = [
+              "code", "market", "exchange", "name", "group", "portfolio_group",
+              "holding_status", "mapping_to", "position_qty", "is_position",
+            ];
+            const key = (stock) => `${stock.market}:${stock.code}`;
+            const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
+
+            function validateClassification(stock, label) {
+              if (!["CN", "HK"].includes(stock.market)) throw new Error(`${label}.market is invalid`);
+              if (!["SZ", "SH", "HK"].includes(stock.exchange)) throw new Error(`${label}.exchange is invalid`);
+              if ((stock.market === "HK") !== (stock.exchange === "HK")) throw new Error(`${label}.market/exchange mismatch`);
+              if (!["Core", "Growth", "Watch"].includes(stock.group)) throw new Error(`${label}.group is invalid`);
+              if (!["core", "growth", "watch", "exited_watch", "mapping"].includes(stock.portfolio_group)) throw new Error(`${label}.portfolio_group is invalid`);
+              if (!["ACTIVE", "MAPPING_ONLY", "WATCH", "EXITED"].includes(stock.holding_status)) throw new Error(`${label}.holding_status is invalid`);
+              const broad = stock.portfolio_group === "core" || stock.portfolio_group === "mapping" ? "Core" : stock.portfolio_group === "growth" ? "Growth" : "Watch";
+              if (stock.group !== broad) throw new Error(`${label}.group does not match portfolio_group`);
+              const status = stock.portfolio_group === "mapping" ? "MAPPING_ONLY" : stock.portfolio_group === "exited_watch" ? "EXITED" : stock.portfolio_group === "watch" ? "WATCH" : "ACTIVE";
+              if (stock.holding_status !== status) throw new Error(`${label}.holding_status does not match portfolio_group`);
+              if (stock.portfolio_group === "mapping" ? typeof stock.mapping_to !== "string" || !stock.mapping_to : stock.mapping_to !== null) throw new Error(`${label}.mapping_to is invalid`);
+              if (!isFiniteNumber(stock.position_qty) || stock.position_qty < 0) throw new Error(`${label}.position_qty is invalid`);
+              if (typeof stock.is_position !== "boolean" || stock.is_position !== (stock.holding_status === "ACTIVE") || (!stock.is_position && stock.position_qty !== 0) || (stock.is_position && stock.position_qty <= 0)) throw new Error(`${label}.position_qty/is_position is inconsistent`);
+            }
 
             function validateSnapshot(snapshot) {
-              if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
-                throw new Error("upstream returned non-object JSON");
-              }
-              if (
-                typeof snapshot.snapshot_time !== "string" ||
-                typeof snapshot.system_quality !== "string" ||
-                !snapshot.summary ||
-                typeof snapshot.summary !== "object" ||
-                !Number.isInteger(snapshot.summary.total) ||
-                snapshot.summary.total < 0 ||
-                !Array.isArray(snapshot.stocks)
-              ) {
-                throw new Error("upstream JSON missing or invalid snapshot fields");
-              }
-              if (snapshot.summary.total !== snapshot.stocks.length) {
-                throw new Error(
-                  "summary.total=" + snapshot.summary.total +
-                    " but stocks.length=" + snapshot.stocks.length,
-                );
-              }
+              if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) throw new Error("upstream returned non-object JSON");
+              if (typeof snapshot.snapshot_time !== "string" || typeof snapshot.system_quality !== "string" || !snapshot.summary || typeof snapshot.summary !== "object" || !Number.isInteger(snapshot.summary.total) || !Array.isArray(snapshot.stocks) || !Array.isArray(snapshot.portfolio_universe)) throw new Error("upstream JSON is missing required snapshot fields");
+              if (snapshot.summary.total !== snapshot.stocks.length || snapshot.portfolio_universe.length !== snapshot.stocks.length) throw new Error("summary.total, portfolio_universe.length and stocks.length must match");
 
-              const codes = new Set();
-              let activeQuoteTotal = 0;
-              let activeHoldingTotal = 0;
-              let watchTotal = 0;
-              let coreTotal = 0;
-              let growthTotal = 0;
+              const stocksByKey = new Map();
               for (const [index, stock] of snapshot.stocks.entries()) {
-                if (!stock || typeof stock !== "object" || Array.isArray(stock)) {
-                  throw new Error("stocks[" + index + "] must be an object");
-                }
-                for (const field of requiredStockFields) {
-                  if (!Object.prototype.hasOwnProperty.call(stock, field)) {
-                    throw new Error("stocks[" + index + "]." + field + " is required");
-                  }
-                }
-                if (typeof stock.code !== "string" || !stock.code) {
-                  throw new Error("stocks[" + index + "].code must be a non-empty string");
-                }
-                if (codes.has(stock.code)) {
-                  throw new Error("duplicate stock code: " + stock.code);
-                }
-                codes.add(stock.code);
-                if (!["Core", "Growth", "Watch"].includes(stock.group)) {
-                  throw new Error("stocks[" + index + "].group is invalid");
-                }
-                if (!["ACTIVE", "MAPPING_ONLY", "WATCH"].includes(stock.holding_status)) {
-                  throw new Error("stocks[" + index + "].holding_status is invalid");
-                }
-                if (stock.mapping_to !== null && typeof stock.mapping_to !== "string") {
-                  throw new Error("stocks[" + index + "].mapping_to must be a string or null");
-                }
-                if (
-                  stock.holding_status === "MAPPING_ONLY" &&
-                  (stock.group === "Watch" || !stock.mapping_to)
-                ) {
-                  throw new Error("stocks[" + index + "] MAPPING_ONLY mapping_to is invalid");
-                }
-                if (
-                  stock.holding_status !== "MAPPING_ONLY" &&
-                  stock.mapping_to !== null
-                ) {
-                  throw new Error(
-                    "stocks[" + index + "].mapping_to is only allowed for MAPPING_ONLY",
-                  );
-                }
-                if (stock.group === "Watch" && stock.holding_status !== "WATCH") {
-                  throw new Error("stocks[" + index + "] Watch status is invalid");
-                }
-                if (stock.group !== "Watch" && stock.holding_status === "WATCH") {
-                  throw new Error("stocks[" + index + "] Core/Growth status is invalid");
-                }
-
-                for (const field of numericStockFields) {
-                  const fieldValue = stock[field];
-                  const nullableWatchField =
-                    stock.holding_status === "WATCH" && fieldValue === null;
-                  if (!Number.isFinite(fieldValue) && !nullableWatchField) {
-                    throw new Error(
-                      "stocks[" + index + "]." + field + " must be numeric or null for Watch",
-                    );
-                  }
-                }
-                for (const field of [
-                  "market_status",
-                  "freshness_basis",
-                  "source_status",
-                  "quality",
-                ]) {
-                  if (typeof stock[field] !== "string" || !stock[field]) {
-                    throw new Error(
-                      "stocks[" + index + "]." + field + " must be a non-empty string",
-                    );
-                  }
-                }
-                for (const field of [
-                  "market_data_time",
-                  "quote_time",
-                  "source_update_time",
-                ]) {
-                  if (stock[field] !== null && typeof stock[field] !== "string") {
-                    throw new Error(
-                      "stocks[" + index + "]." + field + " must be a string or null",
-                    );
-                  }
-                }
-                if (typeof stock.fetch_time !== "string" || !stock.fetch_time) {
-                  throw new Error(
-                    "stocks[" + index + "].fetch_time must be a non-empty string",
-                  );
-                }
-
-                if (stock.group === "Core") coreTotal += 1;
-                if (stock.group === "Growth") growthTotal += 1;
-                if (stock.group === "Watch") watchTotal += 1;
-                if (
-                  (stock.group === "Core" || stock.group === "Growth") &&
-                  ["ACTIVE", "MAPPING_ONLY"].includes(stock.holding_status)
-                ) {
-                  activeQuoteTotal += 1;
-                  if (stock.holding_status === "ACTIVE") activeHoldingTotal += 1;
-                }
+                if (!stock || typeof stock !== "object" || Array.isArray(stock)) throw new Error(`stocks[${index}] must be an object`);
+                for (const field of stockFields) if (!Object.prototype.hasOwnProperty.call(stock, field)) throw new Error(`stocks[${index}].${field} is required`);
+                if (typeof stock.code !== "string" || !/^\\d{5,6}$/.test(stock.code)) throw new Error(`stocks[${index}].code must be a complete code`);
+                validateClassification(stock, `stocks[${index}]`);
+                const instrumentKey = key(stock);
+                if (stocksByKey.has(instrumentKey)) throw new Error(`duplicate instrument key: ${instrumentKey}`);
+                stocksByKey.set(instrumentKey, stock);
+                for (const field of numericFields) if (!isFiniteNumber(stock[field]) && !(stock.is_position === false && stock[field] === null)) throw new Error(`stocks[${index}].${field} must be numeric or null for non-positions`);
+                if (!["OPEN", "CLOSED"].includes(stock.market_status)) throw new Error(`stocks[${index}].market_status is invalid`);
+                for (const field of ["market_status", "freshness_basis", "source_status", "quality", "fetch_time"]) if (typeof stock[field] !== "string" || !stock[field]) throw new Error(`stocks[${index}].${field} must be a non-empty string`);
+                for (const field of ["market_data_time", "source_update_time", "quote_time"]) if (stock[field] !== null && typeof stock[field] !== "string") throw new Error(`stocks[${index}].${field} must be a string or null`);
               }
 
-              if (activeQuoteTotal !== 10) {
-                throw new Error(
-                  "active quote count must be 10, got " + activeQuoteTotal,
-                );
-              }
-              const activeCodes = new Set(
-                snapshot.stocks
-                  .filter(
-                    (stock) =>
-                      (stock.group === "Core" || stock.group === "Growth") &&
-                      ["ACTIVE", "MAPPING_ONLY"].includes(stock.holding_status),
-                  )
-                  .map((stock) => stock.code),
-              );
-              for (const code of expectedActiveCodes) {
-                if (!activeCodes.has(code)) {
-                  throw new Error("active quote set is missing " + code);
-                }
-              }
-              for (const code of activeCodes) {
-                if (!expectedActiveCodes.has(code)) {
-                  throw new Error("unexpected active quote code: " + code);
-                }
-              }
-              for (const code of requiredWatchCodes) {
-                const watch = snapshot.stocks.find((stock) => stock.code === code);
-                if (!watch || watch.group !== "Watch" || watch.holding_status !== "WATCH") {
-                  throw new Error("required Watch record is missing or misclassified: " + code);
-                }
-              }
-              if (watchTotal === 0) {
-                throw new Error("snapshot must include at least one Watch record");
+              for (const keyName of expectedKeys) if (!stocksByKey.has(keyName)) throw new Error(`portfolio snapshot is missing ${keyName}`);
+              for (const keyName of stocksByKey.keys()) if (!expectedKeys.has(keyName)) throw new Error(`unexpected portfolio instrument: ${keyName}`);
+
+              const universeByKey = new Map();
+              for (const [index, item] of snapshot.portfolio_universe.entries()) {
+                if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`portfolio_universe[${index}] must be an object`);
+                validateClassification(item, `portfolio_universe[${index}]`);
+                const instrumentKey = key(item);
+                if (universeByKey.has(instrumentKey)) throw new Error(`duplicate portfolio universe key: ${instrumentKey}`);
+                universeByKey.set(instrumentKey, item);
+                const stock = stocksByKey.get(instrumentKey);
+                if (!stock) throw new Error(`portfolio_universe instrument is missing from stocks: ${instrumentKey}`);
+                for (const field of identityFields) if (item[field] !== stock[field]) throw new Error(`portfolio_universe does not match stocks for ${instrumentKey}: ${field}`);
               }
 
-              const derived = {
-                active_quote_total: activeQuoteTotal,
-                active_holding_total: activeHoldingTotal,
-                watch_total: watchTotal,
-                core_total: coreTotal,
-                growth_total: growthTotal,
-              };
-              for (const [field, expected] of Object.entries(derived)) {
-                if (field in snapshot.summary) {
-                  if (
-                    !Number.isInteger(snapshot.summary[field]) ||
-                    snapshot.summary[field] !== expected
-                  ) {
-                    throw new Error(
-                      "summary." + field + " does not match derived value " + expected,
-                    );
-                  }
-                }
+              const counts = { total: snapshot.stocks.length, activeQuoteTotal: 0, activeHoldingTotal: 0, watchTotal: 0, exitedWatchTotal: 0, coreTotal: 0, growthTotal: 0, mappingTotal: 0 };
+              for (const stock of snapshot.stocks) {
+                if (stock.portfolio_group === "core") counts.coreTotal += 1;
+                if (stock.portfolio_group === "growth") counts.growthTotal += 1;
+                if (stock.portfolio_group === "watch") counts.watchTotal += 1;
+                if (stock.portfolio_group === "exited_watch") counts.exitedWatchTotal += 1;
+                if (stock.portfolio_group === "mapping") counts.mappingTotal += 1;
+                if (["core", "growth", "mapping"].includes(stock.portfolio_group)) counts.activeQuoteTotal += 1;
+                if (stock.is_position) counts.activeHoldingTotal += 1;
               }
-              return {
-                total: snapshot.stocks.length,
-                activeQuoteTotal,
-                activeHoldingTotal,
-                watchTotal,
-                coreTotal,
-                growthTotal,
-              };
+              if (counts.total !== 17 || counts.activeQuoteTotal !== 10 || counts.activeHoldingTotal !== 9 || counts.coreTotal !== 6 || counts.growthTotal !== 3 || counts.watchTotal !== 4 || counts.exitedWatchTotal !== 3 || counts.mappingTotal !== 1) throw new Error(`portfolio counts are invalid: ${JSON.stringify(counts)}`);
+              for (const keyName of expectedActiveKeys) if (!stocksByKey.has(keyName) || !["core", "growth", "mapping"].includes(stocksByKey.get(keyName).portfolio_group)) throw new Error(`active quote set is missing ${keyName}`);
+              for (const keyName of requiredWatchKeys) if (!stocksByKey.has(keyName) || stocksByKey.get(keyName).portfolio_group !== "watch") throw new Error(`required Watch record is missing or misclassified: ${keyName}`);
+              for (const keyName of requiredExitedKeys) if (!stocksByKey.has(keyName) || stocksByKey.get(keyName).portfolio_group !== "exited_watch") throw new Error(`required Exited Watch record is missing or misclassified: ${keyName}`);
+
+              const derived = { active_quote_total: counts.activeQuoteTotal, active_holding_total: counts.activeHoldingTotal, watch_total: counts.watchTotal, exited_watch_total: counts.exitedWatchTotal, mapping_total: counts.mappingTotal, core_total: counts.coreTotal, growth_total: counts.growthTotal };
+              for (const [field, expected] of Object.entries(derived)) if (field in snapshot.summary && snapshot.summary[field] !== expected) throw new Error(`summary.${field} does not match derived value ${expected}`);
+              return counts;
             }
 
             async function fetchSnapshot(source) {
@@ -300,126 +148,58 @@ jobs:
               const timer = setTimeout(() => controller.abort(), 15000);
               try {
                 const separator = source.includes("?") ? "&" : "?";
-                const response = await fetch(
-                  source + separator + "_bridge_ts=" + Date.now(),
-                  {
-                    method: "GET",
-                    headers: {
-                      Accept: "application/json",
-                      "Cache-Control": "no-cache",
-                      "User-Agent": "cn-hk-quotes-github-bridge/1.0",
-                    },
-                    signal: controller.signal,
-                  },
-                );
+                const response = await fetch(source + separator + "_bridge_ts=" + Date.now(), { method: "GET", headers: { Accept: "application/json", "Cache-Control": "no-cache", "User-Agent": "cn-hk-quotes-github-bridge/1.0" }, signal: controller.signal });
                 const raw = await response.text();
-                if (!response.ok) {
-                  const error = new Error(
-                    "HTTP " + response.status + ": " + raw.slice(0, 500),
-                  );
-                  error.httpStatus = response.status;
-                  throw error;
-                }
-                try {
-                  return JSON.parse(raw);
-                } catch {
-                  throw new Error("upstream returned invalid JSON");
-                }
-              } finally {
-                clearTimeout(timer);
-              }
+                if (!response.ok) { const error = new Error("HTTP " + response.status + ": " + raw.slice(0, 500)); error.httpStatus = response.status; throw error; }
+                try { return JSON.parse(raw); } catch { throw new Error("upstream returned invalid JSON"); }
+              } finally { clearTimeout(timer); }
             }
 
             let payload;
             let fetchError = null;
             let usedSource = null;
             let counts = null;
-
             try {
-              if (sources.length === 0) {
-                throw new Error("no upstream source configured");
-              }
               let lastError = null;
               for (const [index, source] of sources.entries()) {
                 try {
                   const candidate = await fetchSnapshot(source);
                   counts = validateSnapshot(candidate);
-                  payload = {
-                    schema_version: "1.0",
-                    bridge: {
-                      last_attempt_at: now,
-                      last_attempt_status: "SUCCESS",
-                      last_success_at: now,
-                      workflow_run_id: String(context.runId),
-                      workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"),
-                      source,
-                      error: null,
-                    },
-                    snapshot: candidate,
-                  };
+                  payload = { schema_version: "1.0", bridge: { last_attempt_at: now, last_attempt_status: "SUCCESS", last_success_at: now, workflow_run_id: String(context.runId), workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"), source, error: null }, snapshot: candidate };
                   usedSource = source;
                   break;
                 } catch (error) {
                   lastError = error;
-                  if (error?.httpStatus === 404 && index < sources.length - 1) {
-                    core.info(
-                      "upstream 404 at " + source +
-                        "; retrying " + sources[index + 1],
-                    );
-                    continue;
-                  }
+                  if (error?.httpStatus === 404 && index < sources.length - 1) { core.info("upstream 404 at " + source + "; retrying " + sources[index + 1]); continue; }
                   throw error;
                 }
               }
-              if (!payload) {
-                throw lastError || new Error("all upstream sources failed");
-              }
+              if (!payload) throw lastError || new Error("all upstream sources failed");
             } catch (error) {
-              fetchError =
-                error instanceof Error
-                  ? error.name + ": " + error.message
-                  : String(error);
-              payload = {
-                schema_version: "1.0",
-                bridge: {
-                  last_attempt_at: now,
-                  last_attempt_status: "FAIL",
-                  last_success_at: previousLastSuccess,
-                  workflow_run_id: String(context.runId),
-                  workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"),
-                  source: usedSource || sources[0] || "unknown",
-                  error: fetchError,
-                },
-                snapshot: previousSnapshot,
-              };
+              fetchError = error instanceof Error ? error.name + ": " + error.message : String(error);
+              payload = { schema_version: "1.0", bridge: { last_attempt_at: now, last_attempt_status: "FAIL", last_success_at: previousLastSuccess, workflow_run_id: String(context.runId), workflow_run_attempt: String(process.env.GITHUB_RUN_ATTEMPT || "1"), source: usedSource || sources[0] || "unknown", error: fetchError }, snapshot: previousSnapshot };
             }
 
             const body = [
               "# A/H 行情计划任务数据桥",
               "",
-              "> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照包含 Core、Growth、Watch 全量标的；请勿手工编辑 JSON 区域。",
+              "> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照覆盖 Core、Growth、Watch、Exited Watch 和 H 股 Mapping 的全部 17 只标的；请勿手工编辑 JSON 区域。",
               "",
               fence + "json",
               JSON.stringify(payload, null, 2),
               fence,
-            ].join("\n");
-
-            await github.rest.issues.update({
-              owner,
-              repo,
-              issue_number: issueNumber,
-              body,
-            });
+            ].join("\\n");
+            await github.rest.issues.update({ owner, repo, issue_number: issueNumber, body });
 
             core.info("bridge_status=" + payload.bridge.last_attempt_status);
             core.info("snapshot_time=" + (payload.snapshot?.snapshot_time ?? "null"));
             core.info("system_quality=" + (payload.snapshot?.system_quality ?? "null"));
             core.info("total=" + (payload.snapshot?.summary?.total ?? "null"));
             core.info("active_quote_total=" + (counts?.activeQuoteTotal ?? "null"));
-            core.info("watch_total=" + (counts?.watchTotal ?? "null"));
+            core.info("active_holding_total=" + (counts?.activeHoldingTotal ?? "null"));
             core.info("core_total=" + (counts?.coreTotal ?? "null"));
             core.info("growth_total=" + (counts?.growthTotal ?? "null"));
-
-            if (fetchError) {
-              core.setFailed(fetchError);
-            }
+            core.info("watch_total=" + (counts?.watchTotal ?? "null"));
+            core.info("exited_watch_total=" + (counts?.exitedWatchTotal ?? "null"));
+            core.info("mapping_total=" + (counts?.mappingTotal ?? "null"));
+            if (fetchError) core.setFailed(fetchError);
