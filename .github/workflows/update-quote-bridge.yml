@@ -188,7 +188,7 @@ jobs:
               fence + "json",
               JSON.stringify(payload, null, 2),
               fence,
-            ].join("\\n");
+            ].join("\n");
             await github.rest.issues.update({ owner, repo, issue_number: issueNumber, body });
 
             core.info("bridge_status=" + payload.bridge.last_attempt_status);
