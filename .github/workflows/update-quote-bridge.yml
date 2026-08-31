@@ -97,7 +97,7 @@ jobs:
               for (const [index, stock] of snapshot.stocks.entries()) {
                 if (!stock || typeof stock !== "object" || Array.isArray(stock)) throw new Error(`stocks[${index}] must be an object`);
                 for (const field of stockFields) if (!Object.prototype.hasOwnProperty.call(stock, field)) throw new Error(`stocks[${index}].${field} is required`);
-                if (typeof stock.code !== "string" || !/^\\d{5,6}$/.test(stock.code)) throw new Error(`stocks[${index}].code must be a complete code`);
+                if (typeof stock.code !== "string" || !/^\d{5,6}$/.test(stock.code)) throw new Error(`stocks[${index}].code must be a complete code`);
                 validateClassification(stock, `stocks[${index}]`);
                 const instrumentKey = key(stock);
                 if (stocksByKey.has(instrumentKey)) throw new Error(`duplicate instrument key: ${instrumentKey}`);
