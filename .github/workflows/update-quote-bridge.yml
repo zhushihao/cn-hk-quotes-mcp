@@ -47,27 +47,29 @@ jobs:
             // The Site emits the runtime PORTFOLIO_UNIVERSE used below.
             const expectedKeys = new Set([
               "CN:300308", "HK:03308", "CN:300502", "CN:300394", "CN:688676",
-              "CN:601872", "CN:588080", "CN:300433", "CN:588170", "CN:603308",
-              "CN:600096", "CN:605376", "CN:301183", "CN:688596", "HK:09988",
-              "HK:02228", "CN:603893",
+              "CN:601872", "CN:588080", "HK:09696", "CN:002466", "CN:002192",
+              "CN:300433", "CN:588170", "CN:603308", "CN:600096", "CN:605376",
+              "CN:301183", "CN:688596", "HK:09988", "HK:02228", "CN:603893",
+              "CN:002460", "CN:002240", "CN:002738",
             ]);
             const expectedActiveKeys = new Set([
               "CN:300308", "HK:03308", "CN:300502", "CN:300394", "CN:688676",
-              "CN:601872", "CN:588080", "CN:300433", "CN:588170", "CN:603308",
+              "CN:601872", "CN:588080", "HK:09696", "CN:002466", "CN:002192",
+              "CN:300433", "CN:588170", "CN:603308",
             ]);
-            const requiredWatchKeys = ["CN:600096", "HK:09988", "HK:02228", "CN:603893"];
-            const requiredExitedKeys = ["CN:605376", "CN:301183", "CN:688596"];
+            const requiredWatchKeys = ["CN:600096", "CN:605376", "CN:301183", "CN:688596", "HK:09988", "HK:02228", "CN:603893", "CN:002460", "CN:002240", "CN:002738"];
+            const requiredMappingKeys = ["HK:03308", "CN:002466"];
             const stockFields = [
               "code", "market", "exchange", "name", "group", "portfolio_group",
-              "holding_status", "mapping_to", "position_qty", "is_position", "price",
-              "pre_close", "open", "high", "low", "pct_change", "volume", "amount",
+              "portfolio_status", "holding_status", "mapping_only", "mapped_to", "mapping_to", "position_qty", "is_position", "price",
+              "change", "change_pct", "pre_close", "prev_close", "open", "high", "low", "pct_change", "volume", "amount",
               "market_status", "market_data_time", "source_update_time", "freshness_basis",
-              "quote_time", "fetch_time", "age_seconds", "source_status", "quality",
+              "quote_time", "fetch_time", "age_seconds", "primary_source", "secondary_source", "source_status", "quality",
             ];
-            const numericFields = ["price", "pre_close", "open", "high", "low", "pct_change", "volume", "amount", "age_seconds"];
+            const numericFields = ["price", "change", "change_pct", "pre_close", "prev_close", "open", "high", "low", "pct_change", "volume", "amount", "age_seconds"];
             const identityFields = [
               "code", "market", "exchange", "name", "group", "portfolio_group",
-              "holding_status", "mapping_to", "position_qty", "is_position",
+              "portfolio_status", "holding_status", "mapping_only", "mapped_to", "mapping_to", "position_qty", "is_position",
             ];
             const key = (stock) => `${stock.market}:${stock.code}`;
             const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
@@ -77,19 +79,27 @@ jobs:
               if (!["SZ", "SH", "HK"].includes(stock.exchange)) throw new Error(`${label}.exchange is invalid`);
               if ((stock.market === "HK") !== (stock.exchange === "HK")) throw new Error(`${label}.market/exchange mismatch`);
               if (!["Core", "Growth", "Watch"].includes(stock.group)) throw new Error(`${label}.group is invalid`);
-              if (!["core", "growth", "watch", "exited_watch", "mapping"].includes(stock.portfolio_group)) throw new Error(`${label}.portfolio_group is invalid`);
-              if (!["ACTIVE", "MAPPING_ONLY", "WATCH", "EXITED"].includes(stock.holding_status)) throw new Error(`${label}.holding_status is invalid`);
+              if (!["core", "growth", "watch", "mapping"].includes(stock.portfolio_group)) throw new Error(`${label}.portfolio_group is invalid`);
+              if (!["CORE", "GROWTH", "WATCH", null].includes(stock.portfolio_status)) throw new Error(`${label}.portfolio_status is invalid`);
+              if (!["ACTIVE", "MAPPING_ONLY", "WATCH"].includes(stock.holding_status)) throw new Error(`${label}.holding_status is invalid`);
+              if (typeof stock.mapping_only !== "boolean") throw new Error(`${label}.mapping_only is invalid`);
               const broad = stock.portfolio_group === "core" || stock.portfolio_group === "mapping" ? "Core" : stock.portfolio_group === "growth" ? "Growth" : "Watch";
               if (stock.group !== broad) throw new Error(`${label}.group does not match portfolio_group`);
-              const status = stock.portfolio_group === "mapping" ? "MAPPING_ONLY" : stock.portfolio_group === "exited_watch" ? "EXITED" : stock.portfolio_group === "watch" ? "WATCH" : "ACTIVE";
+              const status = stock.portfolio_group === "mapping" ? "MAPPING_ONLY" : stock.portfolio_group === "watch" ? "WATCH" : "ACTIVE";
               if (stock.holding_status !== status) throw new Error(`${label}.holding_status does not match portfolio_group`);
-              if (stock.portfolio_group === "mapping" ? typeof stock.mapping_to !== "string" || !stock.mapping_to : stock.mapping_to !== null) throw new Error(`${label}.mapping_to is invalid`);
-              if (!isFiniteNumber(stock.position_qty) || stock.position_qty < 0) throw new Error(`${label}.position_qty is invalid`);
-              if (typeof stock.is_position !== "boolean" || stock.is_position !== (stock.holding_status === "ACTIVE") || (!stock.is_position && stock.position_qty !== 0) || (stock.is_position && stock.position_qty <= 0)) throw new Error(`${label}.position_qty/is_position is inconsistent`);
+              const portfolioStatus = stock.portfolio_group === "core" ? "CORE" : stock.portfolio_group === "growth" ? "GROWTH" : stock.portfolio_group === "watch" ? "WATCH" : null;
+              if (stock.portfolio_status !== portfolioStatus) throw new Error(`${label}.portfolio_status does not match portfolio_group`);
+              if (stock.mapping_only !== (stock.portfolio_group === "mapping")) throw new Error(`${label}.mapping_only does not match portfolio_group`);
+              if (stock.mapped_to !== stock.mapping_to) throw new Error(`${label}.mapped_to/mapping_to mismatch`);
+              if (stock.portfolio_group === "mapping" ? typeof stock.mapping_to !== "string" || !stock.mapping_to : stock.mapping_to !== null || stock.mapped_to !== null) throw new Error(`${label}.mapping_to is invalid`);
+              if (stock.position_qty !== null && (!isFiniteNumber(stock.position_qty) || stock.position_qty < 0)) throw new Error(`${label}.position_qty is invalid`);
+              const expectedPosition = stock.portfolio_group === "core" || stock.portfolio_group === "growth";
+              if (typeof stock.is_position !== "boolean" || stock.is_position !== expectedPosition || (!stock.is_position && stock.position_qty !== 0) || (stock.is_position && stock.position_qty !== null && stock.position_qty <= 0)) throw new Error(`${label}.position_qty/is_position is inconsistent`);
             }
 
             function validateSnapshot(snapshot) {
               if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) throw new Error("upstream returned non-object JSON");
+              if (snapshot.portfolio_version !== "2026-09-01-v4") throw new Error("portfolio_version must be 2026-09-01-v4");
               if (typeof snapshot.snapshot_time !== "string" || typeof snapshot.system_quality !== "string" || !snapshot.summary || typeof snapshot.summary !== "object" || !Number.isInteger(snapshot.summary.total) || !Array.isArray(snapshot.stocks) || !Array.isArray(snapshot.portfolio_universe)) throw new Error("upstream JSON is missing required snapshot fields");
               if (snapshot.summary.total !== snapshot.stocks.length || snapshot.portfolio_universe.length !== snapshot.stocks.length) throw new Error("summary.total, portfolio_universe.length and stocks.length must match");
 
@@ -128,15 +138,14 @@ jobs:
                 if (stock.portfolio_group === "core") counts.coreTotal += 1;
                 if (stock.portfolio_group === "growth") counts.growthTotal += 1;
                 if (stock.portfolio_group === "watch") counts.watchTotal += 1;
-                if (stock.portfolio_group === "exited_watch") counts.exitedWatchTotal += 1;
                 if (stock.portfolio_group === "mapping") counts.mappingTotal += 1;
                 if (["core", "growth", "mapping"].includes(stock.portfolio_group)) counts.activeQuoteTotal += 1;
                 if (stock.is_position) counts.activeHoldingTotal += 1;
               }
-              if (counts.total !== 17 || counts.activeQuoteTotal !== 10 || counts.activeHoldingTotal !== 9 || counts.coreTotal !== 6 || counts.growthTotal !== 3 || counts.watchTotal !== 4 || counts.exitedWatchTotal !== 3 || counts.mappingTotal !== 1) throw new Error(`portfolio counts are invalid: ${JSON.stringify(counts)}`);
+              if (counts.total !== 23 || counts.activeQuoteTotal !== 13 || counts.activeHoldingTotal !== 11 || counts.coreTotal !== 8 || counts.growthTotal !== 3 || counts.watchTotal !== 10 || counts.exitedWatchTotal !== 0 || counts.mappingTotal !== 2) throw new Error(`portfolio counts are invalid: ${JSON.stringify(counts)}`);
               for (const keyName of expectedActiveKeys) if (!stocksByKey.has(keyName) || !["core", "growth", "mapping"].includes(stocksByKey.get(keyName).portfolio_group)) throw new Error(`active quote set is missing ${keyName}`);
               for (const keyName of requiredWatchKeys) if (!stocksByKey.has(keyName) || stocksByKey.get(keyName).portfolio_group !== "watch") throw new Error(`required Watch record is missing or misclassified: ${keyName}`);
-              for (const keyName of requiredExitedKeys) if (!stocksByKey.has(keyName) || stocksByKey.get(keyName).portfolio_group !== "exited_watch") throw new Error(`required Exited Watch record is missing or misclassified: ${keyName}`);
+              for (const keyName of requiredMappingKeys) if (!stocksByKey.has(keyName) || stocksByKey.get(keyName).portfolio_group !== "mapping" || stocksByKey.get(keyName).portfolio_status !== null || stocksByKey.get(keyName).mapping_only !== true) throw new Error(`required mapping record is missing or misclassified: ${keyName}`);
 
               const derived = { active_quote_total: counts.activeQuoteTotal, active_holding_total: counts.activeHoldingTotal, watch_total: counts.watchTotal, exited_watch_total: counts.exitedWatchTotal, mapping_total: counts.mappingTotal, core_total: counts.coreTotal, growth_total: counts.growthTotal };
               for (const [field, expected] of Object.entries(derived)) if (field in snapshot.summary && snapshot.summary[field] !== expected) throw new Error(`summary.${field} does not match derived value ${expected}`);
@@ -183,7 +192,7 @@ jobs:
             const body = [
               "# A/H 行情计划任务数据桥",
               "",
-              "> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照覆盖 Core、Growth、Watch、Exited Watch 和 H 股 Mapping 的全部 17 只标的；请勿手工编辑 JSON 区域。",
+              "> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照版本为 2026-09-01-v4，覆盖 Core、Growth、Watch 和 A/H Mapping 的全部 23 只行情标的；工程侧不再维护 Exited Watch；请勿手工编辑 JSON 区域。",
               "",
               fence + "json",
               JSON.stringify(payload, null, 2),
@@ -192,6 +201,7 @@ jobs:
             await github.rest.issues.update({ owner, repo, issue_number: issueNumber, body });
 
             core.info("bridge_status=" + payload.bridge.last_attempt_status);
+            core.info("portfolio_version=" + (payload.snapshot?.portfolio_version ?? "null"));
             core.info("snapshot_time=" + (payload.snapshot?.snapshot_time ?? "null"));
             core.info("system_quality=" + (payload.snapshot?.system_quality ?? "null"));
             core.info("total=" + (payload.snapshot?.summary?.total ?? "null"));
@@ -200,6 +210,6 @@ jobs:
             core.info("core_total=" + (counts?.coreTotal ?? "null"));
             core.info("growth_total=" + (counts?.growthTotal ?? "null"));
             core.info("watch_total=" + (counts?.watchTotal ?? "null"));
-            core.info("exited_watch_total=" + (counts?.exitedWatchTotal ?? "null"));
+            core.info("exited_watch_total=" + (counts?.exitedWatchTotal ?? "0"));
             core.info("mapping_total=" + (counts?.mappingTotal ?? "null"));
             if (fetchError) core.setFailed(fetchError);

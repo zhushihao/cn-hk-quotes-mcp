@@ -85,7 +85,7 @@ function createIssueBody(payload: BridgePayload): string {
 	return [
 		"# A/H 行情计划任务数据桥",
 		"",
-		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照覆盖 Core、Growth、Watch、Exited Watch 和 H 股 Mapping 的全部 17 只标的；请勿手工编辑 JSON 区域。",
+		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照版本为 2026-09-01-v4，覆盖 Core、Growth、Watch 和 A/H Mapping 的全部 23 只行情标的；工程侧不再维护 Exited Watch；请勿手工编辑 JSON 区域。",
 		"",
 		"```json",
 		JSON.stringify(payload, null, 2),
@@ -204,6 +204,7 @@ async function fetchUpstreamSnapshot(
 				active_quote_count: counts.activeQuoteTotal,
 				active_holding_count: counts.activeHoldingTotal,
 				watch_count: counts.watchTotal,
+				portfolio_version: snapshot.portfolio_version,
 				exited_watch_count: counts.exitedWatchTotal,
 				mapping_count: counts.mappingTotal,
 				core_count: counts.coreTotal,
@@ -340,6 +341,7 @@ export async function updateQuoteBridge(
 	}
 
 	logBridgeStage(context, "bridge_success", {
+		portfolio_version: payload.snapshot?.portfolio_version ?? null,
 		snapshot_time: payload.snapshot?.snapshot_time ?? null,
 		stock_count: payload.snapshot?.stocks.length ?? 0,
 	});
@@ -404,7 +406,7 @@ function createServer() {
 		"get_portfolio_quotes",
 		{
 			description:
-				"获取 Site 返回的全部 17 只 Core、Growth、Watch、Exited Watch 和 H 股 Mapping 标的结构化行情快照。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组和持仓状态等。仅用于只读行情查询。",
+				"获取 Site 返回的 portfolio_version=2026-09-01-v4 的全部 23 只 Core、Growth、Watch 和 A/H Mapping 标的结构化行情快照。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
 			inputSchema: z.object({}),
 		},
 		async () => {

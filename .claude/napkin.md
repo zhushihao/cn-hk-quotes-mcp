@@ -13,8 +13,8 @@
    Do instead: retry the public Site endpoint on HTTP 404 and record the actual source used.
 2. **[2026-08-28] Cloudflare cron weekday numbers are 1=Sunday through 7=Saturday**
    Do instead: use named ranges such as `mon-fri` so weekday intent cannot drift.
-3. **[2026-09-01] The Site emits the complete 17-instrument `PORTFOLIO_UNIVERSE`**
-   Do instead: treat the bridge's market-qualified keys as a validation guard, not a second editable holding list; keep Watch and Exited Watch records in every full snapshot.
+3. **[2026-09-01] The Site emits the complete v4 23-instrument `PORTFOLIO_UNIVERSE`**
+   Do instead: treat the bridge's market-qualified keys as a validation guard, not a second editable holding list; keep all ten Watch records and both A/H mappings in every full snapshot, with no Exited Watch status.
 4. **[2026-09-01] Market plus complete code is the only instrument identity**
    Do instead: use keys such as `CN:603308` and `HK:03308`; never match shortened pure-number aliases.
 

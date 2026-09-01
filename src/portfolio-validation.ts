@@ -1,6 +1,10 @@
+export const EXPECTED_PORTFOLIO_VERSION = "2026-09-01-v4";
+
 export type QuoteGroup = "Core" | "Growth" | "Watch";
-export type PortfolioGroup = "core" | "growth" | "watch" | "exited_watch" | "mapping";
-export type HoldingStatus = "ACTIVE" | "MAPPING_ONLY" | "WATCH" | "EXITED";
+/** Lower-case technical buckets. Mapping is a quote row type, not a status. */
+export type PortfolioGroup = "core" | "growth" | "watch" | "mapping";
+export type PortfolioStatus = "CORE" | "GROWTH" | "WATCH" | null;
+export type HoldingStatus = "ACTIVE" | "MAPPING_ONLY" | "WATCH";
 
 export type QuoteStock = {
 	code: string;
@@ -9,9 +13,13 @@ export type QuoteStock = {
 	name: string;
 	group: QuoteGroup;
 	portfolio_group: PortfolioGroup;
+	portfolio_status: PortfolioStatus;
 	holding_status: HoldingStatus;
+	mapping_only: boolean;
+	mapped_to: string | null;
+	/** Legacy alias retained in the snapshot contract. */
 	mapping_to: string | null;
-	position_qty: number;
+	position_qty: number | null;
 	is_position: boolean;
 	[key: string]: unknown;
 };
@@ -24,7 +32,10 @@ export type PortfolioUniverseItem = Pick<
 	| "name"
 	| "group"
 	| "portfolio_group"
+	| "portfolio_status"
 	| "holding_status"
+	| "mapping_only"
+	| "mapped_to"
 	| "mapping_to"
 	| "position_qty"
 	| "is_position"
@@ -36,6 +47,7 @@ export type QuoteSummary = {
 };
 
 export type QuoteSnapshot = {
+	portfolio_version: string;
 	snapshot_time: string;
 	system_quality: string;
 	summary: QuoteSummary;
@@ -62,8 +74,8 @@ export type SnapshotValidationOptions = {
 
 /**
  * This is a validation contract, not a second editable portfolio config.
- * The actual runtime universe is emitted by the Site's PORTFOLIO_UNIVERSE;
- * these keys prevent an old or partially updated Site from being accepted.
+ * The Site's PORTFOLIO_UNIVERSE is the runtime source of truth; these keys
+ * prevent an old or partially updated Site from being accepted by the bridge.
  */
 export const EXPECTED_MARKET_CODE_KEYS = [
 	"CN:300308",
@@ -73,6 +85,9 @@ export const EXPECTED_MARKET_CODE_KEYS = [
 	"CN:688676",
 	"CN:601872",
 	"CN:588080",
+	"HK:09696",
+	"CN:002466",
+	"CN:002192",
 	"CN:300433",
 	"CN:588170",
 	"CN:603308",
@@ -83,6 +98,9 @@ export const EXPECTED_MARKET_CODE_KEYS = [
 	"HK:09988",
 	"HK:02228",
 	"CN:603893",
+	"CN:002460",
+	"CN:002240",
+	"CN:002738",
 ] as const;
 
 export const EXPECTED_ACTIVE_QUOTE_KEYS = [
@@ -93,6 +111,9 @@ export const EXPECTED_ACTIVE_QUOTE_KEYS = [
 	"CN:688676",
 	"CN:601872",
 	"CN:588080",
+	"HK:09696",
+	"CN:002466",
+	"CN:002192",
 	"CN:300433",
 	"CN:588170",
 	"CN:603308",
@@ -100,31 +121,23 @@ export const EXPECTED_ACTIVE_QUOTE_KEYS = [
 
 export const REQUIRED_WATCH_KEYS = [
 	"CN:600096",
-	"HK:09988",
-	"HK:02228",
-	"CN:603893",
-] as const;
-
-export const REQUIRED_EXITED_WATCH_KEYS = [
 	"CN:605376",
 	"CN:301183",
 	"CN:688596",
+	"HK:09988",
+	"HK:02228",
+	"CN:603893",
+	"CN:002460",
+	"CN:002240",
+	"CN:002738",
 ] as const;
 
+export const REQUIRED_MAPPING_KEYS = ["HK:03308", "CN:002466"] as const;
+
 const GROUPS = new Set<QuoteGroup>(["Core", "Growth", "Watch"]);
-const PORTFOLIO_GROUPS = new Set<PortfolioGroup>([
-	"core",
-	"growth",
-	"watch",
-	"exited_watch",
-	"mapping",
-]);
-const HOLDING_STATUSES = new Set<HoldingStatus>([
-	"ACTIVE",
-	"MAPPING_ONLY",
-	"WATCH",
-	"EXITED",
-]);
+const PORTFOLIO_GROUPS = new Set<PortfolioGroup>(["core", "growth", "watch", "mapping"]);
+const PORTFOLIO_STATUSES = new Set<Exclude<PortfolioStatus, null>>(["CORE", "GROWTH", "WATCH"]);
+const HOLDING_STATUSES = new Set<HoldingStatus>(["ACTIVE", "MAPPING_ONLY", "WATCH"]);
 const MARKETS = new Set(["CN", "HK"]);
 const EXCHANGES = new Set(["SZ", "SH", "HK"]);
 
@@ -135,12 +148,18 @@ const REQUIRED_STOCK_FIELDS = [
 	"name",
 	"group",
 	"portfolio_group",
+	"portfolio_status",
 	"holding_status",
+	"mapping_only",
+	"mapped_to",
 	"mapping_to",
 	"position_qty",
 	"is_position",
 	"price",
+	"change",
+	"change_pct",
 	"pre_close",
+	"prev_close",
 	"open",
 	"high",
 	"low",
@@ -154,6 +173,8 @@ const REQUIRED_STOCK_FIELDS = [
 	"quote_time",
 	"fetch_time",
 	"age_seconds",
+	"primary_source",
+	"secondary_source",
 	"source_status",
 	"quality",
 ] as const;
@@ -196,6 +217,7 @@ function validateClassification(
 	const exchange = stock.exchange;
 	const group = stock.group;
 	const portfolioGroup = stock.portfolio_group;
+	const portfolioStatus = stock.portfolio_status;
 	const holdingStatus = stock.holding_status;
 	if (typeof market !== "string" || !MARKETS.has(market)) {
 		throw new Error(`${context}.market must be CN or HK`);
@@ -209,17 +231,17 @@ function validateClassification(
 	if (typeof group !== "string" || !GROUPS.has(group as QuoteGroup)) {
 		throw new Error(`${context}.group must be Core, Growth, or Watch`);
 	}
-	if (
-		typeof portfolioGroup !== "string" ||
-		!PORTFOLIO_GROUPS.has(portfolioGroup as PortfolioGroup)
-	) {
+	if (typeof portfolioGroup !== "string" || !PORTFOLIO_GROUPS.has(portfolioGroup as PortfolioGroup)) {
 		throw new Error(`${context}.portfolio_group is invalid`);
 	}
-	if (
-		typeof holdingStatus !== "string" ||
-		!HOLDING_STATUSES.has(holdingStatus as HoldingStatus)
-	) {
+	if (portfolioStatus !== null && (typeof portfolioStatus !== "string" || !PORTFOLIO_STATUSES.has(portfolioStatus as Exclude<PortfolioStatus, null>))) {
+		throw new Error(`${context}.portfolio_status must be CORE, GROWTH, WATCH, or null`);
+	}
+	if (typeof holdingStatus !== "string" || !HOLDING_STATUSES.has(holdingStatus as HoldingStatus)) {
 		throw new Error(`${context}.holding_status is invalid`);
+	}
+	if (typeof stock.mapping_only !== "boolean") {
+		throw new Error(`${context}.mapping_only must be boolean`);
 	}
 
 	const normalizedGroup = group as QuoteGroup;
@@ -235,53 +257,73 @@ function validateClassification(
 		throw new Error(`${context}.group does not match portfolio_group`);
 	}
 
-	const mappingTo = stock.mapping_to;
-	if (mappingTo !== null && typeof mappingTo !== "string") {
-		throw new Error(`${context}.mapping_to must be a string or null`);
-	}
 	const expectedStatus: HoldingStatus =
 		normalizedPortfolioGroup === "mapping"
 			? "MAPPING_ONLY"
-			: normalizedPortfolioGroup === "exited_watch"
-				? "EXITED"
-				: normalizedPortfolioGroup === "watch"
-					? "WATCH"
-					: "ACTIVE";
+			: normalizedPortfolioGroup === "watch"
+				? "WATCH"
+				: "ACTIVE";
 	if (normalizedStatus !== expectedStatus) {
 		throw new Error(`${context}.holding_status does not match portfolio_group`);
+	}
+	const expectedPortfolioStatus: PortfolioStatus =
+		normalizedPortfolioGroup === "core"
+			? "CORE"
+			: normalizedPortfolioGroup === "growth"
+				? "GROWTH"
+				: normalizedPortfolioGroup === "watch"
+					? "WATCH"
+					: null;
+	if (portfolioStatus !== expectedPortfolioStatus) {
+		throw new Error(`${context}.portfolio_status does not match portfolio_group`);
+	}
+	const expectedMappingOnly = normalizedPortfolioGroup === "mapping";
+	if (stock.mapping_only !== expectedMappingOnly) {
+		throw new Error(`${context}.mapping_only does not match portfolio_group`);
+	}
+
+	const mappingTo = stock.mapping_to;
+	const mappedTo = stock.mapped_to;
+	for (const [field, value] of [["mapping_to", mappingTo], ["mapped_to", mappedTo]] as const) {
+		if (value !== null && typeof value !== "string") {
+			throw new Error(`${context}.${field} must be a string or null`);
+		}
+	}
+	if (mappingTo !== mappedTo) {
+		throw new Error(`${context}.mapping_to and mapped_to must match`);
 	}
 	if (normalizedPortfolioGroup === "mapping") {
 		if (typeof mappingTo !== "string" || !mappingTo) {
 			throw new Error(`${context}.mapping records require a non-empty mapping_to`);
 		}
-	} else if (mappingTo !== null) {
-		throw new Error(`${context}.mapping_to is only allowed for mapping records`);
+	} else if (mappingTo !== null || mappedTo !== null) {
+		throw new Error(`${context}.mapping fields are only allowed for mapping records`);
 	}
 
 	const positionQty = stock.position_qty;
-	if (!isFiniteNumber(positionQty) || positionQty < 0) {
-		throw new Error(`${context}.position_qty must be a non-negative number`);
+	if (positionQty !== null && (!isFiniteNumber(positionQty) || positionQty < 0)) {
+		throw new Error(`${context}.position_qty must be null or a non-negative number`);
 	}
 	const isPosition = stock.is_position;
 	if (typeof isPosition !== "boolean") {
 		throw new Error(`${context}.is_position must be boolean`);
 	}
-	const expectedIsPosition = normalizedStatus === "ACTIVE";
-	if (isPosition !== expectedIsPosition || (isPosition && positionQty <= 0) || (!isPosition && positionQty !== 0)) {
+	if (isPosition !== (normalizedPortfolioGroup === "core" || normalizedPortfolioGroup === "growth")) {
 		throw new Error(`${context}.position_qty and is_position are inconsistent`);
+	}
+	if (!isPosition && positionQty !== 0) {
+		throw new Error(`${context}.non-position rows must have position_qty=0`);
+	}
+	if (isPosition && positionQty !== null && positionQty <= 0) {
+		throw new Error(`${context}.position_qty must be positive when supplied for a position`);
 	}
 }
 
 function validateStock(value: unknown, index: number): QuoteStock {
 	const context = `stocks[${index}]`;
-	if (!isRecord(value)) {
-		throw new Error(`${context} must be an object`);
-	}
-
+	if (!isRecord(value)) throw new Error(`${context} must be an object`);
 	for (const field of REQUIRED_STOCK_FIELDS) {
-		if (!(field in value)) {
-			throw new Error(`${context}.${field} is required`);
-		}
+		if (!(field in value)) throw new Error(`${context}.${field} is required`);
 	}
 	requireString(value, "code", context);
 	requireString(value, "name", context);
@@ -289,7 +331,10 @@ function validateStock(value: unknown, index: number): QuoteStock {
 
 	const numericFields = [
 		"price",
+		"change",
+		"change_pct",
 		"pre_close",
+		"prev_close",
 		"open",
 		"high",
 		"low",
@@ -305,7 +350,6 @@ function validateStock(value: unknown, index: number): QuoteStock {
 			throw new Error(`${context}.${field} must be a finite number`);
 		}
 	}
-
 	for (const field of ["market_status", "freshness_basis", "source_status", "quality"] as const) {
 		requireString(value, field, context);
 	}
@@ -319,15 +363,18 @@ function validateStock(value: unknown, index: number): QuoteStock {
 		}
 	}
 	requireString(value, "fetch_time", context);
-
+	for (const field of ["primary_source", "secondary_source"] as const) {
+		const fieldValue = value[field];
+		if (typeof fieldValue !== "string" && fieldValue !== null) {
+			throw new Error(`${context}.${field} must be a string or null`);
+		}
+	}
 	return value as QuoteStock;
 }
 
 function validateUniverseItem(value: unknown, index: number): PortfolioUniverseItem {
 	const context = `portfolio_universe[${index}]`;
-	if (!isRecord(value)) {
-		throw new Error(`${context} must be an object`);
-	}
+	if (!isRecord(value)) throw new Error(`${context} must be an object`);
 	for (const field of [
 		"code",
 		"market",
@@ -335,14 +382,15 @@ function validateUniverseItem(value: unknown, index: number): PortfolioUniverseI
 		"name",
 		"group",
 		"portfolio_group",
+		"portfolio_status",
 		"holding_status",
+		"mapping_only",
+		"mapped_to",
 		"mapping_to",
 		"position_qty",
 		"is_position",
 	] as const) {
-		if (!(field in value)) {
-			throw new Error(`${context}.${field} is required`);
-		}
+		if (!(field in value)) throw new Error(`${context}.${field} is required`);
 	}
 	requireString(value, "code", context);
 	requireString(value, "name", context);
@@ -354,7 +402,6 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 	let activeQuoteTotal = 0;
 	let activeHoldingTotal = 0;
 	let watchTotal = 0;
-	let exitedWatchTotal = 0;
 	let coreTotal = 0;
 	let growthTotal = 0;
 	let mappingTotal = 0;
@@ -363,13 +410,11 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 		if (stock.portfolio_group === "core") coreTotal += 1;
 		if (stock.portfolio_group === "growth") growthTotal += 1;
 		if (stock.portfolio_group === "watch") watchTotal += 1;
-		if (stock.portfolio_group === "exited_watch") exitedWatchTotal += 1;
 		if (stock.portfolio_group === "mapping") mappingTotal += 1;
-		if (stock.portfolio_group === "core" || stock.portfolio_group === "growth") {
+		if (stock.portfolio_group === "core" || stock.portfolio_group === "growth" || stock.portfolio_group === "mapping") {
 			activeQuoteTotal += 1;
 			if (stock.is_position) activeHoldingTotal += 1;
 		}
-		if (stock.portfolio_group === "mapping") activeQuoteTotal += 1;
 	}
 
 	return {
@@ -377,7 +422,7 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 		activeQuoteTotal,
 		activeHoldingTotal,
 		watchTotal,
-		exitedWatchTotal,
+		exitedWatchTotal: 0,
 		coreTotal,
 		growthTotal,
 		mappingTotal,
@@ -386,31 +431,17 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 
 export function getActiveQuoteCodes(snapshot: QuoteSnapshot): string[] {
 	return snapshot.stocks
-		.filter(
-			(stock) =>
-				stock.portfolio_group === "core" ||
-				stock.portfolio_group === "growth" ||
-				stock.portfolio_group === "mapping",
-		)
+		.filter((stock) => stock.portfolio_group === "core" || stock.portfolio_group === "growth" || stock.portfolio_group === "mapping")
 		.map((stock) => stock.code);
 }
 
 export function getActiveQuoteKeys(snapshot: QuoteSnapshot): string[] {
 	return snapshot.stocks
-		.filter(
-			(stock) =>
-				stock.portfolio_group === "core" ||
-				stock.portfolio_group === "growth" ||
-				stock.portfolio_group === "mapping",
-		)
+		.filter((stock) => stock.portfolio_group === "core" || stock.portfolio_group === "growth" || stock.portfolio_group === "mapping")
 		.map(instrumentKey);
 }
 
-function compareUniverseToStock(
-	universe: PortfolioUniverseItem,
-	stock: QuoteStock,
-	index: number,
-): void {
+function compareUniverseToStock(universe: PortfolioUniverseItem, stock: QuoteStock, index: number): void {
 	const fields: Array<keyof PortfolioUniverseItem> = [
 		"code",
 		"market",
@@ -418,26 +449,25 @@ function compareUniverseToStock(
 		"name",
 		"group",
 		"portfolio_group",
+		"portfolio_status",
 		"holding_status",
+		"mapping_only",
+		"mapped_to",
 		"mapping_to",
 		"position_qty",
 		"is_position",
 	];
 	for (const field of fields) {
 		if (universe[field] !== stock[field]) {
-			throw new Error(
-				`portfolio_universe[${index}] does not match stocks for ${instrumentKey(stock)}: ${field}`,
-			);
+			throw new Error(`portfolio_universe[${index}] does not match stocks for ${instrumentKey(stock)}: ${field}`);
 		}
 	}
 }
 
-export function validateSnapshot(
-	value: unknown,
-	options: SnapshotValidationOptions = {},
-): asserts value is QuoteSnapshot {
-	if (!isRecord(value)) {
-		throw new Error("upstream returned non-object JSON");
+export function validateSnapshot(value: unknown, options: SnapshotValidationOptions = {}): asserts value is QuoteSnapshot {
+	if (!isRecord(value)) throw new Error("upstream returned non-object JSON");
+	if (value.portfolio_version !== EXPECTED_PORTFOLIO_VERSION) {
+		throw new Error(`portfolio_version must be ${EXPECTED_PORTFOLIO_VERSION}`);
 	}
 	if (typeof value.snapshot_time !== "string" || !value.snapshot_time) {
 		throw new Error("upstream JSON missing required field: snapshot_time");
@@ -445,27 +475,19 @@ export function validateSnapshot(
 	if (typeof value.system_quality !== "string" || !value.system_quality) {
 		throw new Error("upstream JSON missing required field: system_quality");
 	}
-	if (!isRecord(value.summary)) {
-		throw new Error("upstream JSON missing required field: summary");
-	}
+	if (!isRecord(value.summary)) throw new Error("upstream JSON missing required field: summary");
 	if (!isFiniteNumber(value.summary.total) || value.summary.total < 0 || !Number.isInteger(value.summary.total)) {
 		throw new Error("summary.total must be a non-negative integer");
 	}
-	if (!Array.isArray(value.stocks)) {
-		throw new Error("upstream JSON missing required field: stocks");
-	}
+	if (!Array.isArray(value.stocks)) throw new Error("upstream JSON missing required field: stocks");
 	if (value.summary.total !== value.stocks.length) {
 		throw new Error(`summary.total=${value.summary.total} but stocks.length=${value.stocks.length}`);
 	}
-	if (!Array.isArray(value.portfolio_universe)) {
-		throw new Error("upstream JSON missing required field: portfolio_universe");
-	}
+	if (!Array.isArray(value.portfolio_universe)) throw new Error("upstream JSON missing required field: portfolio_universe");
 
 	const stocks = value.stocks.map((stock, index) => validateStock(stock, index));
 	const universe = value.portfolio_universe.map((item, index) => validateUniverseItem(item, index));
-	if (universe.length !== stocks.length) {
-		throw new Error(`portfolio_universe.length=${universe.length} but stocks.length=${stocks.length}`);
-	}
+	if (universe.length !== stocks.length) throw new Error(`portfolio_universe.length=${universe.length} but stocks.length=${stocks.length}`);
 
 	const stockByKey = new Map<string, QuoteStock>();
 	for (const stock of stocks) {
@@ -484,60 +506,38 @@ export function validateSnapshot(
 	}
 
 	const expectedKeys = new Set<string>(EXPECTED_MARKET_CODE_KEYS);
-	if (stocks.length !== expectedKeys.size) {
-		throw new Error(`portfolio snapshot must contain ${expectedKeys.size} instruments, got ${stocks.length}`);
-	}
-	for (const key of expectedKeys) {
-		if (!stockByKey.has(key)) throw new Error(`portfolio snapshot is missing ${key}`);
-	}
-	for (const key of stockByKey.keys()) {
-		if (!expectedKeys.has(key)) throw new Error(`unexpected portfolio instrument: ${key}`);
-	}
+	if (stocks.length !== expectedKeys.size) throw new Error(`portfolio snapshot must contain ${expectedKeys.size} instruments, got ${stocks.length}`);
+	for (const key of expectedKeys) if (!stockByKey.has(key)) throw new Error(`portfolio snapshot is missing ${key}`);
+	for (const key of stockByKey.keys()) if (!expectedKeys.has(key)) throw new Error(`unexpected portfolio instrument: ${key}`);
 
 	const validatedSnapshot = { ...value, stocks, portfolio_universe: universe } as unknown as QuoteSnapshot;
 	const counts = getSnapshotCounts(validatedSnapshot);
 	const expectedActiveQuoteTotal = options.expectedActiveQuoteTotal ?? EXPECTED_ACTIVE_QUOTE_KEYS.length;
-	if (counts.activeQuoteTotal !== expectedActiveQuoteTotal) {
-		throw new Error(`active quote count must be ${expectedActiveQuoteTotal}, got ${counts.activeQuoteTotal}`);
-	}
+	if (counts.activeQuoteTotal !== expectedActiveQuoteTotal) throw new Error(`active quote count must be ${expectedActiveQuoteTotal}, got ${counts.activeQuoteTotal}`);
 	const activeKeys = new Set(getActiveQuoteKeys(validatedSnapshot));
-	for (const key of EXPECTED_ACTIVE_QUOTE_KEYS) {
-		if (!activeKeys.has(key)) throw new Error(`active quote set is missing ${key}`);
-	}
-	for (const key of activeKeys) {
-		if (!EXPECTED_ACTIVE_QUOTE_KEYS.includes(key as (typeof EXPECTED_ACTIVE_QUOTE_KEYS)[number])) {
-			throw new Error(`unexpected active quote key: ${key}`);
-		}
-	}
+	for (const key of EXPECTED_ACTIVE_QUOTE_KEYS) if (!activeKeys.has(key)) throw new Error(`active quote set is missing ${key}`);
+	for (const key of activeKeys) if (!EXPECTED_ACTIVE_QUOTE_KEYS.includes(key as (typeof EXPECTED_ACTIVE_QUOTE_KEYS)[number])) throw new Error(`unexpected active quote key: ${key}`);
 
 	for (const key of REQUIRED_WATCH_KEYS) {
 		const stock = stockByKey.get(key);
-		if (!stock || stock.portfolio_group !== "watch" || stock.holding_status !== "WATCH") {
+		if (!stock || stock.portfolio_group !== "watch" || stock.portfolio_status !== "WATCH" || stock.holding_status !== "WATCH") {
 			throw new Error(`required Watch record is missing or misclassified: ${key}`);
 		}
 	}
-	for (const key of REQUIRED_EXITED_WATCH_KEYS) {
+	for (const key of REQUIRED_MAPPING_KEYS) {
 		const stock = stockByKey.get(key);
-		if (!stock || stock.portfolio_group !== "exited_watch" || stock.holding_status !== "EXITED") {
-			throw new Error(`required Exited Watch record is missing or misclassified: ${key}`);
+		if (!stock || stock.portfolio_group !== "mapping" || !stock.mapping_only || stock.portfolio_status !== null || stock.holding_status !== "MAPPING_ONLY") {
+			throw new Error(`required mapping record is missing or misclassified: ${key}`);
 		}
 	}
-	if (
-		!stockByKey.get("HK:03308") ||
-		stockByKey.get("HK:03308")?.portfolio_group !== "mapping" ||
-		stockByKey.get("HK:03308")?.holding_status !== "MAPPING_ONLY"
-	) {
-		throw new Error("H-share mapping record is missing or misclassified: HK:03308");
-	}
-	if ((options.requireWatch ?? true) && counts.watchTotal === 0 && counts.exitedWatchTotal === 0) {
-		throw new Error("snapshot must include at least one Watch record");
-	}
+	if (counts.exitedWatchTotal !== 0) throw new Error("Exited Watch records are not allowed in v4");
+	if ((options.requireWatch ?? true) && counts.watchTotal === 0) throw new Error("snapshot must include at least one Watch record");
 
 	const derived: Record<string, number> = {
 		active_quote_total: counts.activeQuoteTotal,
 		active_holding_total: counts.activeHoldingTotal,
 		watch_total: counts.watchTotal,
-		exited_watch_total: counts.exitedWatchTotal,
+		exited_watch_total: 0,
 		mapping_total: counts.mappingTotal,
 		core_total: counts.coreTotal,
 		growth_total: counts.growthTotal,
