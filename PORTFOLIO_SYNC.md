@@ -10,7 +10,7 @@
 LIVE QMT POSITION
   → Internal Portfolio Manifest（LIVE 内部，可含数量）
   → quote-universe/1（code-only + sha256）
-  → QuantPro 私有 portfolio-runtime 分支（控制面传输）
+  → Cloudflare Worker（使用现有 GitHub 登录身份验证，无 Cloudflare 凭据）
   → Cloudflare KV：PORTFOLIO_UNIVERSE（LKG）
   → Cloudflare MCP / 动态行情投影
        ├─ LIVE ACTIVE
@@ -19,10 +19,11 @@ LIVE QMT POSITION
 ```
 
 GitHub 不是持仓真相源、也不是行情源；它只承担**私有控制面传输**。LIVE 只向
-`zhushihao/QuantPro` 私有仓的 `portfolio-runtime` 分支写 code-only 投影；Cloudflare
-使用现有 `GITHUB_TOKEN` 读取后写入 KV。PUBLIC `cn-hk-quotes-mcp` 不保存真实
-LIVE universe。本仓现有 Cron → GitHub Issue #1 仅作为旧行情桥兼容链保留，
-不注入 LIVE active set。
+Worker 发送 code-only 投影，并携带 LIVE 机器现有 `gh auth` token 作为身份凭证。
+Worker 实时向 GitHub 校验 login=`zhushihao` 且该 token 对私有
+`zhushihao/quantpro-qmt` 具有写权限，验证通过才允许写 KV。token 不保存于
+Cloudflare KV、仓库或日志。PUBLIC `cn-hk-quotes-mcp` 不保存真实 LIVE universe。
+本仓现有 Cron → GitHub Issue #1 仅作为旧行情桥兼容链保留，不注入 LIVE active set。
 
 ## `quote-universe/1`
 
@@ -64,9 +65,11 @@ Cloudflare 先验证上游行情快照自身结构，再将 KV 中的 LIVE activ
 
 ## Worker 接口
 
-- MCP `get_portfolio_quotes`：每次消费前 best-effort 刷新私有控制面；有 KV LKG 时自动使用 LIVE 动态投影；KV 尚未初始化时保持旧行情目录行为，便于无中断迁移。
-- Cron：先尝试私有 `portfolio-runtime` → KV 同步，再跑旧公开行情桥；私有控制面读取失败不会破坏 KV LKG，也不会中断旧桥。
-- `GET /api/control-plane-status`：只返回私有仓可读、KV binding、universe 是否存在/新鲜及当前模式，不返回代码、数量或 hash，用于无敏感信息验收。
+- MCP `get_portfolio_quotes`：直接消费 KV LKG；KV 尚未初始化时保持旧行情目录行为，便于无中断迁移。
+- `POST /api/github-auth/probe`：仅验证 GitHub 登录身份和私有仓写权限，不写 KV，用于无副作用链路验收。
+- `POST /api/github-auth/quote-universe`：仅接受通过 GitHub 实时身份校验的 LIVE 请求，并严格验证 `quote-universe/1` 后写 KV。
+- `GET /api/control-plane-status`：只返回 KV binding、universe 是否存在/新鲜及 `GITHUB_VERIFIED_PUSH` 模式，不返回代码、数量或 hash。
+- Cron：继续只跑旧公开行情桥；LIVE universe 由 OIDC push 独立更新，失败不会破坏 KV LKG。
 - `POST /api/quote-universe`：旧直推入口保留但不是生产路径；仍需 `PORTFOLIO_UNIVERSE_TOKEN`，未配置时始终拒绝。
 - `GET /api/quote-universe`：同样需要 bearer token，用于受控诊断，不开放匿名读取真实 active set。
 - `GET /api/portfolio-quotes`：同样需要 bearer token，返回动态投影，避免新增一个匿名真实持仓接口。
@@ -89,5 +92,5 @@ Cloudflare KV binding `PORTFOLIO_UNIVERSE` 由 `wrangler.jsonc` 声明；Workers
 4. 卖出标的从 active 投影消失；Mapping 仍保留。
 5. Cloudflare 边界没有持仓数量泄漏。
 6. KV payload hash 错误、重复代码、非法字段、过期 `generated_at` 均 fail-closed。
-7. 私有 `portfolio-runtime` probe 可被 Cloudflare 读取；PUBLIC 仓无 LIVE universe 文件。
+7. LIVE 使用现有 GitHub 登录态调用 auth probe 成功；PUBLIC 仓无 LIVE universe 文件。
 8. 原 MCP/Worker 编译、单测和旧 Cron 链不出现回归。

@@ -1,10 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
-import {
-	probePrivateControlPlane,
-	syncLiveUniverseFromPrivateGithub,
-} from "./control-plane";
+import { githubBearerToken, verifyGithubAccessToken } from "./github-auth";
 import {
 	applyLiveUniverse,
 	assertLiveUniverseFresh,
@@ -163,32 +160,6 @@ function logBridgeFailure(
 		error_type: error instanceof Error ? error.name : typeof error,
 		error_message: safeErrorMessage(error),
 	});
-}
-
-async function refreshPrivateControlPlane(
-	env: Env,
-	context: BridgeStageContext,
-): Promise<void> {
-	if (!env.PORTFOLIO_UNIVERSE) {
-		logBridgeStage(context, "control_plane_sync_skipped", {
-			reason: "kv_binding_missing",
-		});
-		return;
-	}
-	try {
-		const result = await syncLiveUniverseFromPrivateGithub(env);
-		logBridgeStage(context, "control_plane_sync_complete", {
-			status: result.status,
-			universe_present: result.universe !== null,
-		});
-	} catch (error) {
-		// Preserve KV last-known-good and the legacy public bridge on transient
-		// private-control failures. Freshness enforcement happens at consume time.
-		logBridgeStage(context, "control_plane_sync_failed", {
-			error_type: error instanceof Error ? error.name : typeof error,
-			error_message: safeErrorMessage(error),
-		});
-	}
 }
 
 async function fetchUpstreamSnapshot(
@@ -473,7 +444,6 @@ function createServer(env?: Env) {
 		async () => {
 			const context = bridgeContext("mcp:get_portfolio_quotes");
 			try {
-				if (env) await refreshPrivateControlPlane(env, context);
 				const upstream = await fetchUpstreamSnapshot(
 					[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 					context,
@@ -610,12 +580,6 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 }
 
 async function getControlPlaneStatus(env: Env) {
-	let githubPrivateRead = false;
-	try {
-		githubPrivateRead = await probePrivateControlPlane(env);
-	} catch {
-		githubPrivateRead = false;
-	}
 	let universePresent = false;
 	let universeFresh = false;
 	if (env.PORTFOLIO_UNIVERSE) {
@@ -631,8 +595,9 @@ async function getControlPlaneStatus(env: Env) {
 		}
 	}
 	return {
-		status: githubPrivateRead ? "OK" : "DEGRADED",
-		github_private_read: githubPrivateRead,
+		status: universePresent && universeFresh ? "OK" : "PENDING",
+		ingest_mode: "GITHUB_VERIFIED_PUSH",
+		github_private_read: false,
 		kv_bound: Boolean(env.PORTFOLIO_UNIVERSE),
 		universe_present: universePresent,
 		universe_fresh: universeFresh,
@@ -642,7 +607,56 @@ async function getControlPlaneStatus(env: Env) {
 
 async function handleControlPlaneStatus(env: Env): Promise<Response> {
 	const payload = await getControlPlaneStatus(env);
-	return jsonResponse(payload, payload.github_private_read ? 200 : 503);
+	return jsonResponse(payload, payload.kv_bound ? 200 : 503);
+}
+
+async function handleGithubAuthProbe(request: Request): Promise<Response> {
+	if (request.method !== "POST") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+	try {
+		await verifyGithubAccessToken(githubBearerToken(request));
+		return jsonResponse({ status: "OK", identity: "GITHUB_VERIFIED" });
+	} catch (error) {
+		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: safeErrorMessage(error) }, 401);
+	}
+}
+
+async function handleGithubAuthUniverse(request: Request, env: Env): Promise<Response> {
+	if (request.method !== "POST") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
+	try {
+		await verifyGithubAccessToken(githubBearerToken(request));
+	} catch (error) {
+		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: safeErrorMessage(error) }, 401);
+	}
+	let raw: string;
+	try {
+		raw = await request.text();
+	} catch {
+		return jsonResponse({ error: "BODY_READ_FAILED" }, 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > 32_768) {
+		return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	}
+	let payload: unknown;
+	try {
+		payload = JSON.parse(raw);
+	} catch {
+		return jsonResponse({ error: "INVALID_JSON" }, 400);
+	}
+	try {
+		const stored = await writeLiveUniverse(env.PORTFOLIO_UNIVERSE, payload);
+		return jsonResponse({
+			status: "SUCCESS",
+			content_hash: stored.content_hash,
+			generated_at: stored.generated_at,
+			received_at: stored.received_at,
+			active_count: stored.active.length,
+		});
+	} catch (error) {
+		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: safeErrorMessage(error) }, 400);
+	}
 }
 
 async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise<Response> {
@@ -654,7 +668,6 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 	}
 	const context = bridgeContext("http:dynamic-portfolio-quotes");
 	try {
-		await refreshPrivateControlPlane(env, context);
 		const liveUniverse = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
 		if (!liveUniverse) return jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 503);
 		assertLiveUniverseFresh(liveUniverse);
@@ -673,6 +686,8 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
+		if (url.pathname === "/api/github-auth/probe") return handleGithubAuthProbe(request);
+		if (url.pathname === "/api/github-auth/quote-universe") return handleGithubAuthUniverse(request, env);
 		if (url.pathname === "/api/control-plane-status" && request.method === "GET") {
 			return handleControlPlaneStatus(env);
 		}
@@ -687,7 +702,6 @@ export default {
 		logBridgeStage(context, "scheduled_enter");
 
 		try {
-			await refreshPrivateControlPlane(env, context);
 			const payload = await updateQuoteBridge(env, context.runId);
 			logBridgeStage(context, "scheduled_complete", {
 				bridge_status: payload.bridge.last_attempt_status,
