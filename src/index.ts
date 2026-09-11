@@ -2,6 +2,10 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import {
+	probePrivateControlPlane,
+	syncLiveUniverseFromPrivateGithub,
+} from "./control-plane";
+import {
 	applyLiveUniverse,
 	assertLiveUniverseFresh,
 	getLiveUniverseCoverage,
@@ -159,6 +163,32 @@ function logBridgeFailure(
 		error_type: error instanceof Error ? error.name : typeof error,
 		error_message: safeErrorMessage(error),
 	});
+}
+
+async function refreshPrivateControlPlane(
+	env: Env,
+	context: BridgeStageContext,
+): Promise<void> {
+	if (!env.PORTFOLIO_UNIVERSE) {
+		logBridgeStage(context, "control_plane_sync_skipped", {
+			reason: "kv_binding_missing",
+		});
+		return;
+	}
+	try {
+		const result = await syncLiveUniverseFromPrivateGithub(env);
+		logBridgeStage(context, "control_plane_sync_complete", {
+			status: result.status,
+			universe_present: result.universe !== null,
+		});
+	} catch (error) {
+		// Preserve KV last-known-good and the legacy public bridge on transient
+		// private-control failures. Freshness enforcement happens at consume time.
+		logBridgeStage(context, "control_plane_sync_failed", {
+			error_type: error instanceof Error ? error.name : typeof error,
+			error_message: safeErrorMessage(error),
+		});
+	}
 }
 
 async function fetchUpstreamSnapshot(
@@ -443,6 +473,7 @@ function createServer(env?: Env) {
 		async () => {
 			const context = bridgeContext("mcp:get_portfolio_quotes");
 			try {
+				if (env) await refreshPrivateControlPlane(env, context);
 				const upstream = await fetchUpstreamSnapshot(
 					[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 					context,
@@ -537,13 +568,45 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 			status: "SUCCESS",
 			schema_version: stored.schema_version,
 			content_hash: stored.content_hash,
-			as_of: stored.as_of,
+			generated_at: stored.generated_at,
+			source_manifest_hash: stored.source_manifest_hash,
 			received_at: stored.received_at,
 			active_count: stored.active.length,
 		});
 	} catch (error) {
 		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: safeErrorMessage(error) }, 400);
 	}
+}
+
+async function handleControlPlaneStatus(env: Env): Promise<Response> {
+	let githubPrivateRead = false;
+	try {
+		githubPrivateRead = await probePrivateControlPlane(env);
+	} catch {
+		githubPrivateRead = false;
+	}
+	let universePresent = false;
+	let universeFresh = false;
+	if (env.PORTFOLIO_UNIVERSE) {
+		try {
+			const universe = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
+			universePresent = universe !== null;
+			if (universe) {
+				assertLiveUniverseFresh(universe);
+				universeFresh = true;
+			}
+		} catch {
+			universeFresh = false;
+		}
+	}
+	return jsonResponse({
+		status: githubPrivateRead ? "OK" : "DEGRADED",
+		github_private_read: githubPrivateRead,
+		kv_bound: Boolean(env.PORTFOLIO_UNIVERSE),
+		universe_present: universePresent,
+		universe_fresh: universeFresh,
+		mode: universePresent ? "LIVE_DYNAMIC" : "LEGACY_FALLBACK",
+	}, githubPrivateRead ? 200 : 503);
 }
 
 async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise<Response> {
@@ -555,6 +618,7 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 	}
 	const context = bridgeContext("http:dynamic-portfolio-quotes");
 	try {
+		await refreshPrivateControlPlane(env, context);
 		const liveUniverse = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
 		if (!liveUniverse) return jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 503);
 		assertLiveUniverseFresh(liveUniverse);
@@ -573,6 +637,9 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
+		if (url.pathname === "/api/control-plane-status" && request.method === "GET") {
+			return handleControlPlaneStatus(env);
+		}
 		if (url.pathname === "/api/quote-universe") return handleUniverseApi(request, env);
 		if (url.pathname === "/api/portfolio-quotes") return handleDynamicPortfolioQuotes(request, env);
 		const handler = createMcpHandler(() => createServer(env));
@@ -584,6 +651,7 @@ export default {
 		logBridgeStage(context, "scheduled_enter");
 
 		try {
+			await refreshPrivateControlPlane(env, context);
 			const payload = await updateQuoteBridge(env, context.runId);
 			logBridgeStage(context, "scheduled_complete", {
 				bridge_status: payload.bridge.last_attempt_status,

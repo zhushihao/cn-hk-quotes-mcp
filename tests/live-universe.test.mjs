@@ -40,9 +40,10 @@ function snapshotOf(stocks) {
 async function makeUniverse(active) {
 	return {
 		schema_version: "quote-universe/1",
-		as_of: "2026-09-11T16:00:00+08:00",
-		content_hash: await computeLiveUniverseHash(active),
+		generated_at: "2026-09-11T16:00:00+08:00",
+		source_manifest_hash: `sha256:${"1".repeat(64)}`,
 		active,
+		content_hash: await computeLiveUniverseHash(active),
 	};
 }
 
@@ -52,6 +53,7 @@ test("quote-universe/1 is code-only, canonical, unique, and hash-verified", asyn
 		{ market: "CN", exchange: "SZ", code: "300308" },
 	];
 	const payload = await makeUniverse(active);
+	assert.equal(payload.content_hash, "sha256:da38af6b472863b63405459f9b9683a12fd458e5c6a043850524b057251f5e0c");
 	const validated = await validateLiveUniverse(payload);
 	assert.deepEqual(validated.active.map((row) => `${row.market}:${row.code}`), ["CN:300308", "HK:09696"]);
 	await assert.rejects(() => validateLiveUniverse({ ...payload, position_qty: 100 }), /not allowed/i);
@@ -71,7 +73,7 @@ test("LIVE universe freshness rejects very old or future truth but tolerates nor
 		() => assertLiveUniverseFresh(universe, new Date("2026-09-25T16:00:00+08:00")),
 		/stale/i,
 	);
-	const future = { ...universe, as_of: "2026-09-11T17:00:00+08:00" };
+	const future = { ...universe, generated_at: "2026-09-11T17:00:00+08:00" };
 	assert.throws(() => assertLiveUniverseFresh(future, new Date("2026-09-11T16:00:00+08:00")), /future/i);
 });
 

@@ -5,6 +5,7 @@
 		"jsx": "react-jsx",
 		"module": "es2022",
 		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
 		"resolveJsonModule": true,
 		"allowJs": true,
 		"checkJs": false,

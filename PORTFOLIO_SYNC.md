@@ -10,6 +10,7 @@
 LIVE QMT POSITION
   → Internal Portfolio Manifest（LIVE 内部，可含数量）
   → quote-universe/1（code-only + sha256）
+  → QuantPro 私有 portfolio-runtime 分支（控制面传输）
   → Cloudflare KV：PORTFOLIO_UNIVERSE（LKG）
   → Cloudflare MCP / 动态行情投影
        ├─ LIVE ACTIVE
@@ -17,7 +18,11 @@ LIVE QMT POSITION
        └─ A/H Mapping
 ```
 
-GitHub 不再是持仓运行态真相源。本仓现有 Cron → GitHub Issue #1 仅作为旧行情桥兼容链保留，不读取 `PORTFOLIO_UNIVERSE`，因此不会因为本次改造新增实时持仓披露。
+GitHub 不是持仓真相源、也不是行情源；它只承担**私有控制面传输**。LIVE 只向
+`zhushihao/QuantPro` 私有仓的 `portfolio-runtime` 分支写 code-only 投影；Cloudflare
+使用现有 `GITHUB_TOKEN` 读取后写入 KV。PUBLIC `cn-hk-quotes-mcp` 不保存真实
+LIVE universe。本仓现有 Cron → GitHub Issue #1 仅作为旧行情桥兼容链保留，
+不注入 LIVE active set。
 
 ## `quote-universe/1`
 
@@ -26,12 +31,13 @@ GitHub 不再是持仓运行态真相源。本仓现有 Cron → GitHub Issue #1
 ```json
 {
   "schema_version": "quote-universe/1",
-  "as_of": "2026-09-11T16:00:00+08:00",
-  "content_hash": "sha256:<64 lowercase hex>",
+  "generated_at": "2026-09-11T16:00:00+08:00",
+  "source_manifest_hash": "sha256:<internal manifest hash>",
   "active": [
     {"market": "CN", "exchange": "SZ", "code": "300308"},
     {"market": "HK", "exchange": "HK", "code": "09696"}
-  ]
+  ],
+  "content_hash": "sha256:<projection hash>"
 }
 ```
 
@@ -39,7 +45,8 @@ GitHub 不再是持仓运行态真相源。本仓现有 Cron → GitHub Issue #1
 
 - `active` 按 `market + code` 唯一，重复直接拒绝。
 - `content_hash` 对规范化后的 `active` 集合计算 SHA-256；hash 不匹配不得覆盖 KV LKG。
-- `as_of` 必须是可解析时间；默认超过 10 天视为陈旧并 fail-closed，兼容周末与长假但不允许无限期沿用旧持仓。
+- `generated_at` 必须是可解析时间；默认超过 10 天视为陈旧并 fail-closed，兼容周末与长假但不允许无限期沿用旧持仓。
+- SHA-256 规范化与 `quantpro-qmt/pipeline/portfolio/projection.py` 字节级一致；Cloudflare 有固定跨语言 hash 测试，避免两端各自“自洽但互不兼容”。
 - KV 当前值只在整份 payload 通过校验后更新，因此非法上传不会破坏上一份 LKG。
 - Cloudflare 对外行情投影中的真实持仓数量统一置为 `null`；数量只留在 LIVE 内部 Manifest。
 
@@ -57,12 +64,14 @@ Cloudflare 先验证上游行情快照自身结构，再将 KV 中的 LIVE activ
 
 ## Worker 接口
 
-- MCP `get_portfolio_quotes`：有 KV LKG 时自动使用 LIVE 动态投影；KV 尚未初始化时保持旧行情目录行为，便于无中断迁移。
-- `POST /api/quote-universe`：预留给受鉴权 publisher；需要 `PORTFOLIO_UNIVERSE_TOKEN` secret，未配置时始终拒绝。
+- MCP `get_portfolio_quotes`：每次消费前 best-effort 刷新私有控制面；有 KV LKG 时自动使用 LIVE 动态投影；KV 尚未初始化时保持旧行情目录行为，便于无中断迁移。
+- Cron：先尝试私有 `portfolio-runtime` → KV 同步，再跑旧公开行情桥；私有控制面读取失败不会破坏 KV LKG，也不会中断旧桥。
+- `GET /api/control-plane-status`：只返回私有仓可读、KV binding、universe 是否存在/新鲜及当前模式，不返回代码、数量或 hash，用于无敏感信息验收。
+- `POST /api/quote-universe`：旧直推入口保留但不是生产路径；仍需 `PORTFOLIO_UNIVERSE_TOKEN`，未配置时始终拒绝。
 - `GET /api/quote-universe`：同样需要 bearer token，用于受控诊断，不开放匿名读取真实 active set。
 - `GET /api/portfolio-quotes`：同样需要 bearer token，返回动态投影，避免新增一个匿名真实持仓接口。
 
-Cloudflare KV binding `PORTFOLIO_UNIVERSE` 由 `wrangler.jsonc` 声明；Workers Builds 部署时可自动 provision。生产写入更推荐 LIVE publisher 直接用受限 Cloudflare API token 写 KV，而不是把 GitHub 作为中转站。
+Cloudflare KV binding `PORTFOLIO_UNIVERSE` 由 `wrangler.jsonc` 声明；Workers Builds 部署时可自动 provision。生产链不要求 LIVE 保存 Cloudflare Account ID / Namespace ID / API Token。
 
 ## 与旧桥的兼容
 
@@ -79,5 +88,6 @@ Cloudflare KV binding `PORTFOLIO_UNIVERSE` 由 `wrangler.jsonc` 声明；Workers
 3. LIVE active 缺行情时 coverage gate 拒绝输出，而不是静默遗漏。
 4. 卖出标的从 active 投影消失；Mapping 仍保留。
 5. Cloudflare 边界没有持仓数量泄漏。
-6. KV payload hash 错误、重复代码、非法字段、过期 `as_of` 均 fail-closed。
-7. 原 MCP/Worker 编译、单测和旧 Cron 链不出现回归。
+6. KV payload hash 错误、重复代码、非法字段、过期 `generated_at` 均 fail-closed。
+7. 私有 `portfolio-runtime` probe 可被 Cloudflare 读取；PUBLIC 仓无 LIVE universe 文件。
+8. 原 MCP/Worker 编译、单测和旧 Cron 链不出现回归。

@@ -12,9 +12,10 @@ export type LiveUniverseItem = {
 
 export type LiveUniversePayload = {
 	schema_version: typeof LIVE_UNIVERSE_SCHEMA;
-	as_of: string;
-	content_hash: string;
+	generated_at: string;
+	source_manifest_hash: string;
 	active: LiveUniverseItem[];
+	content_hash: string;
 };
 
 export type StoredLiveUniverse = LiveUniversePayload & {
@@ -28,7 +29,13 @@ export type LiveUniverseCoverage = {
 	missing_active: string[];
 };
 
-const TOP_LEVEL_KEYS = new Set(["schema_version", "as_of", "content_hash", "active"]);
+const TOP_LEVEL_KEYS = new Set([
+	"schema_version",
+	"generated_at",
+	"source_manifest_hash",
+	"active",
+	"content_hash",
+]);
 const ITEM_KEYS = new Set(["market", "exchange", "code"]);
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
@@ -73,7 +80,17 @@ export function liveInstrumentKey(item: Pick<LiveUniverseItem, "market" | "code"
 }
 
 export async function computeLiveUniverseHash(active: LiveUniverseItem[]): Promise<string> {
-	const canonical = JSON.stringify({ active: canonicalActive(active) });
+	// Must stay byte-for-byte compatible with quantpro-qmt
+	// projection._projection_hash(): Python json.dumps(..., sort_keys=True,
+	// separators=(",", ":"), ensure_ascii=True). Values in this contract are
+	// ASCII, so constructing row keys in code/exchange/market order reproduces
+	// that canonical byte stream under JSON.stringify.
+	const rows = canonicalActive(active).map((item) => ({
+		code: item.code,
+		exchange: item.exchange,
+		market: item.market,
+	}));
+	const canonical = JSON.stringify({ active: rows });
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
 	const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 	return `sha256:${hex}`;
@@ -85,7 +102,12 @@ export async function validateLiveUniverse(value: unknown): Promise<LiveUniverse
 	if (value.schema_version !== LIVE_UNIVERSE_SCHEMA) {
 		throw new Error(`schema_version must be ${LIVE_UNIVERSE_SCHEMA}`);
 	}
-	if (typeof value.as_of !== "string" || !value.as_of.trim()) throw new Error("as_of must be a non-empty string");
+	if (typeof value.generated_at !== "string" || !value.generated_at.trim()) {
+		throw new Error("generated_at must be a non-empty string");
+	}
+	if (typeof value.source_manifest_hash !== "string" || !HASH_PATTERN.test(value.source_manifest_hash)) {
+		throw new Error("source_manifest_hash must be sha256:<64 lowercase hex>");
+	}
 	if (typeof value.content_hash !== "string" || !HASH_PATTERN.test(value.content_hash)) {
 		throw new Error("content_hash must be sha256:<64 lowercase hex>");
 	}
@@ -103,9 +125,10 @@ export async function validateLiveUniverse(value: unknown): Promise<LiveUniverse
 	if (computed !== value.content_hash) throw new Error(`content_hash mismatch: expected ${computed}`);
 	return {
 		schema_version: LIVE_UNIVERSE_SCHEMA,
-		as_of: value.as_of,
-		content_hash: value.content_hash,
+		generated_at: value.generated_at,
+		source_manifest_hash: value.source_manifest_hash,
 		active: canonicalActive(active),
+		content_hash: value.content_hash,
 	};
 }
 
@@ -144,10 +167,10 @@ export function assertLiveUniverseFresh(
 	now = new Date(),
 	maxAgeSeconds = DEFAULT_LIVE_UNIVERSE_MAX_AGE_SECONDS,
 ): void {
-	const asOf = Date.parse(universe.as_of);
-	if (!Number.isFinite(asOf)) throw new Error("quote universe as_of is not a valid timestamp");
-	const ageSeconds = (now.getTime() - asOf) / 1000;
-	if (ageSeconds < -300) throw new Error(`quote universe as_of is ${Math.round(-ageSeconds)}s in the future`);
+	const generatedAt = Date.parse(universe.generated_at);
+	if (!Number.isFinite(generatedAt)) throw new Error("quote universe generated_at is not a valid timestamp");
+	const ageSeconds = (now.getTime() - generatedAt) / 1000;
+	if (ageSeconds < -300) throw new Error(`quote universe generated_at is ${Math.round(-ageSeconds)}s in the future`);
 	if (ageSeconds > maxAgeSeconds) {
 		throw new Error(`quote universe is stale: age=${Math.round(ageSeconds)}s max=${maxAgeSeconds}s`);
 	}
@@ -226,7 +249,8 @@ export function applyLiveUniverse(snapshot: QuoteSnapshot, universe: StoredLiveU
 		portfolio_version: `live:${universe.content_hash}`,
 		live_universe: {
 			schema_version: universe.schema_version,
-			as_of: universe.as_of,
+			generated_at: universe.generated_at,
+			source_manifest_hash: universe.source_manifest_hash,
 			content_hash: universe.content_hash,
 			received_at: universe.received_at,
 			active_count: universe.active.length,
