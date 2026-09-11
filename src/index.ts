@@ -509,6 +509,23 @@ function createServer(env?: Env) {
 		},
 	);
 
+	server.registerTool(
+		"get_control_plane_status",
+		{
+			description:
+				"只读检查 LIVE 持仓私有控制面是否可用。仅返回私有 GitHub 可读、Cloudflare KV binding、universe 是否存在/新鲜和当前模式；不返回持仓代码、数量、hash 或凭据。",
+			inputSchema: z.object({}),
+		},
+		async () => ({
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(await getControlPlaneStatus(env ?? ({} as Env)), null, 2),
+				},
+			],
+		}),
+	);
+
 	return server;
 }
 
@@ -578,7 +595,7 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 	}
 }
 
-async function handleControlPlaneStatus(env: Env): Promise<Response> {
+async function getControlPlaneStatus(env: Env) {
 	let githubPrivateRead = false;
 	try {
 		githubPrivateRead = await probePrivateControlPlane(env);
@@ -599,14 +616,19 @@ async function handleControlPlaneStatus(env: Env): Promise<Response> {
 			universeFresh = false;
 		}
 	}
-	return jsonResponse({
+	return {
 		status: githubPrivateRead ? "OK" : "DEGRADED",
 		github_private_read: githubPrivateRead,
 		kv_bound: Boolean(env.PORTFOLIO_UNIVERSE),
 		universe_present: universePresent,
 		universe_fresh: universeFresh,
 		mode: universePresent ? "LIVE_DYNAMIC" : "LEGACY_FALLBACK",
-	}, githubPrivateRead ? 200 : 503);
+	};
+}
+
+async function handleControlPlaneStatus(env: Env): Promise<Response> {
+	const payload = await getControlPlaneStatus(env);
+	return jsonResponse(payload, payload.github_private_read ? 200 : 503);
 }
 
 async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise<Response> {
