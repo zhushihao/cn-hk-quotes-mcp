@@ -479,11 +479,25 @@ function createServer(env?: Env) {
 					context,
 					env,
 				);
+				const controlPlaneStatus = env
+					? await getControlPlaneStatus(env)
+					: {
+						status: "DEGRADED",
+						github_private_read: false,
+						kv_bound: false,
+						universe_present: false,
+						universe_fresh: false,
+						mode: "LEGACY_FALLBACK",
+					};
 				return {
 					content: [
 						{
 							type: "text",
-							text: JSON.stringify(upstream.snapshot, null, 2),
+							text: JSON.stringify(
+								{ ...upstream.snapshot, control_plane_status: controlPlaneStatus },
+								null,
+								2,
+							),
 						},
 					],
 				};
