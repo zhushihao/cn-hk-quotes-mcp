@@ -1,105 +1,83 @@
 # 持仓行情同步规范
 
-## 架构和配置口径
+## 真相源与消费边界
 
-Site 的 `lib/stocks.ts` 中 `PORTFOLIO_UNIVERSE` 是运行时唯一标的配置源，版本为 `2026-09-01-v4`。它生成 Site 的全量 `/api/portfolio-quotes` 快照；Cloudflare Worker 和 GitHub 行情桥只负责刷新、校验和转存，不再维护一份可供调仓编辑的名单。
+正式持仓的唯一真相源是 LIVE QMT broker POSITION。LIVE 仅查询本账户实际具备的 `STOCK + HUGANGTONG`，生成内部 Portfolio Manifest；离开 LIVE 边界前再投影成 `quote-universe/1`。
 
-桥接层保留固定的 23 个市场+完整代码校验，是防止旧 Site 或半更新响应进入 GitHub 的安全护栏，不是持仓配置。以后调仓先改 Site 的 `PORTFOLIO_UNIVERSE`，再同步更新桥接护栏和验收测试并部署 Site。后续可以把护栏生成改为构建时读取 Site 配置，以进一步消除重复维护。
-
-唯一标识始终是 `market + code`，例如 `CN:603308`、`HK:03308` 和 `HK:09696`。任何只用纯数字的匹配都不允许，以免把应流股份和中际旭创 H 股混淆。
+`quote-universe/1` 是严格 code-only 契约：只允许 `market / exchange / code`，不允许账号、余额、成本、订单、持仓数量、研究 bucket 或本机路径。唯一标识始终是 `market + code`，不能只按纯数字代码匹配。
 
 ```text
-PORTFOLIO_UNIVERSE（Site 单一运行时源）
-  → /api/portfolio-quotes（23 只全量快照）
-  → Cloudflare Worker/Cron（按原频率刷新）
-  → GitHub Issue #1（行情桥）
-  → ChatGPT 监控任务
+LIVE QMT POSITION
+  → Internal Portfolio Manifest（LIVE 内部，可含数量）
+  → quote-universe/1（code-only + sha256）
+  → Cloudflare KV：PORTFOLIO_UNIVERSE（LKG）
+  → Cloudflare MCP / 动态行情投影
+       ├─ LIVE ACTIVE
+       ├─ Watch
+       └─ A/H Mapping
 ```
 
-## 当前 23 只行情标的
+GitHub 不再是持仓运行态真相源。本仓现有 Cron → GitHub Issue #1 仅作为旧行情桥兼容链保留，不读取 `PORTFOLIO_UNIVERSE`，因此不会因为本次改造新增实时持仓披露。
 
-### Core（8 个正式持仓）
+## `quote-universe/1`
 
-- `300308.SZ` 中际旭创，400 股
-- `300502.SZ` 新易盛，1500 股
-- `300394.SZ` 天孚通信，1800 股
-- `688676.SH` 金盘科技，2000 股
-- `601872.SH` 招商轮船，5000 股
-- `588080.SH` 科创板50ETF，30000 份
-- `09696.HK` 天齐锂业，数量待补
-- `002192.SZ` 融捷股份，数量待补
+示例：
 
-### Growth（3 个正式持仓）
+```json
+{
+  "schema_version": "quote-universe/1",
+  "as_of": "2026-09-11T16:00:00+08:00",
+  "content_hash": "sha256:<64 lowercase hex>",
+  "active": [
+    {"market": "CN", "exchange": "SZ", "code": "300308"},
+    {"market": "HK", "exchange": "HK", "code": "09696"}
+  ]
+}
+```
 
-- `300433.SZ` 蓝思科技，3000 股
-- `588170.SH` 科创半导体材料设备ETF，150000 份
-- `603308.SH` 应流股份，1000 股
+规则：
 
-### Watch（10 个观察标的）
+- `active` 按 `market + code` 唯一，重复直接拒绝。
+- `content_hash` 对规范化后的 `active` 集合计算 SHA-256；hash 不匹配不得覆盖 KV LKG。
+- `as_of` 必须是可解析时间；默认超过 10 天视为陈旧并 fail-closed，兼容周末与长假但不允许无限期沿用旧持仓。
+- KV 当前值只在整份 payload 通过校验后更新，因此非法上传不会破坏上一份 LKG。
+- Cloudflare 对外行情投影中的真实持仓数量统一置为 `null`；数量只留在 LIVE 内部 Manifest。
 
-- `600096.SH` 云天化
-- `605376.SH` 博迁新材
-- `301183.SZ` 东田微
-- `688596.SH` 正帆科技
-- `09988.HK` 阿里巴巴
-- `02228.HK` 晶泰控股
-- `603893.SH` 瑞芯微
-- `002460.SZ` 赣锋锂业
-- `002240.SZ` 盛新锂能
-- `002738.SZ` 中矿资源
+## 动态消费语义
 
-### A/H Mapping（2 个价格映射行）
+Cloudflare 先验证上游行情快照自身结构，再将 KV 中的 LIVE active set 套到行情目录：
 
-- `03308.HK` 中际旭创 H 股，`mapping_only=true`，映射至 `300308.SZ`
-- `002466.SZ` 天齐锂业 A 股，`mapping_only=true`，映射至 `09696.HK`
+- LIVE 已持有且行情目录已有代码：`holding_status=ACTIVE`、`is_position=true`。
+- 原 Watch 后来买入：研究 bucket 仍可保持 `WATCH`，但技术持仓状态升级为 `ACTIVE`；研究分类与是否持仓完全解耦。
+- 原 Core/Growth 已卖出：在 LIVE 完整快照确认后从 active 投影删除。
+- Mapping 行始终只是行情映射，不能被误判成独立持仓。
+- 任一 LIVE active 代码在行情目录不存在：整次动态消费 `fail-closed`，不能静默漏掉新持仓。
 
-映射行参与行情、A/H 相对强弱和折溢价比较，但不计入独立持仓、公司基本面或持仓告警。工程侧只维护 `CORE`、`GROWTH`、`WATCH` 三种 `portfolio_status`；不存在 `EXITED_WATCH`。锂矿专项是上层研究主题，不是工程侧状态。
+最后一条意味着：Cloudflare MCP 已经可以动态消费“现有行情目录覆盖到的”持仓；要做到买入一个此前从未在行情目录出现的代码也能立刻报价，上游 `cn-hk-quotes-proxy` 还需要进一步支持任意动态 code 拉取。
 
-总行情代码为 23；正式持仓证券为 11；主动行情条目为 13（11 个正式持仓加 2 个映射）。
+## Worker 接口
 
-## 字段和状态契约
+- MCP `get_portfolio_quotes`：有 KV LKG 时自动使用 LIVE 动态投影；KV 尚未初始化时保持旧行情目录行为，便于无中断迁移。
+- `POST /api/quote-universe`：预留给受鉴权 publisher；需要 `PORTFOLIO_UNIVERSE_TOKEN` secret，未配置时始终拒绝。
+- `GET /api/quote-universe`：同样需要 bearer token，用于受控诊断，不开放匿名读取真实 active set。
+- `GET /api/portfolio-quotes`：同样需要 bearer token，返回动态投影，避免新增一个匿名真实持仓接口。
 
-Site 和桥接层保留原有行情字段，并校验以下持仓字段：
+Cloudflare KV binding `PORTFOLIO_UNIVERSE` 由 `wrangler.jsonc` 声明；Workers Builds 部署时可自动 provision。生产写入更推荐 LIVE publisher 直接用受限 Cloudflare API token 写 KV，而不是把 GitHub 作为中转站。
 
-- `code`、`name`、`market`、`exchange`
-- `group: Core | Growth | Watch`（旧字段，保持兼容）
-- `portfolio_group: core | growth | watch | mapping`
-- `portfolio_status: CORE | GROWTH | WATCH | null`
-- `holding_status: ACTIVE | WATCH | MAPPING_ONLY`（技术行状态）
-- `position_qty`、`is_position`
-- `mapping_only`、`mapped_to`、`mapping_to`（后者是兼容别名）
+## 与旧桥的兼容
 
-Core/Growth 的正式持仓 `is_position=true`。已提供数量的持仓使用正数；`09696.HK` 和 `002192.SZ` 数量未提供时使用 `position_qty=null`，不把未知数量误写成零。Watch 和 Mapping 的 `is_position=false` 且数量为零。`03308.HK` 只能作为 `300308.SZ` 的价格映射，`002466.SZ` 只能作为 `09696.HK` 的价格映射。
+原 Site/Proxy 的行情字段和 Watch/Mapping 目录暂时继续使用；本轮只取消 Cloudflare 桥里的固定 `portfolio_version=2026-09-01-v4`、固定 23 个代码、固定 13 个 active 等持仓护栏。
 
-行情时间语义保持不变：
+现有 Cloudflare Cron 时间不变；现有 GitHub Issue #1 和 `workflow_dispatch` 暂不切换到 LIVE KV，以免公开仓在迁移阶段承载实时持仓。
 
-- `market_status` 只有 `OPEN` 或 `CLOSED`
-- 闭市后使用 `quality: CLOSED_SNAPSHOT`
-- `market_data_time` 只填可以确认的真实成交/市场数据时间
-- `source_update_time` 只表示供应商更新时间
-- `fetch_time` 表示本系统抓取时间
-- `quote_time` 只有确认是真实成交时间时填写，否则为 `null`
-- `freshness_basis` 必须说明采用的时间依据
+## 验收
 
-不得把收盘后的供应商更新时间冒充最后成交时间，也不得把港股正常公开延迟、A 股上一交易日收盘快照误判为失败。
+至少验证：
 
-## ETF 和市场适配
-
-`588080.SH` 与 `588170.SH` 使用完整的 SH 市场标识，并经过腾讯、 新浪、 东方财富适配器；它们必须返回最新价、昨收、涨跌幅、成交额/成交量、日高、日低和收盘状态。ETF 不能因为证券类型不同而走普通股票失败分支。`09696.HK` 需要走港股适配器；`002192.SZ`、`002466.SZ`、`002460.SZ`、`002240.SZ`、`002738.SZ` 需要走深市适配器。
-
-## Worker 和 GitHub 行情桥
-
-Cloudflare Worker 继续使用 `wrangler.jsonc` 中已有的 Cron 表达式，不修改调度频率或时间语义。Worker 读取 Site 的 23 只全量响应，验证通过后更新 GitHub `zhushihao/cn-hk-quotes-mcp` 的 Issue #1；任一 Watch 没有持仓不能成为删除它的理由。
-
-GitHub Actions 的 `workflow_dispatch` 只用于手工补跑，和 Worker 使用相同的字段及 23 只护栏。上游失败时沿用上一份成功快照并记录失败状态，不伪造行情。
-
-## 验收清单
-
-验收必须实际调用：
-
-1. Site `/api/portfolio-quotes`，确认 23/23 和 Core 8、Growth 3、Watch 10、Mapping 2。
-2. `/api/quote?code=` 单股接口，至少覆盖 `300308`、`03308`、`300394`、`588080`、`588170`、`601872`、`603308`、`605376`、`09696`、`002192`、`002466`。
-3. Cloudflare Worker 的一次手工刷新或等价计划事件，确认读取 Site 并写桥。
-4. GitHub Issue #1 最新正文，确认 23 个 `market:code` 都存在，且版本为 `2026-09-01-v4`。
-
-最终报告必须列出三种工程状态、两个映射行、正式持仓 11，以及没有 Exited Watch。
+1. 动态 validator 接受新增代码，不依赖固定 23/13 或固定版本号。
+2. Watch 标的被 LIVE 买入后可成为 `ACTIVE`，同时保持 `portfolio_status=WATCH`。
+3. LIVE active 缺行情时 coverage gate 拒绝输出，而不是静默遗漏。
+4. 卖出标的从 active 投影消失；Mapping 仍保留。
+5. Cloudflare 边界没有持仓数量泄漏。
+6. KV payload hash 错误、重复代码、非法字段、过期 `as_of` 均 fail-closed。
+7. 原 MCP/Worker 编译、单测和旧 Cron 链不出现回归。

@@ -76,35 +76,54 @@ function makeSnapshot(stocks, summary = {}) {
 const allStocks = universeDefinitions.map((definition) => makeStock(definition));
 const activeStocks = allStocks.filter((stock) => stock.portfolio_group !== "watch");
 
-test("accepts the complete v4 23-instrument snapshot and derives counts", () => {
+test("accepts a structurally complete snapshot without a fixed instrument/version allowlist", () => {
 	const snapshot = makeSnapshot(allStocks);
+	snapshot.portfolio_version = "live:sha256-dynamic";
 	assert.doesNotThrow(() => validateSnapshot(snapshot));
 	assert.deepEqual(getActiveQuoteCodes(snapshot), activeStocks.map((stock) => stock.code));
 	assert.deepEqual(getSnapshotCounts(snapshot), { total: 23, activeQuoteTotal: 13, activeHoldingTotal: 11, watchTotal: 10, exitedWatchTotal: 0, coreTotal: 8, growthTotal: 3, mappingTotal: 2 });
 });
 
-test("rejects a legacy or partial snapshot without the Site universe", () => {
-	assert.throws(() => validateSnapshot(makeSnapshot(activeStocks)), /portfolio_universe|23|instruments/i);
+test("accepts a smaller self-consistent universe and only enforces counts when requested", () => {
+	const snapshot = makeSnapshot(activeStocks);
+	assert.doesNotThrow(() => validateSnapshot(snapshot));
+	assert.throws(() => validateSnapshot(snapshot, { expectedActiveQuoteTotal: 99 }), /active quote count/i);
 });
 
-test("rejects an unexpected or missing market-qualified code", () => {
-	const replaced = allStocks.map((stock) => stock.code === "603308" ? { ...stock, code: "999999" } : stock);
-	assert.throws(() => validateSnapshot(makeSnapshot(replaced)), /603308|unexpected|missing/i);
-	const missing = makeSnapshot(allStocks.filter((stock) => stock.code !== "603308"));
-	assert.throws(() => validateSnapshot(missing), /23|missing/i);
+test("accepts newly introduced market-qualified codes and still rejects duplicate keys", () => {
+	const newHolding = makeStock(["002409", "CN", "SZ", "Core", "core", "CORE", "ACTIVE", null, true]);
+	assert.doesNotThrow(() => validateSnapshot(makeSnapshot([...allStocks, newHolding])));
+	assert.throws(() => validateSnapshot(makeSnapshot([...allStocks, { ...allStocks[0] }])), /duplicate instrument key/i);
 });
 
-test("requires all Watch rows, both mappings, and no Exited Watch identity", () => {
-	const missingWatch = makeSnapshot(allStocks.filter((stock) => stock.code !== "002738"));
-	assert.throws(() => validateSnapshot(missingWatch), /002738|23|missing/i);
+test("validates row semantics instead of a fixed Watch/Mapping identity list", () => {
 	const misclassifiedMapping = allStocks.map((stock) => stock.code === "002466"
-		? { ...stock, portfolio_group: "watch", portfolio_status: "WATCH", holding_status: "WATCH", mapping_only: false, mapped_to: null, mapping_to: null }
+		? { ...stock, group: "Watch", portfolio_group: "watch", portfolio_status: "WATCH", holding_status: "WATCH", mapping_only: false, mapped_to: null, mapping_to: null }
 		: stock);
-	assert.throws(() => validateSnapshot(makeSnapshot(misclassifiedMapping)), /mapping|portfolio|Watch/i);
+	assert.doesNotThrow(() => validateSnapshot(makeSnapshot(misclassifiedMapping)));
+	const badMapping = allStocks.map((stock) => stock.code === "03308"
+		? { ...stock, holding_status: "ACTIVE", is_position: true, position_qty: null }
+		: stock);
+	assert.throws(() => validateSnapshot(makeSnapshot(badMapping)), /mapping|MAPPING_ONLY/i);
 	const exited = allStocks.map((stock) => stock.code === "605376"
 		? { ...stock, portfolio_group: "exited_watch", portfolio_status: "WATCH", holding_status: "WATCH" }
 		: stock);
 	assert.throws(() => validateSnapshot(makeSnapshot(exited)), /portfolio_group|invalid|exited/i);
+});
+
+test("decouples research Watch bucket from LIVE holding status", () => {
+	const heldWatch = allStocks.map((stock) => stock.code === "301183"
+		? { ...stock, holding_status: "ACTIVE", is_position: true, position_qty: null }
+		: stock);
+	const snapshot = makeSnapshot(heldWatch);
+	assert.doesNotThrow(() => validateSnapshot(snapshot));
+	assert.equal(getSnapshotCounts(snapshot).activeHoldingTotal, 12);
+});
+
+test("requireWatch is opt-in instead of a fixed production identity guard", () => {
+	const noWatch = makeSnapshot(allStocks.filter((stock) => stock.portfolio_group !== "watch"));
+	assert.doesNotThrow(() => validateSnapshot(noWatch));
+	assert.throws(() => validateSnapshot(noWatch, { requireWatch: true }), /at least one Watch/i);
 });
 
 test("checks derived summary totals and allows failed Watch quote values", () => {

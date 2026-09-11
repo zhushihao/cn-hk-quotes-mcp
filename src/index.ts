@@ -1,6 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
+import {
+	applyLiveUniverse,
+	assertLiveUniverseFresh,
+	getLiveUniverseCoverage,
+	readLiveUniverse,
+	writeLiveUniverse,
+} from "./live-universe";
 import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
 
 const PORTFOLIO_QUOTES_URL =
@@ -13,6 +20,8 @@ const GITHUB_API_VERSION = "2022-11-28";
 
 interface Env {
 	GITHUB_TOKEN: string;
+	PORTFOLIO_UNIVERSE?: KVNamespace;
+	PORTFOLIO_UNIVERSE_TOKEN?: string;
 }
 
 type BridgePayload = {
@@ -85,7 +94,7 @@ function createIssueBody(payload: BridgePayload): string {
 	return [
 		"# A/H 行情计划任务数据桥",
 		"",
-		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑，供 ChatGPT Scheduled Task 通过 GitHub 连接器读取。快照版本为 2026-09-01-v4，覆盖 Core、Growth、Watch 和 A/H Mapping 的全部 23 只行情标的；工程侧不再维护 Exited Watch；请勿手工编辑 JSON 区域。",
+		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑。LIVE 持仓真相不再由固定 23/13 名单维护，而由 Cloudflare 的受鉴权 quote-universe/1 动态层承接；请勿手工编辑 JSON 区域。",
 		"",
 		"```json",
 		JSON.stringify(payload, null, 2),
@@ -155,6 +164,7 @@ function logBridgeFailure(
 async function fetchUpstreamSnapshot(
 	sources: string[],
 	context: BridgeStageContext,
+	env?: Env,
 ): Promise<UpstreamSnapshotResult> {
 	let lastError: BridgeError | null = null;
 
@@ -198,19 +208,40 @@ async function fetchUpstreamSnapshot(
 				source_url: source,
 			});
 			validateSnapshot(snapshot);
-			const counts = getSnapshotCounts(snapshot);
+			let projectedSnapshot = snapshot;
+			let liveUniverseHash: string | null = null;
+			let liveUniverseCoverage = "NOT_CONFIGURED";
+			if (env?.PORTFOLIO_UNIVERSE) {
+				const liveUniverse = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
+				if (liveUniverse) {
+					assertLiveUniverseFresh(liveUniverse);
+					const coverage = getLiveUniverseCoverage(snapshot, liveUniverse);
+					liveUniverseHash = liveUniverse.content_hash;
+					liveUniverseCoverage = coverage.status;
+					if (coverage.status !== "COMPLETE") {
+						throw new BridgeError(
+							"live_universe_coverage",
+							`upstream quote catalog is missing LIVE positions: ${coverage.missing_active.join(", ")}`,
+						);
+					}
+					projectedSnapshot = applyLiveUniverse(snapshot, liveUniverse);
+				}
+			}
+			const counts = getSnapshotCounts(projectedSnapshot);
 			logBridgeStage(context, "payload_validation_success", {
 				stock_count: counts.total,
 				active_quote_count: counts.activeQuoteTotal,
 				active_holding_count: counts.activeHoldingTotal,
 				watch_count: counts.watchTotal,
-				portfolio_version: snapshot.portfolio_version,
+				portfolio_version: projectedSnapshot.portfolio_version,
+				live_universe_hash: liveUniverseHash,
+				live_universe_coverage: liveUniverseCoverage,
 				exited_watch_count: counts.exitedWatchTotal,
 				mapping_count: counts.mappingTotal,
 				core_count: counts.coreTotal,
 				growth_count: counts.growthTotal,
 			});
-			return { snapshot, source };
+			return { snapshot: projectedSnapshot, source };
 		} catch (error) {
 			lastError =
 				error instanceof BridgeError
@@ -349,7 +380,7 @@ export async function updateQuoteBridge(
 	return payload;
 }
 
-function createServer() {
+function createServer(env?: Env) {
 	const server = new McpServer({
 		name: "A股港股行情",
 		version: "1.1.0",
@@ -406,7 +437,7 @@ function createServer() {
 		"get_portfolio_quotes",
 		{
 			description:
-				"获取 Site 返回的 portfolio_version=2026-09-01-v4 的全部 23 只 Core、Growth、Watch 和 A/H Mapping 标的结构化行情快照。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
+				"获取 A/H 结构化行情快照。桥接层不再用固定 23/13 标的名单校验；LIVE 动态持仓由 Cloudflare quote-universe/1 层独立驱动。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
 			inputSchema: z.object({}),
 		},
 		async () => {
@@ -415,6 +446,7 @@ function createServer() {
 				const upstream = await fetchUpstreamSnapshot(
 					[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 					context,
+					env,
 				);
 				return {
 					content: [
@@ -449,10 +481,101 @@ function createServer() {
 	return server;
 }
 
-const handler = createMcpHandler(createServer);
+function jsonResponse(payload: unknown, status = 200): Response {
+	return new Response(JSON.stringify(payload, null, 2), {
+		status,
+		headers: {
+			"Content-Type": "application/json; charset=utf-8",
+			"Cache-Control": "no-store",
+		},
+	});
+}
+
+function isUniverseAuthorized(request: Request, env: Env): boolean {
+	const configured = env.PORTFOLIO_UNIVERSE_TOKEN;
+	if (!configured) return false;
+	return request.headers.get("Authorization") === `Bearer ${configured}`;
+}
+
+async function handleUniverseApi(request: Request, env: Env): Promise<Response> {
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
+	if (!isUniverseAuthorized(request, env)) {
+		return jsonResponse({ error: "UNAUTHORIZED" }, 401);
+	}
+	if (request.method === "GET") {
+		try {
+			const universe = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
+			return universe ? jsonResponse(universe) : jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 404);
+		} catch (error) {
+			return jsonResponse({ error: "LIVE_UNIVERSE_READ_FAILED", message: safeErrorMessage(error) }, 500);
+		}
+	}
+	if (request.method !== "POST") {
+		return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+	}
+
+	let raw: string;
+	try {
+		raw = await request.text();
+	} catch {
+		return jsonResponse({ error: "BODY_READ_FAILED" }, 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > 32_768) {
+		return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	}
+	let payload: unknown;
+	try {
+		payload = JSON.parse(raw);
+	} catch {
+		return jsonResponse({ error: "INVALID_JSON" }, 400);
+	}
+	try {
+		const stored = await writeLiveUniverse(env.PORTFOLIO_UNIVERSE, payload);
+		return jsonResponse({
+			status: "SUCCESS",
+			schema_version: stored.schema_version,
+			content_hash: stored.content_hash,
+			as_of: stored.as_of,
+			received_at: stored.received_at,
+			active_count: stored.active.length,
+		});
+	} catch (error) {
+		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: safeErrorMessage(error) }, 400);
+	}
+}
+
+async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise<Response> {
+	if (!isUniverseAuthorized(request, env)) {
+		return jsonResponse({ error: "UNAUTHORIZED" }, 401);
+	}
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
+	const context = bridgeContext("http:dynamic-portfolio-quotes");
+	try {
+		const liveUniverse = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
+		if (!liveUniverse) return jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 503);
+		assertLiveUniverseFresh(liveUniverse);
+		const upstream = await fetchUpstreamSnapshot(
+			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+			context,
+			env,
+		);
+		return jsonResponse(upstream.snapshot);
+	} catch (error) {
+		logBridgeFailure(context, error, "dynamic_portfolio_quotes");
+		return jsonResponse({ error: "PORTFOLIO_QUOTES_UNAVAILABLE", message: safeErrorMessage(error) }, 502);
+	}
+}
 
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
+		const url = new URL(request.url);
+		if (url.pathname === "/api/quote-universe") return handleUniverseApi(request, env);
+		if (url.pathname === "/api/portfolio-quotes") return handleDynamicPortfolioQuotes(request, env);
+		const handler = createMcpHandler(() => createServer(env));
 		return handler(request, env, ctx);
 	},
 	async scheduled(controller: ScheduledController, env: Env) {

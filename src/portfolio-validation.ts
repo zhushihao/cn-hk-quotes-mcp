@@ -1,5 +1,3 @@
-export const EXPECTED_PORTFOLIO_VERSION = "2026-09-01-v4";
-
 export type QuoteGroup = "Core" | "Growth" | "Watch";
 /** Lower-case technical buckets. Mapping is a quote row type, not a status. */
 export type PortfolioGroup = "core" | "growth" | "watch" | "mapping";
@@ -71,68 +69,6 @@ export type SnapshotValidationOptions = {
 	expectedActiveQuoteTotal?: number;
 	requireWatch?: boolean;
 };
-
-/**
- * This is a validation contract, not a second editable portfolio config.
- * The Site's PORTFOLIO_UNIVERSE is the runtime source of truth; these keys
- * prevent an old or partially updated Site from being accepted by the bridge.
- */
-export const EXPECTED_MARKET_CODE_KEYS = [
-	"CN:300308",
-	"HK:03308",
-	"CN:300502",
-	"CN:300394",
-	"CN:688676",
-	"CN:601872",
-	"CN:588080",
-	"HK:09696",
-	"CN:002466",
-	"CN:002192",
-	"CN:300433",
-	"CN:588170",
-	"CN:603308",
-	"CN:600096",
-	"CN:605376",
-	"CN:301183",
-	"CN:688596",
-	"HK:09988",
-	"HK:02228",
-	"CN:603893",
-	"CN:002460",
-	"CN:002240",
-	"CN:002738",
-] as const;
-
-export const EXPECTED_ACTIVE_QUOTE_KEYS = [
-	"CN:300308",
-	"HK:03308",
-	"CN:300502",
-	"CN:300394",
-	"CN:688676",
-	"CN:601872",
-	"CN:588080",
-	"HK:09696",
-	"CN:002466",
-	"CN:002192",
-	"CN:300433",
-	"CN:588170",
-	"CN:603308",
-] as const;
-
-export const REQUIRED_WATCH_KEYS = [
-	"CN:600096",
-	"CN:605376",
-	"CN:301183",
-	"CN:688596",
-	"HK:09988",
-	"HK:02228",
-	"CN:603893",
-	"CN:002460",
-	"CN:002240",
-	"CN:002738",
-] as const;
-
-export const REQUIRED_MAPPING_KEYS = ["HK:03308", "CN:002466"] as const;
 
 const GROUPS = new Set<QuoteGroup>(["Core", "Growth", "Watch"]);
 const PORTFOLIO_GROUPS = new Set<PortfolioGroup>(["core", "growth", "watch", "mapping"]);
@@ -257,14 +193,11 @@ function validateClassification(
 		throw new Error(`${context}.group does not match portfolio_group`);
 	}
 
-	const expectedStatus: HoldingStatus =
-		normalizedPortfolioGroup === "mapping"
-			? "MAPPING_ONLY"
-			: normalizedPortfolioGroup === "watch"
-				? "WATCH"
-				: "ACTIVE";
-	if (normalizedStatus !== expectedStatus) {
-		throw new Error(`${context}.holding_status does not match portfolio_group`);
+	if (normalizedPortfolioGroup === "mapping" && normalizedStatus !== "MAPPING_ONLY") {
+		throw new Error(`${context}.mapping rows must use holding_status=MAPPING_ONLY`);
+	}
+	if (normalizedPortfolioGroup !== "mapping" && normalizedStatus === "MAPPING_ONLY") {
+		throw new Error(`${context}.MAPPING_ONLY is only valid for mapping rows`);
 	}
 	const expectedPortfolioStatus: PortfolioStatus =
 		normalizedPortfolioGroup === "core"
@@ -308,8 +241,8 @@ function validateClassification(
 	if (typeof isPosition !== "boolean") {
 		throw new Error(`${context}.is_position must be boolean`);
 	}
-	if (isPosition !== (normalizedPortfolioGroup === "core" || normalizedPortfolioGroup === "growth")) {
-		throw new Error(`${context}.position_qty and is_position are inconsistent`);
+	if (isPosition !== (normalizedStatus === "ACTIVE")) {
+		throw new Error(`${context}.holding_status and is_position are inconsistent`);
 	}
 	if (!isPosition && positionQty !== 0) {
 		throw new Error(`${context}.non-position rows must have position_qty=0`);
@@ -411,10 +344,10 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 		if (stock.portfolio_group === "growth") growthTotal += 1;
 		if (stock.portfolio_group === "watch") watchTotal += 1;
 		if (stock.portfolio_group === "mapping") mappingTotal += 1;
-		if (stock.portfolio_group === "core" || stock.portfolio_group === "growth" || stock.portfolio_group === "mapping") {
+		if (stock.is_position || stock.mapping_only) {
 			activeQuoteTotal += 1;
-			if (stock.is_position) activeHoldingTotal += 1;
 		}
+		if (stock.is_position) activeHoldingTotal += 1;
 	}
 
 	return {
@@ -431,13 +364,13 @@ export function getSnapshotCounts(snapshot: QuoteSnapshot): SnapshotCounts {
 
 export function getActiveQuoteCodes(snapshot: QuoteSnapshot): string[] {
 	return snapshot.stocks
-		.filter((stock) => stock.portfolio_group === "core" || stock.portfolio_group === "growth" || stock.portfolio_group === "mapping")
+		.filter((stock) => stock.is_position || stock.mapping_only)
 		.map((stock) => stock.code);
 }
 
 export function getActiveQuoteKeys(snapshot: QuoteSnapshot): string[] {
 	return snapshot.stocks
-		.filter((stock) => stock.portfolio_group === "core" || stock.portfolio_group === "growth" || stock.portfolio_group === "mapping")
+		.filter((stock) => stock.is_position || stock.mapping_only)
 		.map(instrumentKey);
 }
 
@@ -466,8 +399,8 @@ function compareUniverseToStock(universe: PortfolioUniverseItem, stock: QuoteSto
 
 export function validateSnapshot(value: unknown, options: SnapshotValidationOptions = {}): asserts value is QuoteSnapshot {
 	if (!isRecord(value)) throw new Error("upstream returned non-object JSON");
-	if (value.portfolio_version !== EXPECTED_PORTFOLIO_VERSION) {
-		throw new Error(`portfolio_version must be ${EXPECTED_PORTFOLIO_VERSION}`);
+	if (typeof value.portfolio_version !== "string" || !value.portfolio_version) {
+		throw new Error("portfolio_version must be a non-empty string");
 	}
 	if (typeof value.snapshot_time !== "string" || !value.snapshot_time) {
 		throw new Error("upstream JSON missing required field: snapshot_time");
@@ -505,33 +438,12 @@ export function validateSnapshot(value: unknown, options: SnapshotValidationOpti
 		compareUniverseToStock(item, stock, index);
 	}
 
-	const expectedKeys = new Set<string>(EXPECTED_MARKET_CODE_KEYS);
-	if (stocks.length !== expectedKeys.size) throw new Error(`portfolio snapshot must contain ${expectedKeys.size} instruments, got ${stocks.length}`);
-	for (const key of expectedKeys) if (!stockByKey.has(key)) throw new Error(`portfolio snapshot is missing ${key}`);
-	for (const key of stockByKey.keys()) if (!expectedKeys.has(key)) throw new Error(`unexpected portfolio instrument: ${key}`);
-
 	const validatedSnapshot = { ...value, stocks, portfolio_universe: universe } as unknown as QuoteSnapshot;
 	const counts = getSnapshotCounts(validatedSnapshot);
-	const expectedActiveQuoteTotal = options.expectedActiveQuoteTotal ?? EXPECTED_ACTIVE_QUOTE_KEYS.length;
-	if (counts.activeQuoteTotal !== expectedActiveQuoteTotal) throw new Error(`active quote count must be ${expectedActiveQuoteTotal}, got ${counts.activeQuoteTotal}`);
-	const activeKeys = new Set(getActiveQuoteKeys(validatedSnapshot));
-	for (const key of EXPECTED_ACTIVE_QUOTE_KEYS) if (!activeKeys.has(key)) throw new Error(`active quote set is missing ${key}`);
-	for (const key of activeKeys) if (!EXPECTED_ACTIVE_QUOTE_KEYS.includes(key as (typeof EXPECTED_ACTIVE_QUOTE_KEYS)[number])) throw new Error(`unexpected active quote key: ${key}`);
-
-	for (const key of REQUIRED_WATCH_KEYS) {
-		const stock = stockByKey.get(key);
-		if (!stock || stock.portfolio_group !== "watch" || stock.portfolio_status !== "WATCH" || stock.holding_status !== "WATCH") {
-			throw new Error(`required Watch record is missing or misclassified: ${key}`);
-		}
+	if (options.expectedActiveQuoteTotal !== undefined && counts.activeQuoteTotal !== options.expectedActiveQuoteTotal) {
+		throw new Error(`active quote count must be ${options.expectedActiveQuoteTotal}, got ${counts.activeQuoteTotal}`);
 	}
-	for (const key of REQUIRED_MAPPING_KEYS) {
-		const stock = stockByKey.get(key);
-		if (!stock || stock.portfolio_group !== "mapping" || !stock.mapping_only || stock.portfolio_status !== null || stock.holding_status !== "MAPPING_ONLY") {
-			throw new Error(`required mapping record is missing or misclassified: ${key}`);
-		}
-	}
-	if (counts.exitedWatchTotal !== 0) throw new Error("Exited Watch records are not allowed in v4");
-	if ((options.requireWatch ?? true) && counts.watchTotal === 0) throw new Error("snapshot must include at least one Watch record");
+	if (options.requireWatch === true && counts.watchTotal === 0) throw new Error("snapshot must include at least one Watch record");
 
 	const derived: Record<string, number> = {
 		active_quote_total: counts.activeQuoteTotal,

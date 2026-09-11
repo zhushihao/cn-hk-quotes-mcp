@@ -8,6 +8,11 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-07-02",
 	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+	"kv_namespaces": [
+		{
+			"binding": "PORTFOLIO_UNIVERSE"
+		}
+	],
 	"triggers": {
 		// Cloudflare cron weekdays use 1=Sunday; names make the intended weekdays explicit.
 		"crons": [
