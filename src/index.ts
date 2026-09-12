@@ -3,13 +3,19 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { githubBearerToken, verifyGithubAccessToken } from "./github-auth";
 import {
-	applyLiveUniverse,
-	getLiveUniverseCoverage,
 	readLiveUniverse,
 	resolveLiveUniverseFreshness,
 	writeLiveUniverse,
 	type StoredLiveUniverse,
 } from "./live-universe";
+import {
+	LiveCoverageError,
+	isLiveOverlayEnabled,
+	projectCallerSnapshot,
+	redactInstrumentCodes,
+	resolveLiveOverlayStatus,
+	type LiveOverlayStatus,
+} from "./live-overlay";
 import {
 	PORTFOLIO_STATUS_MAX_PAYLOAD_BYTES,
 	readPortfolioStatus,
@@ -141,6 +147,17 @@ function safeErrorMessage(error: unknown): string {
 		.slice(0, 500);
 }
 
+/**
+ * 面向调用方的错误文本（issue #15 / D-1 要求 2）：
+ *
+ * 在 `safeErrorMessage()`（遮蔽凭据）之上再去掉证券代码形态——coverage 缺失、
+ * identity、stale 等任何出口都不得带出真实代码，缺失**数量**保留。
+ * `safeErrorMessage()` 本身仍是服务端日志口径（可保留明细）。
+ */
+function clientFacingErrorMessage(error: unknown): string {
+	return redactInstrumentCodes(safeErrorMessage(error));
+}
+
 function logBridgeStage(
 	context: BridgeStageContext,
 	stage: string,
@@ -248,11 +265,24 @@ async function resolveLivePresentation(
 	return { universe, status, presentation };
 }
 
+/**
+ * `fetchUpstreamSnapshot()` 的 LIVE 叠加门（D-1 选项 A）。
+ *
+ * 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：只有显式传入 `ENABLED`
+ * 的调用方才可能应用 LIVE 叠加。`updateQuoteBridge()`（旧行情桥）本就不传 `env`，
+ * 叠加在结构上不可能发生（见 `PORTFOLIO_SYNC.md`「与旧桥的兼容」）。
+ */
+type UpstreamFetchOptions = {
+	liveOverlayStatus?: LiveOverlayStatus;
+};
+
 async function fetchUpstreamSnapshot(
 	sources: string[],
 	context: BridgeStageContext,
 	env?: Env,
+	options: UpstreamFetchOptions = {},
 ): Promise<UpstreamSnapshotResult> {
+	const liveOverlayStatus = options.liveOverlayStatus ?? "SKIPPED_UNAUTHORIZED";
 	let lastError: BridgeError | null = null;
 
 	for (const [index, source] of sources.entries()) {
@@ -302,29 +332,28 @@ async function fetchUpstreamSnapshot(
 			let liveUniverseAnchor: string | null = null;
 			let liveUniverseAnchorFallback: boolean | null = null;
 			if (env?.PORTFOLIO_UNIVERSE) {
+				// D-1 选项 A（issue #15）：门未放行（匿名 / 错带 token / 服务端未配置 token）时
+				// **不读 KV、不判三态、不报错** —— 与「无 universe」同路径（legacy 目录视图），
+				// 降级原因随 `control_plane_status.live_overlay_status` 外发。
+				const live = isLiveOverlayEnabled(liveOverlayStatus)
+					? await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date())
+					: null;
 				// C-4：新鲜度锚已迁到状态件 LRCCA（缺失/不可读时回退 generated_at）。
-				// C-5 / J-11：PORTFOLIO_UNKNOWN 不应用 LIVE overlay——回退静态目录，
-				// 不把旧投影当「当前持仓」用，也不报错（由 control_plane_status 标记）。
-				const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date());
-				liveUniverseState = live.presentation.portfolio_state;
-				liveUniverseAnchor = live.presentation.freshness_anchor;
-				liveUniverseAnchorFallback = live.presentation.freshness_anchor_fallback;
-				if (live.universe) {
-					liveUniverseHash = live.universe.content_hash;
-					if (live.presentation.apply_overlay) {
-						const coverage = getLiveUniverseCoverage(snapshot, live.universe);
-						liveUniverseCoverage = coverage.status;
-						if (coverage.status !== "COMPLETE") {
-							throw new BridgeError(
-								"live_universe_coverage",
-								`upstream quote catalog is missing LIVE positions: ${coverage.missing_active.join(", ")}`,
-							);
-						}
-						projectedSnapshot = applyLiveUniverse(snapshot, live.universe);
-					} else {
-						liveUniverseCoverage = "SKIPPED_PORTFOLIO_NOT_CONFIRMED";
-					}
-				}
+				liveUniverseState = live?.presentation.portfolio_state ?? null;
+				liveUniverseAnchor = live?.presentation.freshness_anchor ?? null;
+				liveUniverseAnchorFallback = live?.presentation.freshness_anchor_fallback ?? null;
+				liveUniverseHash = live?.universe?.content_hash ?? null;
+				const projected = projectCallerSnapshot({
+					snapshot,
+					liveOverlayStatus,
+					universeBound: true,
+					universe: live?.universe ?? null,
+					// C-5 / J-11：PORTFOLIO_UNKNOWN 不应用 LIVE overlay——回退静态目录，
+					// 不把旧投影当「当前持仓」用，也不报错（由 control_plane_status 标记）。
+					applyOverlay: live?.presentation.apply_overlay ?? false,
+				});
+				projectedSnapshot = projected.snapshot;
+				liveUniverseCoverage = projected.coverage;
 			}
 			const counts = getSnapshotCounts(projectedSnapshot);
 			logBridgeStage(context, "payload_validation_success", {
@@ -333,6 +362,7 @@ async function fetchUpstreamSnapshot(
 				active_holding_count: counts.activeHoldingTotal,
 				watch_count: counts.watchTotal,
 				portfolio_version: projectedSnapshot.portfolio_version,
+				live_overlay_status: liveOverlayStatus,
 				live_universe_hash: liveUniverseHash,
 				live_universe_coverage: liveUniverseCoverage,
 				live_universe_state: liveUniverseState,
@@ -345,6 +375,17 @@ async function fetchUpstreamSnapshot(
 			});
 			return { snapshot: projectedSnapshot, source };
 		} catch (error) {
+			if (error instanceof LiveCoverageError) {
+				// D-1 要求 2：面向调用方的文本只出数量（error.message 已是数量文本），
+				// 逐代码明细只进服务端结构化日志。
+				logBridgeStage(context, "live_universe_coverage_incomplete", {
+					active_count: error.activeCount,
+					quoted_active_count: error.quotedActiveCount,
+					missing_active_count: error.missingCount,
+					missing_active: error.missingActive,
+				});
+				throw new BridgeError("live_universe_coverage", error.message);
+			}
 			lastError =
 				error instanceof BridgeError
 					? error
@@ -482,7 +523,16 @@ export async function updateQuoteBridge(
 	return payload;
 }
 
-function createServer(env?: Env) {
+/**
+ * MCP server 工厂（每个 HTTP 请求构造一次，`ctx.requestInfo` 即原始请求）。
+ *
+ * `liveOverlayStatus` 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：
+ * 只有 `fetch()` 路由把请求头判定结果显式传进来时才可能应用 LIVE 叠加。
+ */
+function createServer(
+	env?: Env,
+	liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED",
+) {
 	const server = new McpServer({
 		name: "A股港股行情",
 		version: "1.1.0",
@@ -539,7 +589,7 @@ function createServer(env?: Env) {
 		"get_portfolio_quotes",
 		{
 			description:
-				"获取 A/H 结构化行情快照。桥接层不再用固定 23/13 标的名单校验；LIVE 动态持仓由 Cloudflare quote-universe/1 层独立驱动。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
+				"获取 A/H 结构化行情快照。桥接层不再用固定 23/13 标的名单校验；LIVE 动态持仓由 Cloudflare quote-universe/1 层独立驱动，且**仅对携带有效 PORTFOLIO_UNIVERSE_TOKEN bearer 的调用方生效**（匿名调用返回 legacy 目录视图，并在 control_plane_status.live_overlay_status 标注 SKIPPED_*）。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
 			inputSchema: z.object({}),
 		},
 		async () => {
@@ -549,9 +599,13 @@ function createServer(env?: Env) {
 					[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 					context,
 					env,
+					{ liveOverlayStatus },
 				);
 				const controlPlaneStatus = env
-					? await getControlPlaneStatus(env)
+					? {
+						...(await getControlPlaneStatus(env)),
+						live_overlay_status: liveOverlayStatus,
+					}
 					: {
 						status: "DEGRADED",
 						github_private_read: false,
@@ -563,6 +617,7 @@ function createServer(env?: Env) {
 						freshness_anchor: null,
 						freshness_anchor_fallback: false,
 						mode: "LEGACY_FALLBACK",
+						live_overlay_status: liveOverlayStatus,
 					};
 				return {
 					content: [
@@ -586,7 +641,7 @@ function createServer(env?: Env) {
 							text: JSON.stringify(
 								{
 									error: "UPSTREAM_FETCH_ERROR",
-									message: safeErrorMessage(error),
+									message: clientFacingErrorMessage(error),
 								},
 								null,
 								2,
@@ -602,14 +657,21 @@ function createServer(env?: Env) {
 		"get_control_plane_status",
 		{
 			description:
-				"只读检查 LIVE 持仓私有控制面是否可用。仅返回私有 GitHub 可读、Cloudflare KV binding、universe 是否存在/新鲜和当前模式；不返回持仓代码、数量、hash 或凭据。",
+				"只读检查 LIVE 持仓私有控制面是否可用。仅返回私有 GitHub 可读、Cloudflare KV binding、universe 是否存在/新鲜、当前模式和本请求的 LIVE 叠加门判定（live_overlay_status）；不返回持仓代码、数量、hash 或凭据。",
 			inputSchema: z.object({}),
 		},
 		async () => ({
 			content: [
 				{
 					type: "text",
-					text: JSON.stringify(await getControlPlaneStatus(env ?? ({} as Env)), null, 2),
+					text: JSON.stringify(
+						{
+							...(await getControlPlaneStatus(env ?? ({} as Env))),
+							live_overlay_status: liveOverlayStatus,
+						},
+						null,
+						2,
+					),
 				},
 			],
 		}),
@@ -628,10 +690,21 @@ function jsonResponse(payload: unknown, status = 200): Response {
 	});
 }
 
+/**
+ * 请求级 LIVE 叠加门判定（D-1 选项 A）：取 `Authorization` 头与既有
+ * `PORTFOLIO_UNIVERSE_TOKEN` 比对。判定实现与写入端点鉴权**同源**
+ * （`live-overlay.resolveLiveOverlayStatus()`），此处只做请求对象到原始头的适配。
+ */
+function requestLiveOverlayStatus(request: Request | undefined, env: Env): LiveOverlayStatus {
+	return resolveLiveOverlayStatus(
+		request?.headers.get("Authorization") ?? null,
+		env.PORTFOLIO_UNIVERSE_TOKEN,
+	);
+}
+
+/** 沿用既有口径：token 未配置或请求头不匹配 → 未授权（fail-closed，`!== "ENABLED"`）。 */
 function isUniverseAuthorized(request: Request, env: Env): boolean {
-	const configured = env.PORTFOLIO_UNIVERSE_TOKEN;
-	if (!configured) return false;
-	return request.headers.get("Authorization") === `Bearer ${configured}`;
+	return isLiveOverlayEnabled(requestLiveOverlayStatus(request, env));
 }
 
 async function handleUniverseApi(request: Request, env: Env): Promise<Response> {
@@ -646,7 +719,7 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 			const universe = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
 			return universe ? jsonResponse(universe) : jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 404);
 		} catch (error) {
-			return jsonResponse({ error: "LIVE_UNIVERSE_READ_FAILED", message: safeErrorMessage(error) }, 500);
+			return jsonResponse({ error: "LIVE_UNIVERSE_READ_FAILED", message: clientFacingErrorMessage(error) }, 500);
 		}
 	}
 	if (request.method !== "POST") {
@@ -680,7 +753,7 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 			active_count: stored.active.length,
 		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: safeErrorMessage(error) }, 400);
+		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) }, 400);
 	}
 }
 
@@ -718,7 +791,7 @@ async function handleGithubAuthProbe(request: Request): Promise<Response> {
 		await verifyGithubAccessToken(githubBearerToken(request));
 		return jsonResponse({ status: "OK", identity: "GITHUB_VERIFIED" });
 	} catch (error) {
-		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: safeErrorMessage(error) }, 401);
+		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401);
 	}
 }
 
@@ -730,7 +803,7 @@ async function handleGithubAuthUniverse(request: Request, env: Env): Promise<Res
 	try {
 		await verifyGithubAccessToken(githubBearerToken(request));
 	} catch (error) {
-		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: safeErrorMessage(error) }, 401);
+		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401);
 	}
 	let raw: string;
 	try {
@@ -757,7 +830,7 @@ async function handleGithubAuthUniverse(request: Request, env: Env): Promise<Res
 			active_count: stored.active.length,
 		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: safeErrorMessage(error) }, 400);
+		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) }, 400);
 	}
 }
 
@@ -777,7 +850,7 @@ async function handleGithubAuthPortfolioStatus(request: Request, env: Env): Prom
 	try {
 		await verifyGithubAccessToken(githubBearerToken(request));
 	} catch (error) {
-		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: safeErrorMessage(error) }, 401);
+		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401);
 	}
 	let raw: string;
 	try {
@@ -807,7 +880,7 @@ async function handleGithubAuthPortfolioStatus(request: Request, env: Env): Prom
 			received_at: stored.received_at,
 		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_PORTFOLIO_STATUS", message: safeErrorMessage(error) }, 400);
+		return jsonResponse({ error: "INVALID_PORTFOLIO_STATUS", message: clientFacingErrorMessage(error) }, 400);
 	}
 }
 
@@ -839,11 +912,13 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 			context,
 			env,
+			// 本端点已在上面用同一入口鉴权（未授权直接 401），故门必为放行态。
+			{ liveOverlayStatus: requestLiveOverlayStatus(request, env) },
 		);
 		return jsonResponse(upstream.snapshot);
 	} catch (error) {
 		logBridgeFailure(context, error, "dynamic_portfolio_quotes");
-		return jsonResponse({ error: "PORTFOLIO_QUOTES_UNAVAILABLE", message: safeErrorMessage(error) }, 502);
+		return jsonResponse({ error: "PORTFOLIO_QUOTES_UNAVAILABLE", message: clientFacingErrorMessage(error) }, 502);
 	}
 }
 
@@ -860,7 +935,11 @@ export default {
 		}
 		if (url.pathname === "/api/quote-universe") return handleUniverseApi(request, env);
 		if (url.pathname === "/api/portfolio-quotes") return handleDynamicPortfolioQuotes(request, env);
-		const handler = createMcpHandler(() => createServer(env));
+		// MCP 面（含 `get_portfolio_quotes`）：按**本请求**的 Authorization 头判定 LIVE 叠加门
+		// （D-1 选项 A）。工厂按请求构造 server，故 `ctx.requestInfo` 就是当前请求。
+		const handler = createMcpHandler((ctx) =>
+			createServer(env, requestLiveOverlayStatus(ctx.requestInfo, env)),
+		);
 		return handler(request, env, ctx);
 	},
 	async scheduled(controller: ScheduledController, env: Env) {
