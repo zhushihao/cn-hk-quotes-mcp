@@ -1,51 +1,28 @@
-# Building a Remote MCP Server on Cloudflare (Without Auth)
+# QuantPro Collector
 
-This example allows you to deploy a stateless remote MCP server that doesn't require authentication on Cloudflare Workers. It implements the MCP 2026-07-28 specification while remaining compatible with legacy clients for ordinary tool calls.
+> QuantPro 的统一远程 MCP Collector / Gateway。
 
-## Get started:
+`QuantPro Collector` 是现有 `cn-hk-quotes-mcp` 服务的产品名称。仓库名、Cloudflare Worker URL、鉴权 token 环境变量和既有工具名保持兼容；命名调整不应破坏现有 LIVE overlay、行情查询和 Codex/ChatGPT 客户端配置。
 
-[![Deploy to Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/ai/tree/main/demos/remote-mcp-authless)
+当前已承载的只读能力包括：
 
-This will deploy your MCP server to a URL like: `remote-mcp-server-authless.<your-account>.workers.dev/mcp`
+- `get_portfolio_quotes`：受鉴权的 LIVE 持仓行情视图；
+- `get_public_quotes`：不含真实持仓身份的公开行情视图；
+- `get_control_plane_status`：LIVE 控制面健康与 freshness 状态。
 
-Alternatively, you can use the command line below to get the remote MCP Server created on your local machine:
+后续 RIWS 研究基础设施能力继续通过同一个 **QuantPro Collector** 暴露给 ChatGPT，不另建第二个公网 Research MCP。RESEARCH 机器负责采集、Evidence、Accumulator 与 Work Queue；ChatGPT 是唯一投资研究 Agent。
 
-```bash
-npm create cloudflare@latest -- my-mcp-server --template=cloudflare/ai/demos/remote-mcp-authless
-```
+## Compatibility
 
-## Customizing your MCP Server
+为避免对已上线链路造成破坏，以下标识暂不因产品改名而变化：
 
-To add your own [tools](https://developers.cloudflare.com/agents/model-context-protocol/protocol/tools/) to the MCP server, register each tool on the `McpServer` created in the `createServer()` function in `src/index.ts` using `server.registerTool(...)`.
+- GitHub repository: `zhushihao/cn-hk-quotes-mcp`
+- 已部署 Worker / MCP endpoint URL
+- `PORTFOLIO_UNIVERSE_TOKEN` 等现有运行时配置名
+- 已发布 MCP tool 名称
 
-## Connect to Cloudflare AI Playground
+这些属于接口兼容标识，不代表产品仍名为 `A/H股行情` 或 `cn-hk-quotes`。
 
-You can connect to your MCP server from the Cloudflare AI Playground, which is a remote MCP client:
+## MCP Server
 
-1. Go to https://playground.ai.cloudflare.com/
-2. Enter your deployed MCP server URL (`remote-mcp-server-authless.<your-account>.workers.dev/mcp`)
-3. You can now use your MCP tools directly from the playground!
-
-## Connect Claude Desktop to your MCP server
-
-You can also connect to your remote MCP server from local MCP clients, by using the [mcp-remote proxy](https://www.npmjs.com/package/mcp-remote).
-
-To connect to your MCP server from Claude Desktop, follow [Anthropic's Quickstart](https://modelcontextprotocol.io/quickstart/user) and within Claude Desktop go to Settings > Developer > Edit Config.
-
-Update with this configuration:
-
-```json
-{
-	"mcpServers": {
-		"calculator": {
-			"command": "npx",
-			"args": [
-				"mcp-remote",
-				"http://localhost:8787/mcp" // or remote-mcp-server-authless.your-account.workers.dev/mcp
-			]
-		}
-	}
-}
-```
-
-Restart Claude and you should see the tools become available.
+该仓库基于 Cloudflare Workers 提供远程 MCP 服务。生产私域能力必须经过鉴权；匿名/未授权请求不得获得 LIVE overlay 或私域研究数据。
