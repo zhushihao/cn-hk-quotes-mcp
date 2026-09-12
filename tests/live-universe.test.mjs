@@ -7,6 +7,7 @@ import {
 	computeLiveUniverseHash,
 	getLiveUniverseCoverage,
 	readLiveUniverse,
+	resolveLiveUniverseFreshness,
 	validateLiveUniverse,
 	writeLiveUniverse,
 } from "../src/live-universe.ts";
@@ -92,6 +93,45 @@ test("KV current is last-known-good: invalid writes never overwrite the previous
 	);
 	assert.equal(values.get("live-portfolio/current"), before);
 	assert.equal((await readLiveUniverse(kv))?.content_hash, payload.content_hash);
+});
+
+test("C-4 dual-track freshness anchor: LRCCA first, generated_at as rollout fallback", async () => {
+	const active = [{ market: "CN", exchange: "SZ", code: "300308" }];
+	const generatedAt = "2026-09-06T09:30:00+08:00";
+	const universe = { ...(await makeUniverse(active)), generated_at: generatedAt };
+	const now = new Date("2026-09-14T10:00:00+08:00");
+
+	// 状态件携带的 LRCCA 优先：投影内容 8 天前生成，但账号确认 2 小时前 → 锚 LRCCA。
+	const withLrcca = resolveLiveUniverseFreshness(universe, { lrcca: "2026-09-14T08:00:00+08:00", now });
+	assert.equal(withLrcca.anchor, "LRCCA");
+	assert.equal(withLrcca.anchor_fallback, false);
+	assert.equal(withLrcca.anchor_timestamp, "2026-09-14T08:00:00+08:00");
+	assert.equal(withLrcca.anchor_age_seconds, 7200);
+	assert.equal(withLrcca.fresh, true);
+
+	// 状态件缺失（LRCCA 不可用）→ 回退 generated_at 锚并记 anchor_fallback=true（过渡期双轨）。
+	const noLrcca = resolveLiveUniverseFreshness(universe, { now });
+	assert.equal(noLrcca.anchor, "GENERATED_AT");
+	assert.equal(noLrcca.anchor_fallback, true);
+	assert.equal(noLrcca.anchor_timestamp, generatedAt);
+	assert.equal(noLrcca.fresh, true);
+	// LRCCA 为空与缺失同款处理（状态件在但无基线）。
+	assert.equal(resolveLiveUniverseFreshness(universe, { lrcca: null, now }).anchor_fallback, true);
+
+	// 投影陈旧但确认新鲜：以 LRCCA 为准（锚迁移的本意）。
+	const oldUniverse = { ...universe, generated_at: "2026-08-20T09:30:00+08:00" };
+	assert.equal(resolveLiveUniverseFreshness(oldUniverse, { lrcca: "2026-09-14T07:00:00+08:00", now }).fresh, true);
+	assert.equal(resolveLiveUniverseFreshness(oldUniverse, { now }).fresh, false);
+
+	// LRCCA 自身过期 → 不新鲜（由三态层翻 PORTFOLIO_UNKNOWN）。
+	const expired = resolveLiveUniverseFreshness(universe, { lrcca: "2026-09-03T09:30:00+08:00", now });
+	assert.equal(expired.anchor, "LRCCA");
+	assert.equal(expired.fresh, false);
+
+	// 未来时间戳超过容忍窗口 → fail-closed 不新鲜。
+	const future = resolveLiveUniverseFreshness(universe, { lrcca: "2026-09-14T12:00:00+08:00", now });
+	assert.equal(future.fresh, false);
+	assert.equal(future.anchor_age_seconds, -7200);
 });
 
 test("LIVE coverage fails closed when a broker holding has no quote row", async () => {

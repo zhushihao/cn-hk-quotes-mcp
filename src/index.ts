@@ -4,11 +4,21 @@ import { z } from "zod";
 import { githubBearerToken, verifyGithubAccessToken } from "./github-auth";
 import {
 	applyLiveUniverse,
-	assertLiveUniverseFresh,
 	getLiveUniverseCoverage,
 	readLiveUniverse,
+	resolveLiveUniverseFreshness,
 	writeLiveUniverse,
+	type StoredLiveUniverse,
 } from "./live-universe";
+import {
+	PORTFOLIO_STATUS_MAX_PAYLOAD_BYTES,
+	readPortfolioStatus,
+	resolvePortfolioPresentation,
+	writePortfolioStatus,
+	type PortfolioAnchorView,
+	type PortfolioPresentation,
+	type StoredPortfolioStatus,
+} from "./portfolio-status";
 import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
 
 const PORTFOLIO_QUOTES_URL =
@@ -162,6 +172,82 @@ function logBridgeFailure(
 	});
 }
 
+/** KV 中的 LIVE 面（投影 + 状态件）与推导出的消费侧呈现口径。 */
+type LivePresentation = {
+	universe: StoredLiveUniverse | null;
+	status: StoredPortfolioStatus | null;
+	presentation: PortfolioPresentation;
+};
+
+async function readPortfolioStatusSafe(kv: KVNamespace): Promise<StoredPortfolioStatus | null> {
+	try {
+		return await readPortfolioStatus(kv);
+	} catch {
+		// 状态件损坏 / 非法 → 按「无件」口径保守呈现（C-3），不把消费面拖入硬失败。
+		return null;
+	}
+}
+
+/**
+ * C-4/C-5 的单一出口：读 KV 的投影与状态件，解析双轨新鲜度锚，推导三态呈现口径。
+ *
+ * - `tolerateUnreadableUniverse`：诊断面（`/api/control-plane-status`）沿用既有
+ *   「读失败 = present=false」口径；供数面保持 fail-closed（读失败向上抛，与迁移前一致）。
+ */
+async function resolveLivePresentation(
+	kv: KVNamespace | undefined,
+	now = new Date(),
+	options: { tolerateUnreadableUniverse?: boolean } = {},
+): Promise<LivePresentation> {
+	if (!kv) {
+		return {
+			universe: null,
+			status: null,
+			presentation: resolvePortfolioPresentation({
+				universePresent: false,
+				universeContentHash: null,
+				universeManifestHash: null,
+				status: null,
+				anchor: null,
+				now,
+			}),
+		};
+	}
+	let universe: StoredLiveUniverse | null = null;
+	if (options.tolerateUnreadableUniverse) {
+		try {
+			universe = await readLiveUniverse(kv);
+		} catch {
+			universe = null;
+		}
+	} else {
+		universe = await readLiveUniverse(kv);
+	}
+	const status = await readPortfolioStatusSafe(kv);
+	// LRCCA 缺失（无状态件 / 不可读 / 字段为空）→ generated_at 兜底锚（anchor_fallback=true）。
+	let anchorView: PortfolioAnchorView | null = null;
+	if (universe) {
+		const anchor = resolveLiveUniverseFreshness(universe, {
+			lrcca: status?.last_real_complete_confirmed_at ?? null,
+			now,
+		});
+		anchorView = {
+			anchor: anchor.anchor,
+			anchor_fallback: anchor.anchor_fallback,
+			fresh: anchor.fresh,
+		};
+	}
+	const presentation = resolvePortfolioPresentation({
+		universePresent: universe !== null,
+		universeContentHash: universe?.content_hash ?? null,
+		universeManifestHash: universe?.source_manifest_hash ?? null,
+		status,
+		anchor: anchorView,
+		now,
+	});
+	return { universe, status, presentation };
+}
+
 async function fetchUpstreamSnapshot(
 	sources: string[],
 	context: BridgeStageContext,
@@ -212,20 +298,32 @@ async function fetchUpstreamSnapshot(
 			let projectedSnapshot = snapshot;
 			let liveUniverseHash: string | null = null;
 			let liveUniverseCoverage = "NOT_CONFIGURED";
+			let liveUniverseState: string | null = null;
+			let liveUniverseAnchor: string | null = null;
+			let liveUniverseAnchorFallback: boolean | null = null;
 			if (env?.PORTFOLIO_UNIVERSE) {
-				const liveUniverse = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
-				if (liveUniverse) {
-					assertLiveUniverseFresh(liveUniverse);
-					const coverage = getLiveUniverseCoverage(snapshot, liveUniverse);
-					liveUniverseHash = liveUniverse.content_hash;
-					liveUniverseCoverage = coverage.status;
-					if (coverage.status !== "COMPLETE") {
-						throw new BridgeError(
-							"live_universe_coverage",
-							`upstream quote catalog is missing LIVE positions: ${coverage.missing_active.join(", ")}`,
-						);
+				// C-4：新鲜度锚已迁到状态件 LRCCA（缺失/不可读时回退 generated_at）。
+				// C-5 / J-11：PORTFOLIO_UNKNOWN 不应用 LIVE overlay——回退静态目录，
+				// 不把旧投影当「当前持仓」用，也不报错（由 control_plane_status 标记）。
+				const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date());
+				liveUniverseState = live.presentation.portfolio_state;
+				liveUniverseAnchor = live.presentation.freshness_anchor;
+				liveUniverseAnchorFallback = live.presentation.freshness_anchor_fallback;
+				if (live.universe) {
+					liveUniverseHash = live.universe.content_hash;
+					if (live.presentation.apply_overlay) {
+						const coverage = getLiveUniverseCoverage(snapshot, live.universe);
+						liveUniverseCoverage = coverage.status;
+						if (coverage.status !== "COMPLETE") {
+							throw new BridgeError(
+								"live_universe_coverage",
+								`upstream quote catalog is missing LIVE positions: ${coverage.missing_active.join(", ")}`,
+							);
+						}
+						projectedSnapshot = applyLiveUniverse(snapshot, live.universe);
+					} else {
+						liveUniverseCoverage = "SKIPPED_PORTFOLIO_NOT_CONFIRMED";
 					}
-					projectedSnapshot = applyLiveUniverse(snapshot, liveUniverse);
 				}
 			}
 			const counts = getSnapshotCounts(projectedSnapshot);
@@ -237,6 +335,9 @@ async function fetchUpstreamSnapshot(
 				portfolio_version: projectedSnapshot.portfolio_version,
 				live_universe_hash: liveUniverseHash,
 				live_universe_coverage: liveUniverseCoverage,
+				live_universe_state: liveUniverseState,
+				live_universe_anchor: liveUniverseAnchor,
+				live_universe_anchor_fallback: liveUniverseAnchorFallback,
 				exited_watch_count: counts.exitedWatchTotal,
 				mapping_count: counts.mappingTotal,
 				core_count: counts.coreTotal,
@@ -457,6 +558,10 @@ function createServer(env?: Env) {
 						kv_bound: false,
 						universe_present: false,
 						universe_fresh: false,
+						portfolio_state: "PORTFOLIO_UNKNOWN",
+						stale: true,
+						freshness_anchor: null,
+						freshness_anchor_fallback: false,
 						mode: "LEGACY_FALLBACK",
 					};
 				return {
@@ -580,20 +685,12 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 }
 
 async function getControlPlaneStatus(env: Env) {
-	let universePresent = false;
-	let universeFresh = false;
-	if (env.PORTFOLIO_UNIVERSE) {
-		try {
-			const universe = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
-			universePresent = universe !== null;
-			if (universe) {
-				assertLiveUniverseFresh(universe);
-				universeFresh = true;
-			}
-		} catch {
-			universeFresh = false;
-		}
-	}
+	const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date(), {
+		tolerateUnreadableUniverse: true,
+	});
+	const universePresent = live.universe !== null;
+	// 双轨锚：LRCCA 优先，缺失时回退 generated_at（C-4），口径仍是既有 10 天可用窗口。
+	const universeFresh = live.presentation.fresh;
 	return {
 		status: universePresent && universeFresh ? "OK" : "PENDING",
 		ingest_mode: "GITHUB_VERIFIED_PUSH",
@@ -601,6 +698,11 @@ async function getControlPlaneStatus(env: Env) {
 		kv_bound: Boolean(env.PORTFOLIO_UNIVERSE),
 		universe_present: universePresent,
 		universe_fresh: universeFresh,
+		// C-3：只出三态枚举词（无代码 / 数量 / hash）；无件 / 损坏 / 交叉不一致按保守态呈现。
+		portfolio_state: live.presentation.portfolio_state,
+		stale: live.presentation.stale,
+		freshness_anchor: live.presentation.freshness_anchor,
+		freshness_anchor_fallback: live.presentation.freshness_anchor_fallback,
 		mode: universePresent ? "LIVE_DYNAMIC" : "LEGACY_FALLBACK",
 	};
 }
@@ -659,6 +761,56 @@ async function handleGithubAuthUniverse(request: Request, env: Env): Promise<Res
 	}
 }
 
+/**
+ * C-1：`POST /api/github-auth/portfolio-status` —— 接收 LIVE 侧状态件。
+ *
+ * 失败语义与 `/api/github-auth/quote-universe` 完全同款（401 / 413 / 400），
+ * 写入前全量校验，非法件拒写且旧件保留（LKG 语义，见 writePortfolioStatus）。
+ * 写入内容为状态件原样（LIVE 是三态的权威计算方，J-4）；Worker 的保守复核
+ * 发生在**读取**侧（resolveLivePresentation），不回写 KV。
+ */
+async function handleGithubAuthPortfolioStatus(request: Request, env: Env): Promise<Response> {
+	if (request.method !== "POST") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
+	try {
+		await verifyGithubAccessToken(githubBearerToken(request));
+	} catch (error) {
+		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: safeErrorMessage(error) }, 401);
+	}
+	let raw: string;
+	try {
+		raw = await request.text();
+	} catch {
+		return jsonResponse({ error: "BODY_READ_FAILED" }, 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > PORTFOLIO_STATUS_MAX_PAYLOAD_BYTES) {
+		return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	}
+	let payload: unknown;
+	try {
+		payload = JSON.parse(raw);
+	} catch {
+		return jsonResponse({ error: "INVALID_JSON" }, 400);
+	}
+	try {
+		const stored = await writePortfolioStatus(env.PORTFOLIO_UNIVERSE, payload);
+		return jsonResponse({
+			status: "SUCCESS",
+			schema_version: stored.schema_version,
+			state: stored.state,
+			generated_at: stored.generated_at,
+			last_real_complete_confirmed_at: stored.last_real_complete_confirmed_at,
+			universe_content_hash: stored.universe_content_hash,
+			source_manifest_hash: stored.source_manifest_hash,
+			received_at: stored.received_at,
+		});
+	} catch (error) {
+		return jsonResponse({ error: "INVALID_PORTFOLIO_STATUS", message: safeErrorMessage(error) }, 400);
+	}
+}
+
 async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise<Response> {
 	if (!isUniverseAuthorized(request, env)) {
 		return jsonResponse({ error: "UNAUTHORIZED" }, 401);
@@ -668,9 +820,21 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 	}
 	const context = bridgeContext("http:dynamic-portfolio-quotes");
 	try {
-		const liveUniverse = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
-		if (!liveUniverse) return jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 503);
-		assertLiveUniverseFresh(liveUniverse);
+		// C-4/C-5：本端点是「LIVE 动态投影」诊断面，状态未知时不静默返回静态目录。
+		const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date());
+		if (!live.universe) return jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 503);
+		if (!live.presentation.fresh) {
+			return jsonResponse(
+				{ error: "LIVE_UNIVERSE_STALE", portfolio_state: live.presentation.portfolio_state },
+				503,
+			);
+		}
+		if (!live.presentation.apply_overlay) {
+			return jsonResponse(
+				{ error: "PORTFOLIO_UNKNOWN", portfolio_state: live.presentation.portfolio_state },
+				503,
+			);
+		}
 		const upstream = await fetchUpstreamSnapshot(
 			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 			context,
@@ -688,6 +852,9 @@ export default {
 		const url = new URL(request.url);
 		if (url.pathname === "/api/github-auth/probe") return handleGithubAuthProbe(request);
 		if (url.pathname === "/api/github-auth/quote-universe") return handleGithubAuthUniverse(request, env);
+		if (url.pathname === "/api/github-auth/portfolio-status") {
+			return handleGithubAuthPortfolioStatus(request, env);
+		}
 		if (url.pathname === "/api/control-plane-status" && request.method === "GET") {
 			return handleControlPlaneStatus(env);
 		}

@@ -3,6 +3,8 @@ import type { QuoteSnapshot, QuoteStock } from "./portfolio-validation";
 export const LIVE_UNIVERSE_SCHEMA = "quote-universe/1" as const;
 export const LIVE_UNIVERSE_KV_KEY = "live-portfolio/current";
 export const DEFAULT_LIVE_UNIVERSE_MAX_AGE_SECONDS = 10 * 24 * 60 * 60;
+/** 超过该秒数的「未来」时间戳不可信（时钟漂移容忍），fail-closed。 */
+export const LIVE_UNIVERSE_FUTURE_TOLERANCE_SECONDS = 300;
 
 export type LiveUniverseItem = {
 	market: "CN" | "HK";
@@ -170,10 +172,57 @@ export function assertLiveUniverseFresh(
 	const generatedAt = Date.parse(universe.generated_at);
 	if (!Number.isFinite(generatedAt)) throw new Error("quote universe generated_at is not a valid timestamp");
 	const ageSeconds = (now.getTime() - generatedAt) / 1000;
-	if (ageSeconds < -300) throw new Error(`quote universe generated_at is ${Math.round(-ageSeconds)}s in the future`);
+	if (ageSeconds < -LIVE_UNIVERSE_FUTURE_TOLERANCE_SECONDS) throw new Error(`quote universe generated_at is ${Math.round(-ageSeconds)}s in the future`);
 	if (ageSeconds > maxAgeSeconds) {
 		throw new Error(`quote universe is stale: age=${Math.round(ageSeconds)}s max=${maxAgeSeconds}s`);
 	}
+}
+
+export type LiveUniverseFreshnessAnchor = "LRCCA" | "GENERATED_AT";
+
+export type LiveUniverseFreshnessResolution = {
+	anchor: LiveUniverseFreshnessAnchor;
+	/** true = LRCCA 不可用，锚回退到 `generated_at`（C-4 过渡期双轨）。 */
+	anchor_fallback: boolean;
+	anchor_timestamp: string;
+	/** null = 锚时间戳不可解析。 */
+	anchor_age_seconds: number | null;
+	fresh: boolean;
+};
+
+/**
+ * 新鲜度锚解析（规格 §5.5 C-4，双轨）：
+ *
+ * - 状态件提供非空 LRCCA 时，10 天窗口锚在 LRCCA（= 最近一次真实完整确认）上；
+ * - 状态件缺失 / 不可读 / LRCCA 为空时回退到 universe `generated_at`，
+ *   并置 `anchor_fallback = true` 留痕——保证两批改动可按任意顺序上线。
+ *
+ * `fresh` 仅表达「锚在 LKG 可用窗口内」，供 `control_plane_status` 的
+ * `universe_fresh` / `status` 面沿用既有 10 天口径；是否应用 LIVE overlay
+ * 由三态决定（见 `portfolio-status.resolvePortfolioPresentation`）。
+ */
+export function resolveLiveUniverseFreshness(
+	universe: StoredLiveUniverse,
+	options: { lrcca?: string | null; now?: Date; maxAgeSeconds?: number } = {},
+): LiveUniverseFreshnessResolution {
+	const now = options.now ?? new Date();
+	const maxAgeSeconds = options.maxAgeSeconds ?? DEFAULT_LIVE_UNIVERSE_MAX_AGE_SECONDS;
+	const lrcca = options.lrcca ?? null;
+	const anchor: LiveUniverseFreshnessAnchor = lrcca ? "LRCCA" : "GENERATED_AT";
+	const anchorTimestamp = lrcca ?? universe.generated_at;
+	const parsed = Date.parse(anchorTimestamp);
+	const ageSeconds = Number.isFinite(parsed) ? (now.getTime() - parsed) / 1000 : null;
+	const fresh =
+		ageSeconds !== null &&
+		ageSeconds >= -LIVE_UNIVERSE_FUTURE_TOLERANCE_SECONDS &&
+		ageSeconds <= maxAgeSeconds;
+	return {
+		anchor,
+		anchor_fallback: anchor === "GENERATED_AT",
+		anchor_timestamp: anchorTimestamp,
+		anchor_age_seconds: ageSeconds === null ? null : Math.round(ageSeconds),
+		fresh,
+	};
 }
 
 export function getLiveUniverseCoverage(
