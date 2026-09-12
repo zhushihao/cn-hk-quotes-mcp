@@ -26,6 +26,7 @@ import {
 	type StoredPortfolioStatus,
 } from "./portfolio-status";
 import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
+import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
 
 const PORTFOLIO_QUOTES_URL =
 	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
@@ -408,6 +409,16 @@ async function fetchUpstreamSnapshot(
 	throw lastError ?? new BridgeError("upstream_fetch", "no upstream source configured");
 }
 
+async function fetchPublicQuoteSnapshot(context: BridgeStageContext): Promise<PublicQuoteSnapshot> {
+	const upstream = await fetchUpstreamSnapshot(
+		[PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+		context,
+	);
+	return toPublicQuoteSnapshot(upstream.snapshot);
+}
+
+const PUBLIC_QUOTES_UNAVAILABLE_MESSAGE = "Public quote snapshot is unavailable";
+
 export async function updateQuoteBridge(
 	env: Env,
 	workflowRunId: string,
@@ -643,6 +654,38 @@ function createServer(
 									error: "UPSTREAM_FETCH_ERROR",
 									message: clientFacingErrorMessage(error),
 								},
+								null,
+								2,
+							),
+						},
+					],
+				};
+			}
+		},
+	);
+
+	server.registerTool(
+		"get_public_quotes",
+		{
+			description: "获取不含持仓身份的 A/H 公开行情快照。仅返回行情、时间和质量字段。",
+			inputSchema: z.object({}),
+		},
+		async () => {
+			const context = bridgeContext("mcp:get_public_quotes");
+			try {
+				const snapshot = await fetchPublicQuoteSnapshot(context);
+				return {
+					content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
+				};
+			} catch (error) {
+				logBridgeFailure(context, error, "public_quotes");
+				return {
+					isError: true,
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								{ error: "UPSTREAM_UNAVAILABLE", message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE },
 								null,
 								2,
 							),
@@ -922,6 +965,20 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 	}
 }
 
+async function handlePublicQuotes(request: Request): Promise<Response> {
+	if (request.method !== "GET") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+	const context = bridgeContext("http:public-quotes");
+	try {
+		return jsonResponse(await fetchPublicQuoteSnapshot(context));
+	} catch (error) {
+		logBridgeFailure(context, error, "public_quotes");
+		return jsonResponse(
+			{ error: "UPSTREAM_UNAVAILABLE", message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE },
+			502,
+		);
+	}
+}
+
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
@@ -934,6 +991,7 @@ export default {
 			return handleControlPlaneStatus(env);
 		}
 		if (url.pathname === "/api/quote-universe") return handleUniverseApi(request, env);
+		if (url.pathname === "/api/public/quotes") return handlePublicQuotes(request);
 		if (url.pathname === "/api/portfolio-quotes") return handleDynamicPortfolioQuotes(request, env);
 		// MCP 面（含 `get_portfolio_quotes`）：按**本请求**的 Authorization 头判定 LIVE 叠加门
 		// （D-1 选项 A）。工厂按请求构造 server，故 `ctx.requestInfo` 就是当前请求。
