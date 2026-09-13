@@ -35,6 +35,7 @@ import {
 import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
 import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
 import { ingestResearchReplicaRecord, type ResearchReplicaStorage } from "./research-replica.ts";
+import { CollectorResearchRemoteAdapter } from "./research-remote-adapter.ts";
 import { ResearchBoundaryError } from "./research-outbound-v2.ts";
 
 const PORTFOLIO_QUOTES_URL =
@@ -760,6 +761,47 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 			],
 		}),
 	);
+
+	// C7: these tools deliberately use only the Collector-owned C5 replica.
+	// They do not share market/LIVE authorization, and the default research
+	// scope is PUBLIC.  PRIVATE remains unavailable until a separate future
+	// research-read scope is wired; it never falls through from this surface.
+	const researchAdapter = () => {
+		const storage = env ? researchReplicaStorage(env) : null;
+		if (!storage) throw new ResearchBoundaryError("STORE_UNAVAILABLE");
+		return new CollectorResearchRemoteAdapter(storage, { visibility: "PUBLIC" });
+	};
+	const researchRead = async (operation: () => Promise<unknown>) => {
+		try {
+			return { content: [{ type: "text" as const, text: JSON.stringify(await operation(), null, 2) }] };
+		} catch (error) {
+			const safe =
+				error instanceof ResearchBoundaryError
+					? error.asError()
+					: new ResearchBoundaryError("STORE_UNAVAILABLE").asError();
+			return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
+		}
+	};
+	const unsupportedResearchRead = () => ({
+		isError: true,
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify({ status: "UNSUPPORTED", ...new ResearchBoundaryError("UNSUPPORTED_OPERATION").asError() }, null, 2),
+			},
+		],
+	});
+
+	server.registerTool("search_documents", { description: "在 Collector 的 PUBLIC Research replica 中搜索文档元数据。", inputSchema: z.object({ query: z.string().optional(), limit: z.number().int().min(1).max(100).optional() }) }, async ({ query, limit }) => researchRead(() => researchAdapter().searchDocuments(query, limit)));
+	server.registerTool("get_document", { description: "读取 Collector replica 中经 SHA-256 校验的 PUBLIC 文档正文。", inputSchema: z.object({ document_id: z.string().min(1) }) }, async ({ document_id }) => researchRead(() => researchAdapter().getDocument(document_id)));
+	server.registerTool("search_evidence", { description: "列出 Collector replica 中的 PUBLIC Evidence。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().searchEvidence(limit)));
+	server.registerTool("get_evidence", { description: "读取 Collector replica 中指定的 PUBLIC Evidence。", inputSchema: z.object({ evidence_id: z.string().min(1) }) }, async ({ evidence_id }) => researchRead(() => researchAdapter().getEvidence(evidence_id)));
+	server.registerTool("get_theme_accumulator", { description: "读取指定主题的 PUBLIC Evidence Accumulator。", inputSchema: z.object({ subject_key: z.string().min(1) }) }, async ({ subject_key }) => researchRead(() => researchAdapter().getThemeAccumulator(subject_key)));
+	server.registerTool("get_company_evidence_state", { description: "读取指定公司的 PUBLIC Evidence Accumulator 状态。", inputSchema: z.object({ company: z.string().min(1) }) }, async ({ company }) => researchRead(() => researchAdapter().getCompanyEvidenceState(company)));
+	server.registerTool("get_coverage_status", { description: "读取 Collector replica 中的 PUBLIC Research Coverage。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().getCoverageStatus(limit)));
+	server.registerTool("get_source_health", { description: "读取 Research source health；当前 replica 未复制该能力时明确返回 UNSUPPORTED。", inputSchema: z.object({}) }, async () => unsupportedResearchRead());
+	server.registerTool("list_research_jobs", { description: "列出 Collector replica 中的 PUBLIC QUEUED Research Job。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().listResearchJobs(limit)));
+	server.registerTool("get_research_job_context", { description: "读取 Collector replica 中指定 PUBLIC QUEUED Research Job 的上下文。", inputSchema: z.object({ job_id: z.string().min(1) }) }, async ({ job_id }) => researchRead(() => researchAdapter().getResearchJobContext(job_id)));
 
 	return server;
 }
