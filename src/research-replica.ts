@@ -23,6 +23,12 @@ export type ReplicaIngestResult = {
 	content_sha256: string | null;
 };
 
+// 8 GiB stores as at most 9 decimal GB after provider rounding, below R2's
+// 10 GB monthly included storage.  100k writes is a tenfold safety margin
+// below its 1m included Class A operations.
+export const RESEARCH_REPLICA_MAX_STORED_BYTES = 8 * 1024 * 1024 * 1024;
+export const RESEARCH_REPLICA_MAX_MONTHLY_R2_WRITES = 100_000;
+
 type ReplicaHealthRow = {
 	last_attempt_at: string | null;
 	last_success_at: string | null;
@@ -32,7 +38,7 @@ type ReplicaHealthRow = {
 };
 
 function safeFailure(
-	code: "INTEGRITY_FAILED" | "STORE_UNAVAILABLE" | "UNSUPPORTED_OPERATION",
+	code: "INTEGRITY_FAILED" | "STORE_UNAVAILABLE" | "UNSUPPORTED_OPERATION" | "RATE_LIMITED",
 ): never {
 	throw new ResearchBoundaryError(code);
 }
@@ -52,6 +58,54 @@ function canonicalJson(value: unknown): string {
 async function sha256Hex(value: string): Promise<string> {
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
 	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function usagePeriod(now: string): string {
+	if (!/^\d{4}-\d{2}-\d{2}T/.test(now)) safeFailure("INTEGRITY_FAILED");
+	return now.slice(0, 7);
+}
+
+async function reserveR2Quota(
+	storage: ResearchReplicaStorage,
+	bytes: number,
+	writes: number,
+	now: string,
+): Promise<void> {
+	const period = usagePeriod(now);
+	await storage.db
+		.prepare(
+			"INSERT OR IGNORE INTO research_replica_usage (name, usage_period) VALUES ('primary', ?)",
+		)
+		.bind(period)
+		.run();
+	await storage.db
+		.prepare(
+			"UPDATE research_replica_usage SET usage_period=?, r2_write_ops=0 WHERE name='primary' AND usage_period<>?",
+		)
+		.bind(period, period)
+		.run();
+	const result = await storage.db
+		.prepare(
+			"UPDATE research_replica_usage SET stored_bytes=stored_bytes+?, r2_write_ops=r2_write_ops+? WHERE name='primary' AND stored_bytes+?<=? AND r2_write_ops+?<=?",
+		)
+		.bind(
+			bytes,
+			writes,
+			bytes,
+			RESEARCH_REPLICA_MAX_STORED_BYTES,
+			writes,
+			RESEARCH_REPLICA_MAX_MONTHLY_R2_WRITES,
+		)
+		.run();
+	if (Number(result.meta.changes ?? 0) !== 1) safeFailure("RATE_LIMITED");
+}
+
+async function isReplay(storage: ResearchReplicaStorage, messageId: string): Promise<boolean> {
+	const row = await storage.db
+		.prepare("SELECT message_id FROM research_ingest_messages WHERE message_id=?")
+		.bind(messageId)
+		.first<{ message_id: string }>();
+	return Boolean(row);
 }
 
 function objectKey(contentSha256: string): string {
@@ -91,6 +145,8 @@ export async function ingestResearchReplicaRecord(
 	now = new Date().toISOString(),
 ): Promise<ReplicaIngestResult> {
 	let record: OutboundV2Record;
+	const chunks =
+		objectChunks === null ? null : [...objectChunks].map((chunk) => new Uint8Array(chunk));
 	try {
 		const rawRecordType =
 			rawRecord && typeof rawRecord === "object"
@@ -98,36 +154,53 @@ export async function ingestResearchReplicaRecord(
 				: undefined;
 		record =
 			rawRecordType === "object"
-				? await verifyOutboundV2ObjectChunks(rawRecord, objectChunks ?? [])
+				? await verifyOutboundV2ObjectChunks(rawRecord, chunks ?? [])
 				: await verifyOutboundV2Record(rawRecord);
 	} catch (error) {
 		if (error instanceof ResearchBoundaryError) throw error;
 		safeFailure("INTEGRITY_FAILED");
 	}
 
-	if (record.record_type !== "object" && objectChunks !== null)
-		safeFailure("UNSUPPORTED_OPERATION");
+	if (record.record_type !== "object" && chunks !== null) safeFailure("UNSUPPORTED_OPERATION");
 	const key = outboundV2RecordKey(record);
 	const payloadJson = canonicalJson(record.payload);
 	const payloadSha256 = await sha256Hex(payloadJson);
 	const contentSha256 = objectContentHash(record);
+	const journal = canonicalJson(record);
+	const journalBytes = new TextEncoder().encode(journal).byteLength;
+	let objectBody: Uint8Array | null = null;
+	if (contentSha256) {
+		const size = chunks?.reduce((total, chunk) => total + chunk.byteLength, 0) ?? 0;
+		objectBody = new Uint8Array(size);
+		let offset = 0;
+		for (const chunk of chunks ?? []) {
+			objectBody.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+	}
 
 	try {
+		if (await isReplay(storage, record.message_id)) {
+			return {
+				status: "REPLAY",
+				message_id: record.message_id,
+				record_type: record.record_type,
+				content_sha256: contentSha256,
+			};
+		}
+		await reserveR2Quota(
+			storage,
+			journalBytes + (objectBody?.byteLength ?? 0),
+			contentSha256 ? 2 : 1,
+			now,
+		);
 		// The journal is the recovery source for metadata.  It contains the
 		// validated, path-free outbound envelope and is idempotent by message id.
-		await storage.objects.put(journalKey(record.message_id), canonicalJson(record), {
+		await storage.objects.put(journalKey(record.message_id), journal, {
 			httpMetadata: { contentType: "application/json; charset=utf-8" },
 		});
-		if (contentSha256) {
-			const chunks = [...(objectChunks ?? [])];
-			const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-			const body = new Uint8Array(size);
-			let offset = 0;
-			for (const chunk of chunks) {
-				body.set(chunk, offset);
-				offset += chunk.byteLength;
-			}
-			await storage.objects.put(objectKey(contentSha256), body, {
+		if (contentSha256 && objectBody) {
+			await storage.objects.put(objectKey(contentSha256), objectBody, {
 				httpMetadata: { contentType: String(record.payload.media_type) },
 				customMetadata: { content_sha256: contentSha256, visibility: record.visibility },
 			});

@@ -41,6 +41,7 @@ class FakeD1 {
 		last_error_code: null,
 		accepted_messages: 0,
 	};
+	usage = { usage_period: "1970-01", stored_bytes: 0, r2_write_ops: 0 };
 
 	prepare(sql) {
 		const db = this;
@@ -51,6 +52,24 @@ class FakeD1 {
 				return this;
 			},
 			async run() {
+				if (sql.includes("SET stored_bytes=stored_bytes+")) {
+					const [bytes, writes, , maxBytes, , maxWrites] = this.params;
+					if (
+						db.usage.stored_bytes + bytes > maxBytes ||
+						db.usage.r2_write_ops + writes > maxWrites
+					) {
+						return { meta: { changes: 0 } };
+					}
+					db.usage.stored_bytes += bytes;
+					db.usage.r2_write_ops += writes;
+				}
+				if (sql.includes("SET usage_period=?")) {
+					const [period] = this.params;
+					if (db.usage.usage_period !== period) {
+						db.usage.usage_period = period;
+						db.usage.r2_write_ops = 0;
+					}
+				}
 				if (sql.includes("accepted_messages")) {
 					db.health.last_attempt_at = this.params[0];
 					db.health.last_success_at = this.params[1];
@@ -60,6 +79,9 @@ class FakeD1 {
 				return { meta: { changes: 1 } };
 			},
 			async first() {
+				if (sql.includes("FROM research_ingest_messages")) {
+					return db.messages.has(this.params[0]) ? { message_id: this.params[0] } : null;
+				}
 				return db.health;
 			},
 		};
@@ -172,6 +194,18 @@ test("C5 fails closed before storage on corrupted body or forbidden metadata", a
 		() => replica.ingestResearchReplicaRecord(store, source),
 		(error) => error?.error_code === "INTEGRITY_FAILED",
 	);
+});
+
+test("C5 hard quota rejects a new record before it writes any R2 object", async () => {
+	const store = storage();
+	store.db.usage.stored_bytes = replica.RESEARCH_REPLICA_MAX_STORED_BYTES;
+	const source = (await fixture("metadata_source.public.json"))[0];
+	await assert.rejects(
+		() => replica.ingestResearchReplicaRecord(store, source),
+		(error) => error?.error_code === "RATE_LIMITED",
+	);
+	assert.equal(store.objects.objects.size, 0);
+	assert.equal(store.db.batches.length, 0);
 });
 
 test("C5 exposes health for observation and makes its recovery path the same idempotent ingest", async () => {
