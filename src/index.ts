@@ -8,6 +8,7 @@ import {
 	writeLiveUniverse,
 	type StoredLiveUniverse,
 } from "./live-universe";
+import { recordPortfolioUniverseObservation, type PortfolioDeltaState } from "./portfolio-delta";
 import {
 	LiveCoverageError,
 	isLiveOverlayEnabled,
@@ -16,6 +17,12 @@ import {
 	resolveLiveOverlayStatus,
 	type LiveOverlayStatus,
 } from "./live-overlay";
+import {
+	DynamicQuoteError,
+	createTencentQuoteProvider,
+	fetchDynamicQuoteRows,
+	mergeDynamicQuoteRows,
+} from "./dynamic-quotes";
 import {
 	PORTFOLIO_STATUS_MAX_PAYLOAD_BYTES,
 	readPortfolioStatus,
@@ -267,6 +274,34 @@ async function resolveLivePresentation(
 }
 
 /**
+ * C1 dynamic quote completion is deliberately before the existing coverage
+ * gate.  The gate remains the final authority: a provider error, malformed
+ * code, or partial batch never contributes rows and therefore never turns an
+ * incomplete LIVE universe into a successful response.
+ */
+async function completeMissingLiveQuotes(
+	snapshot: QuoteSnapshot,
+	universe: StoredLiveUniverse,
+): Promise<QuoteSnapshot> {
+	const catalogKeys = new Set(snapshot.stocks.map((row) => `${row.market}:${row.code}`));
+	const missing = universe.active.filter(
+		(identity) => !catalogKeys.has(`${identity.market}:${identity.code}`),
+	);
+	if (missing.length === 0) return snapshot;
+	try {
+		const batch = await fetchDynamicQuoteRows(missing, {
+			fetchQuote: createTencentQuoteProvider(),
+		});
+		return mergeDynamicQuoteRows(snapshot, batch);
+	} catch (error) {
+		if (error instanceof DynamicQuoteError) {
+			throw new BridgeError("dynamic_quote_fetch", error.code);
+		}
+		throw error;
+	}
+}
+
+/**
  * `fetchUpstreamSnapshot()` 的 LIVE 叠加门（D-1 选项 A）。
  *
  * 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：只有显式传入 `ENABLED`
@@ -344,8 +379,12 @@ async function fetchUpstreamSnapshot(
 				liveUniverseAnchor = live?.presentation.freshness_anchor ?? null;
 				liveUniverseAnchorFallback = live?.presentation.freshness_anchor_fallback ?? null;
 				liveUniverseHash = live?.universe?.content_hash ?? null;
+				const snapshotForOverlay =
+					live?.universe && live.presentation.apply_overlay
+						? await completeMissingLiveQuotes(snapshot, live.universe)
+						: snapshot;
 				const projected = projectCallerSnapshot({
-					snapshot,
+					snapshot: snapshotForOverlay,
 					liveOverlayStatus,
 					universeBound: true,
 					universe: live?.universe ?? null,
@@ -410,10 +449,7 @@ async function fetchUpstreamSnapshot(
 }
 
 async function fetchPublicQuoteSnapshot(context: BridgeStageContext): Promise<PublicQuoteSnapshot> {
-	const upstream = await fetchUpstreamSnapshot(
-		[PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
-		context,
-	);
+	const upstream = await fetchUpstreamSnapshot([PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL], context);
 	return toPublicQuoteSnapshot(upstream.snapshot);
 }
 
@@ -540,12 +576,9 @@ export async function updateQuoteBridge(
  * `liveOverlayStatus` 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：
  * 只有 `fetch()` 路由把请求头判定结果显式传进来时才可能应用 LIVE 叠加。
  */
-function createServer(
-	env?: Env,
-	liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED",
-) {
+function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED") {
 	const server = new McpServer({
-		name: "A股港股行情",
+		name: "QuantPro Collector",
 		version: "1.1.0",
 	});
 
@@ -614,22 +647,22 @@ function createServer(
 				);
 				const controlPlaneStatus = env
 					? {
-						...(await getControlPlaneStatus(env)),
-						live_overlay_status: liveOverlayStatus,
-					}
+							...(await getControlPlaneStatus(env)),
+							live_overlay_status: liveOverlayStatus,
+						}
 					: {
-						status: "DEGRADED",
-						github_private_read: false,
-						kv_bound: false,
-						universe_present: false,
-						universe_fresh: false,
-						portfolio_state: "PORTFOLIO_UNKNOWN",
-						stale: true,
-						freshness_anchor: null,
-						freshness_anchor_fallback: false,
-						mode: "LEGACY_FALLBACK",
-						live_overlay_status: liveOverlayStatus,
-					};
+							status: "DEGRADED",
+							github_private_read: false,
+							kv_bound: false,
+							universe_present: false,
+							universe_fresh: false,
+							portfolio_state: "PORTFOLIO_UNKNOWN",
+							stale: true,
+							freshness_anchor: null,
+							freshness_anchor_fallback: false,
+							mode: "LEGACY_FALLBACK",
+							live_overlay_status: liveOverlayStatus,
+						};
 				return {
 					content: [
 						{
@@ -685,7 +718,10 @@ function createServer(
 						{
 							type: "text",
 							text: JSON.stringify(
-								{ error: "UPSTREAM_UNAVAILABLE", message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE },
+								{
+									error: "UPSTREAM_UNAVAILABLE",
+									message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE,
+								},
 								null,
 								2,
 							),
@@ -760,9 +796,14 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 	if (request.method === "GET") {
 		try {
 			const universe = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
-			return universe ? jsonResponse(universe) : jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 404);
+			return universe
+				? jsonResponse(universe)
+				: jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 404);
 		} catch (error) {
-			return jsonResponse({ error: "LIVE_UNIVERSE_READ_FAILED", message: clientFacingErrorMessage(error) }, 500);
+			return jsonResponse(
+				{ error: "LIVE_UNIVERSE_READ_FAILED", message: clientFacingErrorMessage(error) },
+				500,
+			);
 		}
 	}
 	if (request.method !== "POST") {
@@ -796,7 +837,10 @@ async function handleUniverseApi(request: Request, env: Env): Promise<Response> 
 			active_count: stored.active.length,
 		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) }, 400);
+		return jsonResponse(
+			{ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) },
+			400,
+		);
 	}
 }
 
@@ -834,7 +878,10 @@ async function handleGithubAuthProbe(request: Request): Promise<Response> {
 		await verifyGithubAccessToken(githubBearerToken(request));
 		return jsonResponse({ status: "OK", identity: "GITHUB_VERIFIED" });
 	} catch (error) {
-		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401);
+		return jsonResponse(
+			{ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) },
+			401,
+		);
 	}
 }
 
@@ -846,7 +893,10 @@ async function handleGithubAuthUniverse(request: Request, env: Env): Promise<Res
 	try {
 		await verifyGithubAccessToken(githubBearerToken(request));
 	} catch (error) {
-		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401);
+		return jsonResponse(
+			{ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) },
+			401,
+		);
 	}
 	let raw: string;
 	try {
@@ -873,7 +923,10 @@ async function handleGithubAuthUniverse(request: Request, env: Env): Promise<Res
 			active_count: stored.active.length,
 		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) }, 400);
+		return jsonResponse(
+			{ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) },
+			400,
+		);
 	}
 }
 
@@ -893,7 +946,10 @@ async function handleGithubAuthPortfolioStatus(request: Request, env: Env): Prom
 	try {
 		await verifyGithubAccessToken(githubBearerToken(request));
 	} catch (error) {
-		return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401);
+		return jsonResponse(
+			{ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) },
+			401,
+		);
 	}
 	let raw: string;
 	try {
@@ -912,6 +968,20 @@ async function handleGithubAuthPortfolioStatus(request: Request, env: Env): Prom
 	}
 	try {
 		const stored = await writePortfolioStatus(env.PORTFOLIO_UNIVERSE, payload);
+		try {
+			await recordPortfolioDeltaAfterStatusWrite(env.PORTFOLIO_UNIVERSE, stored);
+		} catch (error) {
+			// The authenticated status document is already LKG-valid.  Report the
+			// private reducer failure explicitly so LIVE retries instead of treating
+			// the batch as a fully accepted C3 observation.
+			return jsonResponse(
+				{
+					error: "PORTFOLIO_DELTA_UPDATE_FAILED",
+					message: clientFacingErrorMessage(error),
+				},
+				503,
+			);
+		}
 		return jsonResponse({
 			status: "SUCCESS",
 			schema_version: stored.schema_version,
@@ -923,8 +993,57 @@ async function handleGithubAuthPortfolioStatus(request: Request, env: Env): Prom
 			received_at: stored.received_at,
 		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_PORTFOLIO_STATUS", message: clientFacingErrorMessage(error) }, 400);
+		return jsonResponse(
+			{ error: "INVALID_PORTFOLIO_STATUS", message: clientFacingErrorMessage(error) },
+			400,
+		);
 	}
+}
+
+/**
+ * C3 only observes the authenticated LIVE status push.  A mismatch or an
+ * unreadable universe is deliberately downgraded to UNKNOWN for the reducer:
+ * it breaks continuity, never manufactures a removal event, and preserves
+ * the existing three-state/LRCCA presentation semantics.
+ */
+async function recordPortfolioDeltaAfterStatusWrite(
+	kv: KVNamespace,
+	status: StoredPortfolioStatus,
+): Promise<void> {
+	let universe: StoredLiveUniverse | null = null;
+	try {
+		universe = await readLiveUniverse(kv);
+	} catch {
+		// A corrupted private universe cannot participate in COMPLETE→COMPLETE.
+		universe = null;
+	}
+	let state: PortfolioDeltaState = "PORTFOLIO_UNKNOWN";
+	if (universe) {
+		const freshness = resolveLiveUniverseFreshness(universe, {
+			lrcca: status.last_real_complete_confirmed_at,
+			now: new Date(),
+		});
+		// C3 must consume the same conservative state that guards LIVE overlay.
+		// A stale LRCCA or hash drift may downgrade a self-declared COMPLETE
+		// status, and such a transition must never confirm a removal.
+		state = resolvePortfolioPresentation({
+			universePresent: true,
+			universeContentHash: universe.content_hash,
+			universeManifestHash: universe.source_manifest_hash,
+			status,
+			anchor: {
+				anchor: freshness.anchor,
+				anchor_fallback: freshness.anchor_fallback,
+				fresh: freshness.fresh,
+			},
+		}).portfolio_state;
+	}
+	await recordPortfolioUniverseObservation(kv, {
+		state,
+		current_complete_hash: status.universe_content_hash,
+		active_codes: universe?.active ?? [],
+		observed_at: status.generated_at,
+	});
 }
 
 async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise<Response> {
@@ -941,7 +1060,10 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 		if (!live.universe) return jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 503);
 		if (!live.presentation.fresh) {
 			return jsonResponse(
-				{ error: "LIVE_UNIVERSE_STALE", portfolio_state: live.presentation.portfolio_state },
+				{
+					error: "LIVE_UNIVERSE_STALE",
+					portfolio_state: live.presentation.portfolio_state,
+				},
 				503,
 			);
 		}
@@ -961,7 +1083,10 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 		return jsonResponse(upstream.snapshot);
 	} catch (error) {
 		logBridgeFailure(context, error, "dynamic_portfolio_quotes");
-		return jsonResponse({ error: "PORTFOLIO_QUOTES_UNAVAILABLE", message: clientFacingErrorMessage(error) }, 502);
+		return jsonResponse(
+			{ error: "PORTFOLIO_QUOTES_UNAVAILABLE", message: clientFacingErrorMessage(error) },
+			502,
+		);
 	}
 }
 
@@ -983,7 +1108,8 @@ export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
 		if (url.pathname === "/api/github-auth/probe") return handleGithubAuthProbe(request);
-		if (url.pathname === "/api/github-auth/quote-universe") return handleGithubAuthUniverse(request, env);
+		if (url.pathname === "/api/github-auth/quote-universe")
+			return handleGithubAuthUniverse(request, env);
 		if (url.pathname === "/api/github-auth/portfolio-status") {
 			return handleGithubAuthPortfolioStatus(request, env);
 		}
@@ -992,7 +1118,8 @@ export default {
 		}
 		if (url.pathname === "/api/quote-universe") return handleUniverseApi(request, env);
 		if (url.pathname === "/api/public/quotes") return handlePublicQuotes(request);
-		if (url.pathname === "/api/portfolio-quotes") return handleDynamicPortfolioQuotes(request, env);
+		if (url.pathname === "/api/portfolio-quotes")
+			return handleDynamicPortfolioQuotes(request, env);
 		// MCP 面（含 `get_portfolio_quotes`）：按**本请求**的 Authorization 头判定 LIVE 叠加门
 		// （D-1 选项 A）。工厂按请求构造 server，故 `ctx.requestInfo` 就是当前请求。
 		const handler = createMcpHandler((ctx) =>

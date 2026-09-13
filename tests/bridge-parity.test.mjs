@@ -1,0 +1,141 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import path from "node:path";
+import { registerHooks } from "node:module";
+
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		if (specifier.startsWith("./") && !path.extname(specifier)) {
+			try {
+				return nextResolve(`${specifier}.ts`, context);
+			} catch {
+				// Let Node resolve non-TypeScript imports normally.
+			}
+		}
+		return nextResolve(specifier, context);
+	},
+});
+
+const { updateQuoteBridge } = await import("../src/index.ts");
+const { runManualQuoteBridge } = await import("../scripts/manual-quote-bridge.mjs");
+
+function dynamicSnapshot() {
+	const row = {
+		code: "002409",
+		market: "CN",
+		exchange: "SZ",
+		name: "Dynamic security",
+		group: "Watch",
+		portfolio_group: "watch",
+		portfolio_status: "WATCH",
+		holding_status: "ACTIVE",
+		mapping_only: false,
+		mapped_to: null,
+		mapping_to: null,
+		position_qty: null,
+		is_position: true,
+		price: 10,
+		change: 1,
+		change_pct: 10,
+		pre_close: 9,
+		prev_close: 9,
+		open: 9.5,
+		high: 10.5,
+		low: 9,
+		pct_change: 10,
+		volume: 100,
+		amount: 1000,
+		market_status: "CLOSED",
+		market_data_time: "2026-09-13T15:00:00+08:00",
+		source_update_time: "2026-09-13T15:01:00+08:00",
+		freshness_basis: "MARKET_DATA",
+		quote_time: "2026-09-13T15:00:00+08:00",
+		fetch_time: "2026-09-13T15:01:00+08:00",
+		age_seconds: 60,
+		primary_source: "synthetic",
+		secondary_source: null,
+		source_status: "OK",
+		quality: "SYNTHETIC",
+	};
+	const {
+		price,
+		change,
+		change_pct,
+		pre_close,
+		prev_close,
+		open,
+		high,
+		low,
+		pct_change,
+		volume,
+		amount,
+		market_status,
+		market_data_time,
+		source_update_time,
+		freshness_basis,
+		quote_time,
+		fetch_time,
+		age_seconds,
+		primary_source,
+		secondary_source,
+		source_status,
+		quality,
+		...identity
+	} = row;
+	return {
+		portfolio_version: "live:dynamic-002409",
+		snapshot_time: "2026-09-13T15:01:00+08:00",
+		system_quality: "GOOD",
+		summary: { total: 1 },
+		portfolio_universe: [identity],
+		stocks: [row],
+	};
+}
+
+function response(body, status = 200) {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
+test("Cron and manual rerun accept the same dynamically added legal security", async () => {
+	const snapshot = dynamicSnapshot();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (input, options = {}) => {
+		const url = String(input);
+		if (url === "https://api.github.com/repos/zhushihao/cn-hk-quotes-mcp/issues/1") {
+			return response(options.method === "PATCH" ? {} : { body: "" });
+		}
+		return response(snapshot);
+	};
+	let cronPayload;
+	try {
+		cronPayload = await updateQuoteBridge(
+			{ GITHUB_TOKEN: "test-token" },
+			"cron:dynamic-parity",
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+
+	let updated = null;
+	const manual = await runManualQuoteBridge({
+		env: { ISSUE_NUMBER: "1" },
+		sources: ["https://quotes.example/portfolio"],
+		github: {
+			getIssue: async () => ({ data: { body: "" } }),
+			updateIssue: async (_number, update) => {
+				updated = update;
+			},
+		},
+		fetchImpl: async () => response(snapshot),
+		now: "2026-09-13T07:00:00.000Z",
+	});
+
+	assert.equal(cronPayload.bridge.last_attempt_status, "SUCCESS");
+	assert.equal(manual.payload.bridge.last_attempt_status, "SUCCESS");
+	assert.deepEqual(cronPayload.snapshot, manual.payload.snapshot);
+	assert.equal(cronPayload.snapshot.stocks[0].code, "002409");
+	assert.match(updated.body, /002409/);
+});
