@@ -34,6 +34,8 @@ import {
 } from "./portfolio-status";
 import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
 import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
+import { ingestResearchReplicaRecord, type ResearchReplicaStorage } from "./research-replica.ts";
+import { ResearchBoundaryError } from "./research-outbound-v2.ts";
 
 const PORTFOLIO_QUOTES_URL =
 	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
@@ -47,6 +49,9 @@ interface Env {
 	GITHUB_TOKEN: string;
 	PORTFOLIO_UNIVERSE?: KVNamespace;
 	PORTFOLIO_UNIVERSE_TOKEN?: string;
+	RESEARCH_REPLICA?: D1Database;
+	RESEARCH_OBJECTS?: R2Bucket;
+	RESEARCH_REPLICA_INGEST_TOKEN?: string;
 }
 
 type BridgePayload = {
@@ -769,6 +774,90 @@ function jsonResponse(payload: unknown, status = 200): Response {
 	});
 }
 
+function researchReplicaStorage(env: Env): ResearchReplicaStorage | null {
+	return env.RESEARCH_REPLICA && env.RESEARCH_OBJECTS
+		? { db: env.RESEARCH_REPLICA, objects: env.RESEARCH_OBJECTS }
+		: null;
+}
+
+function researchReplicaAuthorized(request: Request, env: Env): boolean {
+	const token = env.RESEARCH_REPLICA_INGEST_TOKEN;
+	return Boolean(token && request.headers.get("Authorization") === `Bearer ${token}`);
+}
+
+function researchBoundaryResponse(error: unknown, status = 400): Response {
+	const safe =
+		error instanceof ResearchBoundaryError
+			? error.asError()
+			: new ResearchBoundaryError("STORE_UNAVAILABLE").asError();
+	return jsonResponse(safe, status);
+}
+
+function decodeBase64Chunks(value: unknown): Uint8Array[] {
+	if (!Array.isArray(value)) throw new ResearchBoundaryError("INTEGRITY_FAILED");
+	try {
+		return value.map((encoded) => {
+			if (typeof encoded !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+				throw new Error("invalid base64");
+			}
+			const binary = atob(encoded);
+			return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+		});
+	} catch {
+		throw new ResearchBoundaryError("INTEGRITY_FAILED");
+	}
+}
+
+/**
+ * C5 private one-way transport.  This is an internal ingestion endpoint, not
+ * an MCP tool and not a RESEARCH database connection.  The separate secret is
+ * deliberately unrelated to LIVE/market scopes and remains fail-closed until
+ * configured.
+ */
+async function handleResearchReplicaIngest(request: Request, env: Env): Promise<Response> {
+	if (request.method !== "POST") {
+		return researchBoundaryResponse(new ResearchBoundaryError("UNSUPPORTED_OPERATION"), 405);
+	}
+	const storage = researchReplicaStorage(env);
+	if (!storage || !env.RESEARCH_REPLICA_INGEST_TOKEN) {
+		return researchBoundaryResponse(new ResearchBoundaryError("STORE_UNAVAILABLE"), 503);
+	}
+	if (!researchReplicaAuthorized(request, env)) {
+		return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
+	}
+	let body: unknown;
+	try {
+		body = await request.json();
+	} catch {
+		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	}
+	if (
+		!body ||
+		typeof body !== "object" ||
+		Array.isArray(body) ||
+		Object.keys(body as Record<string, unknown>).some(
+			(key) => key !== "record" && key !== "object_chunks_base64",
+		)
+	) {
+		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	}
+	const transport = body as { record?: unknown; object_chunks_base64?: unknown };
+	try {
+		const objectChunks =
+			transport.object_chunks_base64 === undefined
+				? null
+				: decodeBase64Chunks(transport.object_chunks_base64);
+		return jsonResponse(
+			await ingestResearchReplicaRecord(storage, transport.record, objectChunks),
+		);
+	} catch (error) {
+		return researchBoundaryResponse(
+			error,
+			error instanceof ResearchBoundaryError && error.retryable ? 503 : 400,
+		);
+	}
+}
+
 /**
  * 请求级 LIVE 叠加门判定（D-1 选项 A）：取 `Authorization` 头与既有
  * `PORTFOLIO_UNIVERSE_TOKEN` 比对。判定实现与写入端点鉴权**同源**
@@ -1112,6 +1201,9 @@ export default {
 			return handleGithubAuthUniverse(request, env);
 		if (url.pathname === "/api/github-auth/portfolio-status") {
 			return handleGithubAuthPortfolioStatus(request, env);
+		}
+		if (url.pathname === "/internal/research-replica/v2/ingest") {
+			return handleResearchReplicaIngest(request, env);
 		}
 		if (url.pathname === "/api/control-plane-status" && request.method === "GET") {
 			return handleControlPlaneStatus(env);

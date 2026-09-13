@@ -13,6 +13,19 @@
 			"binding": "PORTFOLIO_UNIVERSE"
 		}
 	],
+	"d1_databases": [
+		{
+			"binding": "RESEARCH_REPLICA",
+			"database_name": "quantpro-collector-research-replica",
+			"database_id": "0e20aca4-c394-4f41-aa46-d98831b81836"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "RESEARCH_OBJECTS",
+			"bucket_name": "quantpro-collector-research-replica"
+		}
+	],
 	"triggers": {
 		// Cloudflare cron weekdays use 1=Sunday; names make the intended weekdays explicit.
 		"crons": [

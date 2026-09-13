@@ -351,7 +351,7 @@ async function sha256Hex(value: string | Uint8Array): Promise<string> {
 	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function recordKey(record: OutboundV2Record): string {
+export function outboundV2RecordKey(record: OutboundV2Record): string {
 	const payload = record.payload;
 	switch (record.record_type) {
 		case "object":
@@ -383,7 +383,7 @@ export async function computeOutboundV2MessageId(record: OutboundV2Record): Prom
 	const input = [
 		record.schema_version,
 		record.record_type,
-		recordKey(record),
+		outboundV2RecordKey(record),
 		canonicalJson(material),
 	].join("\x1f");
 	return `outbound_${(await sha256Hex(input)).slice(0, 40)}`;
