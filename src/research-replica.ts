@@ -23,11 +23,12 @@ export type ReplicaIngestResult = {
 	content_sha256: string | null;
 };
 
-// 8 GiB stores as at most 9 decimal GB after provider rounding, below R2's
-// 10 GB monthly included storage.  100k writes is a tenfold safety margin
-// below its 1m included Class A operations.
-export const RESEARCH_REPLICA_MAX_STORED_BYTES = 8 * 1024 * 1024 * 1024;
-export const RESEARCH_REPLICA_MAX_MONTHLY_R2_WRITES = 100_000;
+// Keep the Collector below the published R2 Standard free tier while using it
+// efficiently: 9.8 decimal GB of retained content (including journals) and
+// 990k monthly Class A writes.  Provider billing rounds upward, so this leaves
+// a small but explicit margin below 10 GB / 1m operations.
+export const RESEARCH_REPLICA_MAX_STORED_BYTES = 9_800_000_000;
+export const RESEARCH_REPLICA_MAX_MONTHLY_R2_WRITES = 990_000;
 
 type ReplicaHealthRow = {
 	last_attempt_at: string | null;

@@ -1,5 +1,5 @@
--- Conservative hard guardrail: keep Collector-owned R2 usage well below the
--- published free tier.  It accounts for both raw objects and recovery journals.
+-- Hard guardrail: retain just below the R2 Standard free tier.  Runtime limits
+-- account for both raw objects and recovery journals.
 CREATE TABLE IF NOT EXISTS research_replica_usage (
 	name TEXT PRIMARY KEY,
 	usage_period TEXT NOT NULL,
