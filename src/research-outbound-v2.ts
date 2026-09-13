@@ -162,9 +162,22 @@ const VERSION_KEYS = [
 	"revision_kind",
 	"corrects_version_id",
 	"historical_backfill",
+	// `readable` is producer-declared metadata.  The read plane never consumes
+	// it as stored: it recomputes the effective value via isVersionServable
+	// (WITHDRAWAL excluded; whitelisted own media_type OR a FETCHED
+	// text_extraction projection) and only overrides the presented view,
+	// leaving the stored payload_json byte-for-byte untouched.  See the
+	// header comment of research-remote-adapter.ts for the full formula.
 	"readable",
 ];
 const ATTACHMENT_KEYS = [
+	// Contract note (SPEC-C8 §3.4): `role` is a free-form string, but the only
+	// role the read plane consumes today is the RESEARCH text-extraction
+	// projection: role = "text_extraction", attachment_locator =
+	// "urn:riws:text-extraction:<version_id>", attachment_status = "FETCHED",
+	// media_type "text/plain" (inside the servable whitelist).  No extra or
+	// restricted keys exist for it; this stays a comment-only contract point.
+
 	"attachment_id",
 	"attachment_locator",
 	"content_sha256",
