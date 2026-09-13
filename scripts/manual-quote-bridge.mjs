@@ -1,25 +1,43 @@
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import path from "node:path";
+import { registerHooks } from "node:module";
 
-import { getSnapshotCounts, validateSnapshot } from "../src/portfolio-validation.ts";
+// 与仓内测试同款 resolve 钩子：TS 模块内部的无扩展名相对导入在
+// `node --experimental-strip-types` 直跑时也需要补 `.ts`。
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		if (specifier.startsWith("./") && !path.extname(specifier)) {
+			try {
+				return nextResolve(`${specifier}.ts`, context);
+			} catch {
+				// 非 TS 导入交给默认解析器。
+			}
+		}
+		return nextResolve(specifier, context);
+	},
+});
+
+// 动态导入：确保钩子在解析模块图之前生效（静态 import 会被提升到钩子注册之前）。
+const { assertPublicQuotePrivacy } = await import("../src/quote-projections.ts");
 
 const DEFAULT_SOURCE_URL =
-	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
-const DEFAULT_FALLBACK_SOURCE_URL =
-	"https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes";
+	"https://cn-hk-quotes-mcp.zhushihao710.workers.dev/api/public/quotes";
 const DEFAULT_ISSUE_NUMBER = 1;
 const GITHUB_API_VERSION = "2022-11-28";
 const USER_AGENT = "quantpro-collector-manual-quote-bridge/1.0";
 const JSON_BLOCK_PATTERN = /```json\s*([\s\S]*?)\s*```/i;
 
 /**
- * The workflow and the Worker/Cron path deliberately share this validator.
- * Keeping this tiny wrapper exported also gives the manual path a testable
- * validation seam without maintaining a second contract.
+ * The workflow and the Worker/Cron path deliberately share the public
+ * quote-only contract (issue #7). Manual runs consume the new Worker's
+ * `/api/public/quotes` and validate with the same privacy-asserting seam:
+ * exact top-level keys, quoted stock fields only, and a hard failure if any
+ * holding identity/qty field appears.
  */
 export function validateFetchedSnapshot(snapshot) {
-	validateSnapshot(snapshot);
-	return getSnapshotCounts(snapshot);
+	assertPublicQuotePrivacy(snapshot);
+	return { total: snapshot.summary.total };
 }
 
 export function parsePreviousBridge(body) {
@@ -47,7 +65,7 @@ export function createIssueBody(payload) {
 	return [
 		"# QuantPro Collector A/H 行情计划任务数据桥",
 		"",
-		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑。快照由共享生产校验器验证；请勿手工编辑 JSON 区域。",
+		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑。本载荷为 quote-only（public_quote_snapshot/1），不含任何持仓身份/数量字段；请勿手工编辑 JSON 区域。",
 		"",
 		"```json",
 		JSON.stringify(payload, null, 2),
@@ -168,12 +186,7 @@ function issueNumberFrom(env) {
 
 function sourceList(env, sources) {
 	if (Array.isArray(sources)) return sources.filter(Boolean);
-	return [
-		env.SOURCE_URL === undefined ? DEFAULT_SOURCE_URL : env.SOURCE_URL,
-		env.FALLBACK_SOURCE_URL === undefined
-			? DEFAULT_FALLBACK_SOURCE_URL
-			: env.FALLBACK_SOURCE_URL,
-	].filter(Boolean);
+	return [env.SOURCE_URL === undefined ? DEFAULT_SOURCE_URL : env.SOURCE_URL].filter(Boolean);
 }
 
 export async function runManualQuoteBridge({
@@ -255,13 +268,6 @@ export async function runManualQuoteBridge({
 	console.info(`snapshot_time=${payload.snapshot?.snapshot_time ?? "null"}`);
 	console.info(`system_quality=${payload.snapshot?.system_quality ?? "null"}`);
 	console.info(`total=${payload.snapshot?.summary?.total ?? "null"}`);
-	console.info(`active_quote_total=${counts?.activeQuoteTotal ?? "null"}`);
-	console.info(`active_holding_total=${counts?.activeHoldingTotal ?? "null"}`);
-	console.info(`core_total=${counts?.coreTotal ?? "null"}`);
-	console.info(`growth_total=${counts?.growthTotal ?? "null"}`);
-	console.info(`watch_total=${counts?.watchTotal ?? "null"}`);
-	console.info(`exited_watch_total=${counts?.exitedWatchTotal ?? "0"}`);
-	console.info(`mapping_total=${counts?.mappingTotal ?? "null"}`);
 	if (fetchError) console.error(fetchError);
 
 	return { payload, body, fetchError, counts, usedSource };

@@ -524,14 +524,16 @@ test("D-1 wiring: the MCP surface derives the gate from the current request head
 	// 4. 叠加出口唯一，且其缺省是 fail-closed。
 	assert.match(source, /liveOverlayStatus \?\? "SKIPPED_UNAUTHORIZED"/);
 	assert.match(source, /liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED"/);
-	// 5. 旧行情桥（cron）不传 env/门，结构上不可能叠加。
+	// 5. 旧行情桥（cron）不传门（liveOverlayStatus），结构上不可能叠加；
+	//    env 仅用于旧 origin 的 Access 服务令牌（issue #7 Step 3）。
 	const bridgeBody = source.slice(
 		source.indexOf("export async function updateQuoteBridge"),
-		source.indexOf("function createServer"),
+		source.indexOf("/**\n * MCP server 工厂"),
 	);
+	assert.doesNotMatch(bridgeBody, /liveOverlayStatus/);
 	assert.match(
 		bridgeBody,
-		/fetchUpstreamSnapshot\(\s*\[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL\],\s*context,\s*\);/,
+		/fetchUpstreamSnapshot\(\s*\[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL\],\s*context,\s*env,\s*\);/,
 	);
 });
 

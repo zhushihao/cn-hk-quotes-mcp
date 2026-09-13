@@ -10,19 +10,10 @@ import {
 
 function makeSnapshot(code = "000001") {
 	const stock = {
-		code,
 		market: "CN",
 		exchange: "SZ",
+		code,
 		name: `dynamic-${code}`,
-		group: "Core",
-		portfolio_group: "core",
-		portfolio_status: "CORE",
-		holding_status: "ACTIVE",
-		mapping_only: false,
-		mapped_to: null,
-		mapping_to: null,
-		position_qty: 1,
-		is_position: true,
 		price: 10,
 		change: 1,
 		change_pct: 10,
@@ -47,11 +38,10 @@ function makeSnapshot(code = "000001") {
 		quality: "SYNTHETIC",
 	};
 	return {
-		portfolio_version: `live:dynamic-${code}`,
+		schema_version: "public_quote_snapshot/1",
 		snapshot_time: "2026-09-13T15:01:00+08:00",
 		system_quality: "GOOD",
-		summary: { total: 1 },
-		portfolio_universe: [{ ...stock }],
+		summary: { total: 1, usable: 1 },
 		stocks: [stock],
 	};
 }
@@ -85,7 +75,6 @@ test("manual bridge accepts a newly introduced legal security through the shared
 	const result = await runManualQuoteBridge({
 		env: {
 			SOURCE_URL: "https://primary.example/quotes",
-			FALLBACK_SOURCE_URL: "",
 			ISSUE_NUMBER: "1",
 			GITHUB_RUN_ID: "synthetic-run",
 			GITHUB_TOKEN: "synthetic-token",
@@ -171,7 +160,10 @@ test("manual and Worker/Cron paths point to the same production validator", () =
 		"utf8",
 	);
 
-	assert.match(manualSource, /from ["']\.\.\/src\/portfolio-validation\.ts["']/);
+	assert.match(
+		manualSource,
+		/await import\("\.\.\/src\/quote-projections\.ts"\)/,
+	);
 	assert.match(workerSource, /from ["']\.\/portfolio-validation["']/);
 	assert.match(workerSource, /validateSnapshot\(snapshot\)/);
 	assert.match(workflowSource, /actions\/checkout@v4/);
@@ -185,5 +177,10 @@ test("manual and Worker/Cron paths point to the same production validator", () =
 		/2026-09-01-v4|expectedKeys|requiredWatchKeys|CN:\d{5,6}|HK:\d{5,6}/,
 	);
 	assert.doesNotMatch(workflowSource, /npm\s+(ci|install)/);
+	// 手工补跑与公开面同源：SOURCE_URL 指向新 Worker 的 quote-only 路由，无同源 fallback。
+	assert.match(workflowSource, /SOURCE_URL: https:\/\/cn-hk-quotes-mcp\.zhushihao710\.workers\.dev\/api\/public\/quotes/);
+	assert.doesNotMatch(workflowSource, /FALLBACK_SOURCE_URL/);
+	assert.match(manualSource, /api\/public\/quotes/);
+	assert.doesNotMatch(manualSource, /DEFAULT_FALLBACK_SOURCE_URL/);
 	assert.doesNotThrow(() => validateFetchedSnapshot(makeSnapshot("688001")));
 });

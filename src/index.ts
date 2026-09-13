@@ -50,6 +50,9 @@ interface Env {
 	GITHUB_TOKEN: string;
 	PORTFOLIO_UNIVERSE?: KVNamespace;
 	PORTFOLIO_UNIVERSE_TOKEN?: string;
+	/** 旧行情 origin（cn-hk-quotes-proxy / chatgpt.site）启用 Cloudflare Access 后注入。 */
+	CF_ACCESS_CLIENT_ID?: string;
+	CF_ACCESS_CLIENT_SECRET?: string;
 	RESEARCH_REPLICA?: D1Database;
 	RESEARCH_OBJECTS?: R2Bucket;
 	RESEARCH_REPLICA_INGEST_TOKEN?: string;
@@ -66,7 +69,7 @@ type BridgePayload = {
 		source: string;
 		error: string | null;
 	};
-	snapshot: QuoteSnapshot | null;
+	snapshot: QuoteSnapshot | PublicQuoteSnapshot | null;
 };
 
 type GitHubIssue = {
@@ -98,7 +101,7 @@ class BridgeError extends Error {
 const JSON_BLOCK_PATTERN = /```json\s*([\s\S]*?)\s*```/i;
 
 function parsePreviousBridge(body: string | null | undefined): {
-	snapshot: QuoteSnapshot | null;
+	snapshot: QuoteSnapshot | PublicQuoteSnapshot | null;
 	lastSuccessAt: string | null;
 } {
 	if (!body) {
@@ -125,7 +128,7 @@ function createIssueBody(payload: BridgePayload): string {
 	return [
 		"# A/H 行情计划任务数据桥",
 		"",
-		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑。LIVE 持仓真相不再由固定 23/13 名单维护，而由 Cloudflare 的受鉴权 quote-universe/1 动态层承接；请勿手工编辑 JSON 区域。",
+		"> 机器数据。由 Cloudflare Worker Cron 自动刷新；GitHub Actions 仅用于手工补跑。本载荷为 quote-only（public_quote_snapshot/1），不含任何持仓身份/数量字段；LIVE 持仓真相由受鉴权 quote-universe/1 动态层承接；请勿手工编辑 JSON 区域。",
 		"",
 		"```json",
 		JSON.stringify(payload, null, 2),
@@ -336,12 +339,21 @@ async function fetchUpstreamSnapshot(
 
 		try {
 			const separator = source.includes("?") ? "&" : "?";
+			// 旧行情 origin（proxy/chatgpt.site）启用 Cloudflare Access 服务令牌后，
+			// 内部抓取凭 CF-Access-Client-Id/Secret 通过边（issue #7 Step 3）；
+			// 绑定未配置时保持匿名（本地 dev / Access 未开启阶段），凭据不进日志。
+			const accessHeaders: Record<string, string> = {};
+			if (env?.CF_ACCESS_CLIENT_ID && env?.CF_ACCESS_CLIENT_SECRET) {
+				accessHeaders["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
+				accessHeaders["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
+			}
 			const response = await fetch(`${source}${separator}_bridge_ts=${Date.now()}`, {
 				method: "GET",
 				headers: {
 					Accept: "application/json",
 					"Cache-Control": "no-cache",
 					"User-Agent": "cn-hk-quotes-cloudflare-bridge/1.0",
+					...accessHeaders,
 				},
 				signal: controller.signal,
 			});
@@ -454,8 +466,17 @@ async function fetchUpstreamSnapshot(
 	throw lastError ?? new BridgeError("upstream_fetch", "no upstream source configured");
 }
 
-async function fetchPublicQuoteSnapshot(context: BridgeStageContext): Promise<PublicQuoteSnapshot> {
-	const upstream = await fetchUpstreamSnapshot([PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL], context);
+async function fetchPublicQuoteSnapshot(
+	context: BridgeStageContext,
+	env?: Env,
+): Promise<PublicQuoteSnapshot> {
+	// 公开行情 pickup 仍指向旧 Worker 的 chatgpt.site 公开入口（public host，
+	// issue #7 Step 4 起由 Cloudflare Access + 服务令牌保护），投影为 quote-only 后外发。
+	const upstream = await fetchUpstreamSnapshot(
+		[PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+		context,
+		env,
+	);
 	return toPublicQuoteSnapshot(upstream.snapshot);
 }
 
@@ -501,9 +522,12 @@ export async function updateQuoteBridge(
 	let upstreamError: BridgeError | null = null;
 
 	try {
+		// env 仅用于旧 origin 的 Access 服务令牌（Step 3）；不传叠加门参，
+		// 叠加（LIVE overlay / KV 读取）在 cron 路径结构上仍不可能发生。
 		const upstream = await fetchUpstreamSnapshot(
 			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 			context,
+			env,
 		);
 		payload = {
 			schema_version: "1.0",
@@ -516,7 +540,8 @@ export async function updateQuoteBridge(
 				source: upstream.source,
 				error: null,
 			},
-			snapshot: upstream.snapshot,
+			// Issue #1 是公开面（repo 为 public）：载荷一律投影为 quote-only。
+			snapshot: toPublicQuoteSnapshot(upstream.snapshot),
 		};
 	} catch (error) {
 		upstreamError =
@@ -534,7 +559,8 @@ export async function updateQuoteBridge(
 				source: PORTFOLIO_QUOTES_URL,
 				error: `${upstreamError.name}: ${upstreamError.message}`,
 			},
-			snapshot: previous.snapshot,
+			// 失败回退的历史快照同样投影，防止把身份字段重新写回公开 issue。
+			snapshot: previous.snapshot ? toPublicQuoteSnapshot(previous.snapshot) : null,
 		};
 	}
 
@@ -568,7 +594,13 @@ export async function updateQuoteBridge(
 	}
 
 	logBridgeStage(context, "bridge_success", {
-		portfolio_version: payload.snapshot?.portfolio_version ?? null,
+		// 旧（v4 富件）与新（public_quote_snapshot/1）两种载荷各自带版本字段。
+		portfolio_version:
+			payload.snapshot == null
+				? null
+				: "portfolio_version" in payload.snapshot
+					? payload.snapshot.portfolio_version
+					: payload.snapshot.schema_version,
 		snapshot_time: payload.snapshot?.snapshot_time ?? null,
 		stock_count: payload.snapshot?.stocks.length ?? 0,
 	});
@@ -639,7 +671,7 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 		"get_portfolio_quotes",
 		{
 			description:
-				"获取 A/H 结构化行情快照。桥接层不再用固定 23/13 标的名单校验；LIVE 动态持仓由 Cloudflare quote-universe/1 层独立驱动，且**仅对携带有效 PORTFOLIO_UNIVERSE_TOKEN bearer 的调用方生效**（匿名调用返回 legacy 目录视图，并在 control_plane_status.live_overlay_status 标注 SKIPPED_*）。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
+				"获取 A/H 结构化行情快照。LIVE 动态持仓由 Cloudflare quote-universe/1 层独立驱动，且**仅对携带有效 PORTFOLIO_UNIVERSE_TOKEN bearer 的调用方生效**（匿名调用返回 quote-only 投影视图，不含任何持仓身份/数量字段，并在 control_plane_status.live_overlay_status 标注 SKIPPED_*）。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
 			inputSchema: z.object({}),
 		},
 		async () => {
@@ -651,6 +683,11 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 					env,
 					{ liveOverlayStatus },
 				);
+				// 双契约（issue #7 Step 2）：有效 bearer 保留完整 LIVE 语义；
+				// 匿名 / 未授权调用投影为 quote-only（白名单 + 精确键断言）。
+				const displaySnapshot = isLiveOverlayEnabled(liveOverlayStatus)
+					? upstream.snapshot
+					: toPublicQuoteSnapshot(upstream.snapshot);
 				const controlPlaneStatus = env
 					? {
 							...(await getControlPlaneStatus(env)),
@@ -674,7 +711,7 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 						{
 							type: "text",
 							text: JSON.stringify(
-								{ ...upstream.snapshot, control_plane_status: controlPlaneStatus },
+								{ ...displaySnapshot, control_plane_status: controlPlaneStatus },
 								null,
 								2,
 							),
@@ -711,8 +748,8 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 		},
 		async () => {
 			const context = bridgeContext("mcp:get_public_quotes");
-			try {
-				const snapshot = await fetchPublicQuoteSnapshot(context);
+				try {
+					const snapshot = await fetchPublicQuoteSnapshot(context, env);
 				return {
 					content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
 				};
@@ -1221,11 +1258,11 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 	}
 }
 
-async function handlePublicQuotes(request: Request): Promise<Response> {
+async function handlePublicQuotes(request: Request, env: Env): Promise<Response> {
 	if (request.method !== "GET") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
 	const context = bridgeContext("http:public-quotes");
 	try {
-		return jsonResponse(await fetchPublicQuoteSnapshot(context));
+		return jsonResponse(await fetchPublicQuoteSnapshot(context, env));
 	} catch (error) {
 		logBridgeFailure(context, error, "public_quotes");
 		return jsonResponse(
@@ -1251,7 +1288,7 @@ export default {
 			return handleControlPlaneStatus(env);
 		}
 		if (url.pathname === "/api/quote-universe") return handleUniverseApi(request, env);
-		if (url.pathname === "/api/public/quotes") return handlePublicQuotes(request);
+		if (url.pathname === "/api/public/quotes") return handlePublicQuotes(request, env);
 		if (url.pathname === "/api/portfolio-quotes")
 			return handleDynamicPortfolioQuotes(request, env);
 		// MCP 面（含 `get_portfolio_quotes`）：按**本请求**的 Authorization 头判定 LIVE 叠加门

@@ -18,6 +18,7 @@ registerHooks({
 
 const { updateQuoteBridge } = await import("../src/index.ts");
 const { runManualQuoteBridge } = await import("../scripts/manual-quote-bridge.mjs");
+const { toPublicQuoteSnapshot } = await import("../src/quote-projections.ts");
 
 function dynamicSnapshot() {
 	const row = {
@@ -100,7 +101,10 @@ function response(body, status = 200) {
 }
 
 test("Cron and manual rerun accept the same dynamically added legal security", async () => {
+	// 双契约（issue #7）：cron 消费旧 origin 的富快照并投影 quote-only；
+	// manual 直接消费新 Worker 的公开 quote-only 路由（已投影）。两者必须收敛到同一 schema。
 	const snapshot = dynamicSnapshot();
+	const publicSnapshot = toPublicQuoteSnapshot(snapshot);
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input, options = {}) => {
 		const url = String(input);
@@ -129,7 +133,7 @@ test("Cron and manual rerun accept the same dynamically added legal security", a
 				updated = update;
 			},
 		},
-		fetchImpl: async () => response(snapshot),
+		fetchImpl: async () => response(publicSnapshot),
 		now: "2026-09-13T07:00:00.000Z",
 	});
 
@@ -137,5 +141,6 @@ test("Cron and manual rerun accept the same dynamically added legal security", a
 	assert.equal(manual.payload.bridge.last_attempt_status, "SUCCESS");
 	assert.deepEqual(cronPayload.snapshot, manual.payload.snapshot);
 	assert.equal(cronPayload.snapshot.stocks[0].code, "002409");
+	assert.equal(cronPayload.snapshot.schema_version, "public_quote_snapshot/1");
 	assert.match(updated.body, /002409/);
 });
