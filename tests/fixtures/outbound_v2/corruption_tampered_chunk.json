@@ -1,0 +1,39 @@
+{
+  "chunks_hex": [
+    "30313233343536373839616263646566",
+    "cf313233343536373839616263646566",
+    "30313233343536373839616263646566",
+    "30313233343536373839616263646566"
+  ],
+  "expectation": "verify_object_chunks recomputes each chunk hash against the manifest and must reject with INTEGRITY_FAILED; producer-side drain also refuses to send",
+  "record": {
+    "generated_at": null,
+    "message_id": "outbound_10e2f64c3b704ff21afd40881223fd382116edb8",
+    "payload": {
+      "byte_size": 64,
+      "chunking": {
+        "chunk_sha256": [
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f",
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f",
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f",
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f"
+        ],
+        "chunk_size": 16,
+        "chunked": true,
+        "total_chunks": 4
+      },
+      "content_sha256": "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e",
+      "encoding": "identity",
+      "manifest_message_id": "outbound_10e2f64c3b704ff21afd40881223fd382116edb8",
+      "media_type": "text/plain",
+      "object_id": "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e",
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "object",
+    "schema_version": "collector-outbound-v2",
+    "visibility": "PUBLIC"
+  },
+  "sample_kind": "corruption_tampered_chunk",
+  "tampered_chunk_index": 1
+}

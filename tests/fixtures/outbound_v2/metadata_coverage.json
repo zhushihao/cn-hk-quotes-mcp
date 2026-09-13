@@ -1,0 +1,22 @@
+[
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_5b83d19e221b9a77af711a6db8bbc0457f1a1642",
+    "payload": {
+      "alternative_coverage_id": null,
+      "coverage_id": "cov-fixture-0001",
+      "metric_type": "REALITY",
+      "next_check_at": "2026-09-13T03:15:00+00:00",
+      "rule_key": "rule-key-fixture-1",
+      "source_id": "fixture-source-public",
+      "status": "NEW_CONTENT",
+      "subject": "fixture-theme",
+      "updated_at": "2026-09-13T03:00:00+00:00",
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "coverage",
+    "schema_version": "collector-outbound-v2",
+    "visibility": "PUBLIC"
+  }
+]

@@ -1,0 +1,100 @@
+[
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_c8447d18980eeb797c7f012082cea5a25a2afc9e",
+    "payload": {
+      "attachments": [
+        {
+          "attachment_id": "att_975735cebab13c27b7b856b4ed64e85c8607e8f3",
+          "attachment_locator": "https://fixture.example.test/public/attachment",
+          "attachment_status": "FETCHED",
+          "byte_size": 24,
+          "content_sha256": "472aaa73f456781b1f51c36d868c3e636b324f3610d6b7e6308aa41318ce43a7",
+          "display_name": "fixture-attachment.pdf",
+          "failure_class": null,
+          "media_type": "application/pdf",
+          "outcome": "OK",
+          "role": "ANNEX"
+        }
+      ],
+      "document": {
+        "canonical_locator": "https://fixture.example.test/public/item",
+        "document_id": "doc_32cfa675b5a232e457a0448c5f528b8c82d65ce8",
+        "first_seen_at": "2026-09-13T01:00:00+00:00",
+        "historical_backfill": false,
+        "origin_locator": "https://fixture.example.test/origin/item",
+        "source_id": "fixture-source-public",
+        "source_identity_key": "fixture-item-public",
+        "source_kind": "RSS",
+        "title": "Fixture Document (synthetic)",
+        "visibility": "PUBLIC"
+      },
+      "version": {
+        "byte_size": 24,
+        "content_sha256": "39394538ece72feccc2d7d8647a970f026dd0389540da36ab803e0a5e0a8414c",
+        "corrects_version_id": null,
+        "document_id": "doc_32cfa675b5a232e457a0448c5f528b8c82d65ce8",
+        "event_time": "2026-09-12T21:30:00+00:00",
+        "historical_backfill": false,
+        "ingested_at": "2026-09-13T01:00:00+00:00",
+        "media_type": "text/plain",
+        "published_at": "2026-09-12T22:00:00+00:00",
+        "readable": true,
+        "response_headers": {
+          "content-type": "text/plain",
+          "etag": "\"fixture-etag-1\""
+        },
+        "revision_kind": "ORIGINAL",
+        "source_updated_at": null,
+        "version_id": "ver_a23bc3b33ddf81405b78539abd17c52dc49af5ab",
+        "version_number": 1
+      }
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "document_version",
+    "schema_version": "collector-outbound-v2",
+    "visibility": "PUBLIC"
+  },
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_0ba5bc3e360a7ac0a62a720bff920b76ca6ba528",
+    "payload": {
+      "attachments": [],
+      "document": {
+        "canonical_locator": "https://fixture.example.test/public/item",
+        "document_id": "doc_32cfa675b5a232e457a0448c5f528b8c82d65ce8",
+        "first_seen_at": "2026-09-13T01:00:00+00:00",
+        "historical_backfill": false,
+        "origin_locator": "https://fixture.example.test/origin/item",
+        "source_id": "fixture-source-public",
+        "source_identity_key": "fixture-item-public",
+        "source_kind": "RSS",
+        "title": "Fixture Document (synthetic)",
+        "visibility": "PUBLIC"
+      },
+      "version": {
+        "byte_size": 24,
+        "content_sha256": "ea2e71b4f4fce4e249923e4705e61941c37c4e22da1462a704858e5eca1ccc19",
+        "corrects_version_id": "ver_a23bc3b33ddf81405b78539abd17c52dc49af5ab",
+        "document_id": "doc_32cfa675b5a232e457a0448c5f528b8c82d65ce8",
+        "event_time": "2026-09-12T21:30:00+00:00",
+        "historical_backfill": false,
+        "ingested_at": "2026-09-13T03:00:00+00:00",
+        "media_type": "text/plain",
+        "published_at": "2026-09-12T22:00:00+00:00",
+        "readable": true,
+        "response_headers": {
+          "content-type": "text/plain"
+        },
+        "revision_kind": "CORRECTION",
+        "source_updated_at": "2026-09-13T02:55:00+00:00",
+        "version_id": "ver_5b0fc2724aa565102dff6f7f138b68e0526b638e",
+        "version_number": 2
+      }
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "document_version",
+    "schema_version": "collector-outbound-v2",
+    "visibility": "PUBLIC"
+  }
+]

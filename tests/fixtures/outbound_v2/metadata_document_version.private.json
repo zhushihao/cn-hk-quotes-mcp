@@ -1,0 +1,82 @@
+[
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_d302dfdd4e73e0f182d61119024b6732a28e0493",
+    "payload": {
+      "attachments": [],
+      "document": {
+        "canonical_locator": "private://fixture/private-item",
+        "document_id": "doc_e1668806a390fe8da02b7f3b61af2a1aa9edd841",
+        "first_seen_at": "2026-09-13T01:30:00+00:00",
+        "historical_backfill": false,
+        "origin_locator": null,
+        "source_id": "fixture-source-private",
+        "source_identity_key": "fixture-item-private",
+        "source_kind": "AUTHORIZED_IMPORT",
+        "title": "Private Fixture (synthetic)",
+        "visibility": "PRIVATE"
+      },
+      "version": {
+        "byte_size": 20,
+        "content_sha256": "7732d5c6439e6c608d15bab805c3a1f52a7da6386124f9cdfdd9208f208ceffc",
+        "corrects_version_id": null,
+        "document_id": "doc_e1668806a390fe8da02b7f3b61af2a1aa9edd841",
+        "event_time": null,
+        "historical_backfill": false,
+        "ingested_at": "2026-09-13T01:30:00+00:00",
+        "media_type": "text/plain",
+        "published_at": null,
+        "readable": true,
+        "response_headers": {},
+        "revision_kind": "ORIGINAL",
+        "source_updated_at": null,
+        "version_id": "ver_ff71ccfe53b5a44c061f87894f2b079d161595f5",
+        "version_number": 1
+      }
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "document_version",
+    "schema_version": "collector-outbound-v2",
+    "visibility": "PRIVATE"
+  },
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_719eb1ee8347e8d29c975955e293a8ee7f006b1d",
+    "payload": {
+      "attachments": [],
+      "document": {
+        "canonical_locator": "private://fixture/private-item",
+        "document_id": "doc_e1668806a390fe8da02b7f3b61af2a1aa9edd841",
+        "first_seen_at": "2026-09-13T01:30:00+00:00",
+        "historical_backfill": false,
+        "origin_locator": null,
+        "source_id": "fixture-source-private",
+        "source_identity_key": "fixture-item-private",
+        "source_kind": "AUTHORIZED_IMPORT",
+        "title": "Private Fixture (synthetic)",
+        "visibility": "PRIVATE"
+      },
+      "version": {
+        "byte_size": 30,
+        "content_sha256": "5d2b664dbff5fe911bca6ecf2d5b1a3b45ccfc35b0db5762f4aab8f6b2981350",
+        "corrects_version_id": "ver_ff71ccfe53b5a44c061f87894f2b079d161595f5",
+        "document_id": "doc_e1668806a390fe8da02b7f3b61af2a1aa9edd841",
+        "event_time": null,
+        "historical_backfill": false,
+        "ingested_at": "2026-09-13T03:00:00+00:00",
+        "media_type": "text/plain",
+        "published_at": null,
+        "readable": false,
+        "response_headers": {},
+        "revision_kind": "WITHDRAWAL",
+        "source_updated_at": null,
+        "version_id": "ver_f7ed2745a3306a366c67e47e7de9b57f88314ff3",
+        "version_number": 2
+      }
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "document_version",
+    "schema_version": "collector-outbound-v2",
+    "visibility": "PRIVATE"
+  }
+]
