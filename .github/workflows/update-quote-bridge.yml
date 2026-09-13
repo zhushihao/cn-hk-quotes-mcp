@@ -23,6 +23,5 @@ jobs:
               run: node --experimental-strip-types scripts/manual-quote-bridge.mjs
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  SOURCE_URL: https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes
-                  FALLBACK_SOURCE_URL: https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes
+                  SOURCE_URL: SOURCE_URL: https://cn-hk-quotes-mcp.zhushihao710.workers.dev/api/public/quotes
                   ISSUE_NUMBER: "1"
