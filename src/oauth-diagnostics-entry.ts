@@ -139,6 +139,31 @@ async function applyIssuerAdvertisementCompat(
 	}
 }
 
+function applyChatGptCallbackIssuerCompat(response: Response): Response {
+	if (response.status < 300 || response.status >= 400) return response;
+	const location = response.headers.get("Location");
+	if (!location) return response;
+	try {
+		const redirect = new URL(location);
+		const isChatGptConnector =
+			redirect.hostname === "chatgpt.com" &&
+			(redirect.pathname === "/connector_platform_oauth_redirect" ||
+				redirect.pathname.startsWith("/connector/oauth/"));
+		if (!isChatGptConnector || !redirect.searchParams.has("iss")) return response;
+		redirect.searchParams.delete("iss");
+		const headers = new Headers(response.headers);
+		headers.set("Location", redirect.toString());
+		headers.set("Cache-Control", "no-store");
+		return new Response(response.body, {
+			status: response.status,
+			statusText: response.statusText,
+			headers,
+		});
+	} catch {
+		return response;
+	}
+}
+
 async function readLatest(env: Env): Promise<Response> {
 	const db = env.RESEARCH_REPLICA;
 	if (!db) return Response.json({ available: false }, { status: 503 });
@@ -184,6 +209,7 @@ export default {
 		try {
 			response = await oauthWorker.fetch(request, env, ctx);
 			response = await applyIssuerAdvertisementCompat(request, response);
+			if (authorizePost) response = applyChatGptCallbackIssuerCompat(response);
 		} catch (error) {
 			if (tokenRequest || authorizePost || mcpRequest) {
 				ctx.waitUntil(
