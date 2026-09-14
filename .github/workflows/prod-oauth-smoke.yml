@@ -58,10 +58,11 @@ jobs:
                       raise
                   time.sleep(10)
 
-      - name: Verify OAuth KV write path through one-time DCR probe
+      - name: Wait for deployed OAuth KV write path through one-time DCR probe
         shell: python
         run: |
           import json
+          import time
           import urllib.error
           import urllib.request
 
@@ -73,23 +74,29 @@ jobs:
               "grant_types": ["authorization_code"],
               "response_types": ["code"]
           }).encode("utf-8")
-          request = urllib.request.Request(
-              url,
-              data=payload,
-              method="POST",
-              headers={
-                  "Content-Type": "application/json",
-                  "Accept": "application/json",
-                  "User-Agent": "quantpro-prod-oauth-storage-smoke/1"
-              },
-          )
-          try:
-              with urllib.request.urlopen(request, timeout=15) as response:
-                  body = json.loads(response.read().decode("utf-8"))
-                  assert response.status == 201, (response.status, body)
-                  assert isinstance(body.get("client_id"), str) and body["client_id"], body
-                  print("PROD_OAUTH_KV_WRITE_OK")
-                  print(json.dumps({"client_id_issued": True, "status": response.status}))
-          except urllib.error.HTTPError as exc:
-              body = exc.read().decode("utf-8", errors="replace")
-              raise RuntimeError(f"OAuth DCR storage probe failed: HTTP {exc.code}: {body[:500]}") from exc
+
+          for attempt in range(1, 31):
+              request = urllib.request.Request(
+                  url,
+                  data=payload,
+                  method="POST",
+                  headers={
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                      "User-Agent": "quantpro-prod-oauth-storage-smoke/1"
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      body = json.loads(response.read().decode("utf-8"))
+                      assert response.status == 201, (response.status, body)
+                      assert isinstance(body.get("client_id"), str) and body["client_id"], body
+                      print("PROD_OAUTH_KV_WRITE_OK")
+                      print(json.dumps({"client_id_issued": True, "status": response.status}))
+                      break
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="replace")
+                  print(f"attempt {attempt}/30: HTTP {exc.code}: {body[:240]}")
+                  if attempt == 30:
+                      raise RuntimeError(f"OAuth DCR storage probe failed after deployment wait: HTTP {exc.code}: {body[:500]}") from exc
+                  time.sleep(10)
