@@ -182,7 +182,7 @@ function authorizationHeaders(): HeadersInit {
 		"Content-Type": "text/html; charset=utf-8",
 		"Cache-Control": "no-store",
 		"Content-Security-Policy":
-			"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+			"default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://chatgpt.com; base-uri 'none'; frame-ancestors 'none'",
 		"Referrer-Policy": "no-referrer",
 	};
 }

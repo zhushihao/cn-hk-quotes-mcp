@@ -610,7 +610,7 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 	//    env 仅用于旧 origin 的 Access 服务令牌（issue #7 Step 3）。
 	const bridgeBody = source.slice(
 		source.indexOf("export async function updateQuoteBridge"),
-		source.indexOf("/**\n * MCP server 工厂"),
+		source.lastIndexOf("/**", source.indexOf("function createServer")),
 	);
 	assert.doesNotMatch(bridgeBody, /liveOverlayStatus/);
 	assert.match(

@@ -170,3 +170,4 @@ dist
 
 .dev.vars
 .wrangler/
+oauth-browser-preflight.json

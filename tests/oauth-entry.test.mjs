@@ -151,6 +151,19 @@ test("OAuth owner authorization uses a signed cookie-independent form token", as
 	assert.match(oauth, /授权密钥不匹配/);
 });
 
+test("authorization CSP grants only the minimal ChatGPT callback origin", async () => {
+	const oauth = await source("../src/oauth-entry.ts");
+	const headersStart = oauth.indexOf("function authorizationHeaders");
+	const headersEnd = oauth.indexOf("function authorizationPage", headersStart);
+	const headers = oauth.slice(headersStart, headersEnd);
+	assert.match(headers, /form-action 'self' https:\/\/chatgpt\.com/);
+	assert.doesNotMatch(headers, /form-action \*/);
+	assert.doesNotMatch(headers, /form-action https:/);
+	assert.match(headers, /default-src 'none'/);
+	assert.match(headers, /base-uri 'none'/);
+	assert.match(headers, /frame-ancestors 'none'/);
+});
+
 test("OAuth authorization stays market-read only", async () => {
 	const oauth = await source("../src/oauth-entry.ts");
 	assert.match(oauth, /if \(!requested\.has\(MARKET_READ_SCOPE\)\) return null/);
