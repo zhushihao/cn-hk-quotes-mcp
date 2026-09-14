@@ -310,7 +310,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 		return renderAuthorizationError({
 			action,
 			clientName,
-				scopes,
+			scopes,
 			secret: ownerSecret,
 			error: "授权会话已过期或无效，请返回 ChatGPT 重新发起授权。",
 			status: 400,
@@ -321,7 +321,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 		return renderAuthorizationError({
 			action,
 			clientName,
-				scopes,
+			scopes,
 			secret: ownerSecret,
 			error: "授权密钥不匹配，请确认使用当前生效的授权密钥。",
 			status: 401,
