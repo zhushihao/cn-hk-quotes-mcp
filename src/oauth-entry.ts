@@ -12,8 +12,9 @@ const MCP_RESOURCE = `${ORIGIN}/mcp`;
 const MARKET_READ_SCOPE = "market:read";
 const OFFLINE_ACCESS_SCOPE = "offline_access";
 const OWNER_USER_ID = "quantpro-owner";
-const CSRF_COOKIE = "qp_oauth_csrf";
 const MAX_OWNER_KEY_LENGTH = 512;
+const AUTH_FORM_MAX_AGE_SECONDS = 10 * 60;
+const AUTH_FORM_FUTURE_TOLERANCE_SECONDS = 60;
 
 type CoreEnv = Parameters<typeof coreWorker.fetch>[1];
 type OAuthProps = {
@@ -47,25 +48,25 @@ function escapeHtml(value: string): string {
 		.replaceAll("'", "&#039;");
 }
 
-function randomBase64Url(bytes = 24): string {
-	const raw = crypto.getRandomValues(new Uint8Array(bytes));
+function base64UrlFromBytes(bytes: Uint8Array): string {
 	let binary = "";
-	for (const byte of raw) binary += String.fromCharCode(byte);
+	for (const byte of bytes) binary += String.fromCharCode(byte);
 	return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
-function parseCookies(request: Request): Map<string, string> {
-	const result = new Map<string, string>();
-	for (const part of (request.headers.get("Cookie") ?? "").split(";")) {
-		const separator = part.indexOf("=");
-		if (separator < 1) continue;
-		result.set(part.slice(0, separator).trim(), part.slice(separator + 1).trim());
-	}
-	return result;
+function randomBase64Url(bytes = 24): string {
+	return base64UrlFromBytes(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
 async function sha256(value: string): Promise<Uint8Array> {
 	return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+}
+
+async function constantTimeTextEquals(leftValue: string, rightValue: string): Promise<boolean> {
+	const [left, right] = await Promise.all([sha256(leftValue), sha256(rightValue)]);
+	let difference = 0;
+	for (let index = 0; index < left.length; index += 1) difference |= left[index] ^ right[index];
+	return difference === 0;
 }
 
 async function constantTimeSecretEquals(
@@ -73,10 +74,57 @@ async function constantTimeSecretEquals(
 	configured: string | undefined,
 ): Promise<boolean> {
 	if (!configured || !candidate || candidate.length > MAX_OWNER_KEY_LENGTH) return false;
-	const [left, right] = await Promise.all([sha256(candidate), sha256(configured)]);
-	let difference = 0;
-	for (let index = 0; index < left.length; index += 1) difference |= left[index] ^ right[index];
-	return difference === 0;
+	return constantTimeTextEquals(candidate, configured);
+}
+
+async function authFormSignature(secret: string, payload: string): Promise<string> {
+	const key = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(secret),
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"],
+	);
+	const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+	return base64UrlFromBytes(new Uint8Array(signature));
+}
+
+async function createAuthFormToken(
+	action: string,
+	secret: string | undefined,
+): Promise<string | null> {
+	if (!secret) return null;
+	const issuedAt = Math.floor(Date.now() / 1000);
+	const nonce = randomBase64Url(18);
+	const payload = `${issuedAt}.${nonce}.${action}`;
+	const signature = await authFormSignature(secret, payload);
+	return `${issuedAt}.${nonce}.${signature}`;
+}
+
+async function validateAuthFormToken(
+	token: string,
+	action: string,
+	secret: string | undefined,
+): Promise<boolean> {
+	if (!secret) return false;
+	const parts = token.split(".");
+	if (parts.length !== 3) return false;
+	const [issuedAtRaw, nonce, providedSignature] = parts;
+	const issuedAt = Number.parseInt(issuedAtRaw, 10);
+	if (!Number.isSafeInteger(issuedAt) || nonce.length < 12 || providedSignature.length < 32) {
+		return false;
+	}
+	const now = Math.floor(Date.now() / 1000);
+	const ageSeconds = now - issuedAt;
+	if (
+		ageSeconds > AUTH_FORM_MAX_AGE_SECONDS ||
+		ageSeconds < -AUTH_FORM_FUTURE_TOLERANCE_SECONDS
+	) {
+		return false;
+	}
+	const payload = `${issuedAtRaw}.${nonce}.${action}`;
+	const expectedSignature = await authFormSignature(secret, payload);
+	return constantTimeTextEquals(providedSignature, expectedSignature);
 }
 
 function audienceMatches(audience: string | string[] | undefined): boolean {
@@ -127,6 +175,16 @@ function validRequestedScopes(authRequest: AuthRequest): string[] | null {
 		if (scope !== MARKET_READ_SCOPE && scope !== OFFLINE_ACCESS_SCOPE) return null;
 	}
 	return [...requested];
+}
+
+function authorizationHeaders(): HeadersInit {
+	return {
+		"Content-Type": "text/html; charset=utf-8",
+		"Cache-Control": "no-store",
+		"Content-Security-Policy":
+			"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+		"Referrer-Policy": "no-referrer",
+	};
 }
 
 function authorizationPage(options: {
@@ -183,6 +241,27 @@ async function parseAuthorizationRequest(
 	}
 }
 
+async function renderAuthorizationError(options: {
+	action: string;
+	clientName: string;
+	scopes: string[];
+	secret: string | undefined;
+	error: string;
+	status: number;
+}): Promise<Response> {
+	const csrf = (await createAuthFormToken(options.action, options.secret)) ?? "";
+	return new Response(
+		authorizationPage({
+			action: options.action,
+			clientName: options.clientName,
+			scopes: options.scopes,
+			csrf,
+			error: options.error,
+		}),
+		{ status: options.status, headers: authorizationHeaders() },
+	);
+}
+
 async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Response> {
 	if (request.method !== "GET" && request.method !== "POST") {
 		return new Response("Method Not Allowed", { status: 405 });
@@ -194,49 +273,59 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 	const clientName = client?.clientName || "ChatGPT";
 	const url = new URL(request.url);
 	const action = `${url.pathname}${url.search}`;
+	const ownerSecret = env.COLLECTOR_MCP_CLIENT_TOKEN;
 
 	if (request.method === "GET") {
-		const csrf = randomBase64Url();
+		const csrf = await createAuthFormToken(action, ownerSecret);
+		if (!csrf) {
+			return renderAuthorizationError({
+				action,
+				clientName,
+				scopes,
+				secret: ownerSecret,
+				error: "服务端授权密钥尚未配置，请稍后重试。",
+				status: 503,
+			});
+		}
 		return new Response(authorizationPage({ action, clientName, scopes, csrf }), {
-			headers: {
-				"Content-Type": "text/html; charset=utf-8",
-				"Cache-Control": "no-store",
-				"Set-Cookie": `${CSRF_COOKIE}=${csrf}; HttpOnly; Secure; SameSite=Lax; Path=/authorize; Max-Age=600`,
-				"Content-Security-Policy":
-					"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-				"Referrer-Policy": "no-referrer",
-			},
+			headers: authorizationHeaders(),
 		});
 	}
 
 	const form = await request.formData();
 	const csrf = String(form.get("csrf") ?? "");
-	const cookieCsrf = parseCookies(request).get(CSRF_COOKIE) ?? "";
 	const ownerKey = String(form.get("owner_key") ?? "");
-	const csrfOk = csrf.length >= 20 && cookieCsrf.length >= 20 && csrf === cookieCsrf;
-	const ownerOk = await constantTimeSecretEquals(ownerKey, env.COLLECTOR_MCP_CLIENT_TOKEN);
-	if (!csrfOk || !ownerOk) {
-		const nextCsrf = randomBase64Url();
-		return new Response(
-			authorizationPage({
-				action,
-				clientName,
-				scopes,
-				csrf: nextCsrf,
-				error: "授权信息无效，请重试。",
-			}),
-			{
-				status: 401,
-				headers: {
-					"Content-Type": "text/html; charset=utf-8",
-					"Cache-Control": "no-store",
-					"Set-Cookie": `${CSRF_COOKIE}=${nextCsrf}; HttpOnly; Secure; SameSite=Lax; Path=/authorize; Max-Age=600`,
-					"Content-Security-Policy":
-						"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-					"Referrer-Policy": "no-referrer",
-				},
-			},
-		);
+	if (!ownerSecret) {
+		return renderAuthorizationError({
+			action,
+			clientName,
+			scopes,
+			secret: ownerSecret,
+			error: "服务端授权密钥尚未配置，请稍后重试。",
+			status: 503,
+		});
+	}
+	const csrfOk = await validateAuthFormToken(csrf, action, ownerSecret);
+	if (!csrfOk) {
+		return renderAuthorizationError({
+			action,
+			clientName,
+			scopes,
+			secret: ownerSecret,
+			error: "授权会话已过期或无效，请返回 ChatGPT 重新发起授权。",
+			status: 400,
+		});
+	}
+	const ownerOk = await constantTimeSecretEquals(ownerKey, ownerSecret);
+	if (!ownerOk) {
+		return renderAuthorizationError({
+			action,
+			clientName,
+			scopes,
+			secret: ownerSecret,
+			error: "授权密钥不匹配，请确认使用当前生效的授权密钥。",
+			status: 401,
+		});
 	}
 
 	const principal = env.COLLECTOR_MCP_CLIENT_ID?.trim() || "chatgpt-production";
@@ -252,7 +341,6 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 		headers: {
 			Location: redirectTo,
 			"Cache-Control": "no-store",
-			"Set-Cookie": `${CSRF_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/authorize; Max-Age=0`,
 		},
 	});
 }

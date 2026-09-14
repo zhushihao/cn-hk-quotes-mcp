@@ -93,7 +93,8 @@ test("owner secret stays out of rendered HTML, OAuth props and logs", async () =
 	const pageEnd = oauth.indexOf("async function parseAuthorizationRequest", pageStart);
 	const page = oauth.slice(pageStart, pageEnd);
 	assert.doesNotMatch(page, /COLLECTOR_MCP_CLIENT_TOKEN/);
-	assert.match(oauth, /constantTimeSecretEquals\(ownerKey, env\.COLLECTOR_MCP_CLIENT_TOKEN\)/);
+	assert.match(oauth, /const ownerSecret = env\.COLLECTOR_MCP_CLIENT_TOKEN/);
+	assert.match(oauth, /constantTimeSecretEquals\(ownerKey, ownerSecret\)/);
 	assert.doesNotMatch(oauth, /console\.(?:log|warn|error).*COLLECTOR_MCP_CLIENT_TOKEN/);
 	assert.doesNotMatch(oauth, /props:\s*\{[^}]*ownerKey/s);
 });
@@ -112,10 +113,21 @@ test("internal universe credential remains outside the OAuth adapter", async () 
 	assert.match(core.slice(internalStart, internalEnd), /PORTFOLIO_UNIVERSE_TOKEN/);
 });
 
-test("OAuth authorization is owner-approved, CSRF protected and market-read only", async () => {
+test("OAuth owner authorization uses a signed cookie-independent form token", async () => {
 	const oauth = await source("../src/oauth-entry.ts");
-	assert.match(oauth, /csrf === cookieCsrf/);
-	assert.match(oauth, /HttpOnly; Secure; SameSite=Lax/);
+	assert.match(oauth, /async function createAuthFormToken/);
+	assert.match(oauth, /async function validateAuthFormToken/);
+	assert.match(oauth, /name: "HMAC", hash: "SHA-256"/);
+	assert.match(oauth, /AUTH_FORM_MAX_AGE_SECONDS = 10 \* 60/);
+	assert.doesNotMatch(oauth, /CSRF_COOKIE/);
+	assert.doesNotMatch(oauth, /parseCookies/);
+	assert.doesNotMatch(oauth, /Set-Cookie/);
+	assert.match(oauth, /授权会话已过期或无效/);
+	assert.match(oauth, /授权密钥不匹配/);
+});
+
+test("OAuth authorization stays market-read only", async () => {
+	const oauth = await source("../src/oauth-entry.ts");
 	assert.match(oauth, /if \(!requested\.has\(MARKET_READ_SCOPE\)\) return null/);
 	assert.match(oauth, /scope: scopes/);
 	assert.match(oauth, /userId: OWNER_USER_ID/);
