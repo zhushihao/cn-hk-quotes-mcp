@@ -89,7 +89,10 @@ async function authFormSignature(secret: string, payload: string): Promise<strin
 	return base64UrlFromBytes(new Uint8Array(signature));
 }
 
-async function createAuthFormToken(action: string, secret: string | undefined): Promise<string | null> {
+async function createAuthFormToken(
+	action: string,
+	secret: string | undefined,
+): Promise<string | null> {
 	if (!secret) return null;
 	const issuedAt = Math.floor(Date.now() / 1000);
 	const nonce = randomBase64Url(18);
@@ -307,7 +310,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 		return renderAuthorizationError({
 			action,
 			clientName,
-			scopes,
+				scopes,
 			secret: ownerSecret,
 			error: "授权会话已过期或无效，请返回 ChatGPT 重新发起授权。",
 			status: 400,
@@ -318,7 +321,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 		return renderAuthorizationError({
 			action,
 			clientName,
-			scopes,
+				scopes,
 			secret: ownerSecret,
 			error: "授权密钥不匹配，请确认使用当前生效的授权密钥。",
 			status: 401,
