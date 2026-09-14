@@ -28,9 +28,6 @@ jobs:
       - name: Type check
         run: npm run type-check
       - name: Format OAuth migration files
-        run: |
-          npx oxfmt --write src/oauth-entry.ts src/oauth-diagnostics-entry.ts src/d1-oauth-kv.ts tests/oauth-entry.test.mjs
-          git diff -- src/oauth-entry.ts src/oauth-diagnostics-entry.ts src/d1-oauth-kv.ts tests/oauth-entry.test.mjs
-          git diff --exit-code -- src/oauth-entry.ts src/oauth-diagnostics-entry.ts src/d1-oauth-kv.ts tests/oauth-entry.test.mjs
+        run: npx oxfmt --check src/oauth-entry.ts src/oauth-diagnostics-entry.ts src/d1-oauth-kv.ts tests/oauth-entry.test.mjs
       - name: Lint OAuth migration files
         run: npx oxlint src/oauth-entry.ts src/oauth-diagnostics-entry.ts src/d1-oauth-kv.ts tests/oauth-entry.test.mjs
