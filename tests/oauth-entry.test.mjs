@@ -63,7 +63,10 @@ test("anonymous MCP remains quote-only compatible while OAuth bearer is validate
 	const mcpStart = oauth.indexOf("async function handleMcp");
 	const mcpEnd = oauth.indexOf("const defaultHandler", mcpStart);
 	const body = oauth.slice(mcpStart, mcpEnd);
-	assert.match(body, /if \(token === null\)[\s\S]*coreWorker\.fetch\(withAuthorization\(request, null\)/);
+	assert.match(
+		body,
+		/if \(token === null\)[\s\S]*coreWorker\.fetch\(withAuthorization\(request, null\)/,
+	);
 	assert.match(body, /OAUTH_PROVIDER\.unwrapToken<OAuthProps>\(token\)/);
 	assert.match(body, /summary\.scope\.includes\(MARKET_READ_SCOPE\)/);
 	assert.match(body, /tokenHasMarketRead\(summary\)/);
@@ -80,7 +83,10 @@ test("legacy static bearer cannot bypass OAuth at the public MCP route", async (
 	const mcpEnd = oauth.indexOf("const defaultHandler", mcpStart);
 	const body = oauth.slice(mcpStart, mcpEnd);
 	assert.match(body, /unwrapToken<OAuthProps>\(token\)/);
-	assert.doesNotMatch(body, /request\.headers\.get\("Authorization"\) === `Bearer \$\{env\.COLLECTOR_MCP_CLIENT_TOKEN\}`/);
+	assert.doesNotMatch(
+		body,
+		/request\.headers\.get\("Authorization"\) === `Bearer \$\{env\.COLLECTOR_MCP_CLIENT_TOKEN\}`/,
+	);
 	assert.doesNotMatch(body, /PORTFOLIO_UNIVERSE_TOKEN/);
 });
 
