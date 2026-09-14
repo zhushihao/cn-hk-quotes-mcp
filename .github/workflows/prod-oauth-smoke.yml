@@ -43,6 +43,7 @@ jobs:
                   assert auth.get("token_endpoint") == f"{origin}/oauth/token", auth
                   assert auth.get("registration_endpoint") == f"{origin}/oauth/register", auth
                   assert "S256" in auth.get("code_challenge_methods_supported", []), auth
+                  assert "authorization_response_iss_parameter_supported" not in auth, auth
                   scopes = set(auth.get("scopes_supported", []))
                   assert {"market:read", "offline_access"}.issubset(scopes), auth
 
@@ -51,6 +52,7 @@ jobs:
                   assert "market:read" in protected.get("scopes_supported", []), protected
 
                   print("PROD_OAUTH_DISCOVERY_OK")
+                  print("PROD_OAUTH_ISS_ADVERTISEMENT_COMPAT_OK")
                   break
               except Exception as exc:
                   print(f"attempt {attempt}/30: {type(exc).__name__}: {exc}")
