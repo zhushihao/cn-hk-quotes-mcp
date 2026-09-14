@@ -9,8 +9,11 @@ async function source(path) {
 test("OAuth state is stored in an isolated D1 table instead of account-wide Workers KV", async () => {
 	const wrangler = await source("../wrangler.jsonc");
 	const oauth = await source("../src/oauth-entry.ts");
+	const diagnostics = await source("../src/oauth-diagnostics-entry.ts");
 	const adapter = await source("../src/d1-oauth-kv.ts");
-	assert.match(wrangler, /"main": "src\/oauth-entry\.ts"/);
+	assert.match(wrangler, /"main": "src\/oauth-diagnostics-entry\.ts"/);
+	assert.match(diagnostics, /import oauthWorker from "\.\/oauth-entry"/);
+	assert.match(diagnostics, /oauthWorker\.fetch\(request, env, ctx\)/);
 	assert.match(wrangler, /"binding": "RESEARCH_REPLICA"/);
 	assert.match(wrangler, /"binding": "PORTFOLIO_UNIVERSE"/);
 	assert.doesNotMatch(wrangler, /"binding": "OAUTH_KV"/);
@@ -60,10 +63,7 @@ test("anonymous MCP remains quote-only compatible while OAuth bearer is validate
 	const mcpStart = oauth.indexOf("async function handleMcp");
 	const mcpEnd = oauth.indexOf("const defaultHandler", mcpStart);
 	const body = oauth.slice(mcpStart, mcpEnd);
-	assert.match(
-		body,
-		/if \(token === null\)[\s\S]*coreWorker\.fetch\(withAuthorization\(request, null\)/,
-	);
+	assert.match(body, /if \(token === null\)[\s\S]*coreWorker\.fetch\(withAuthorization\(request, null\)/);
 	assert.match(body, /OAUTH_PROVIDER\.unwrapToken<OAuthProps>\(token\)/);
 	assert.match(body, /summary\.scope\.includes\(MARKET_READ_SCOPE\)/);
 	assert.match(body, /tokenHasMarketRead\(summary\)/);
@@ -80,10 +80,7 @@ test("legacy static bearer cannot bypass OAuth at the public MCP route", async (
 	const mcpEnd = oauth.indexOf("const defaultHandler", mcpStart);
 	const body = oauth.slice(mcpStart, mcpEnd);
 	assert.match(body, /unwrapToken<OAuthProps>\(token\)/);
-	assert.doesNotMatch(
-		body,
-		/request\.headers\.get\("Authorization"\) === `Bearer \$\{env\.COLLECTOR_MCP_CLIENT_TOKEN\}`/,
-	);
+	assert.doesNotMatch(body, /request\.headers\.get\("Authorization"\) === `Bearer \$\{env\.COLLECTOR_MCP_CLIENT_TOKEN\}`/);
 	assert.doesNotMatch(body, /PORTFOLIO_UNIVERSE_TOKEN/);
 });
 
