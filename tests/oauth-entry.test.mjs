@@ -6,11 +6,24 @@ async function source(path) {
 	return readFile(new URL(path, import.meta.url), "utf8");
 }
 
-test("wrangler routes production through OAuth entrypoint with isolated OAuth KV", async () => {
+test("wrangler routes OAuth through the proven private KV binding instead of broken auto-provisioning", async () => {
 	const wrangler = await source("../wrangler.jsonc");
+	const oauth = await source("../src/oauth-entry.ts");
 	assert.match(wrangler, /"main": "src\/oauth-entry\.ts"/);
-	assert.match(wrangler, /"binding": "OAUTH_KV"/);
 	assert.match(wrangler, /"binding": "PORTFOLIO_UNIVERSE"/);
+	assert.doesNotMatch(wrangler, /"binding": "OAUTH_KV"/);
+	assert.match(oauth, /OAUTH_KV: env\.PORTFOLIO_UNIVERSE/);
+	assert.match(oauth, /PORTFOLIO_UNIVERSE KV binding is required for OAuth storage/);
+});
+
+test("shared physical KV keeps QuantPro LIVE keys on a disjoint live-portfolio prefix", async () => {
+	const liveUniverse = await source("../src/live-universe.ts");
+	const portfolioStatus = await source("../src/portfolio-status.ts");
+	const portfolioDelta = await source("../src/portfolio-delta.ts");
+	assert.match(liveUniverse, /LIVE_UNIVERSE_KV_KEY = "live-portfolio\/current"/);
+	assert.match(portfolioStatus, /PORTFOLIO_STATUS_KV_KEY = "live-portfolio\/status"/);
+	assert.match(portfolioDelta, /PORTFOLIO_UNIVERSE_BASELINE_KV_KEY = "live-portfolio\/private\//);
+	assert.match(portfolioDelta, /PORTFOLIO_UNIVERSE_DELTA_KV_KEY = "live-portfolio\/private\//);
 });
 
 test("OAuth discovery advertises market:read and offline refresh support with PKCE S256 only", async () => {

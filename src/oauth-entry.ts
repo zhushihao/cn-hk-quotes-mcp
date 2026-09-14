@@ -19,10 +19,24 @@ type OAuthProps = {
 	principal: string;
 	scopes: string[];
 };
-type Env = CoreEnv & {
+type OAuthEnv = CoreEnv & {
 	OAUTH_KV: KVNamespace;
 	OAUTH_PROVIDER: OAuthHelpers;
 };
+
+/**
+ * The production PORTFOLIO_UNIVERSE namespace is an existing, proven private KV binding.
+ * OAuthProvider owns disjoint key prefixes (`client:`, `grant:`, `token:` and EMA keys), while
+ * the LIVE control plane owns only `live-portfolio/...` keys. Reusing the physical namespace
+ * avoids relying on a second auto-provisioned binding that was present in discovery metadata
+ * but threw 1101 on every write. Credentials and authorization semantics remain independent.
+ */
+function oauthRuntimeEnv(env: CoreEnv): OAuthEnv {
+	if (!env.PORTFOLIO_UNIVERSE) {
+		throw new Error("PORTFOLIO_UNIVERSE KV binding is required for OAuth storage");
+	}
+	return { ...env, OAUTH_KV: env.PORTFOLIO_UNIVERSE } as OAuthEnv;
+}
 
 function escapeHtml(value: string): string {
 	return value
@@ -156,7 +170,7 @@ code{background:#f1f2f4;padding:2px 5px;border-radius:4px}
 
 async function parseAuthorizationRequest(
 	request: Request,
-	env: Env,
+	env: OAuthEnv,
 ): Promise<AuthRequest | Response> {
 	try {
 		const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
@@ -169,7 +183,7 @@ async function parseAuthorizationRequest(
 	}
 }
 
-async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Response> {
 	if (request.method !== "GET" && request.method !== "POST") {
 		return new Response("Method Not Allowed", { status: 405 });
 	}
@@ -254,7 +268,11 @@ function tokenHasMarketRead(summary: TokenSummary<OAuthProps>): boolean {
 	);
 }
 
-async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function handleMcp(
+	request: Request,
+	env: OAuthEnv,
+	ctx: ExecutionContext,
+): Promise<Response> {
 	const token = bearerToken(request);
 	if (token === null) {
 		// Hybrid contract: anonymous MCP remains available, but core projects it to quote-only.
@@ -282,7 +300,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
 	return coreWorker.fetch(forwarded, env, ctx);
 }
 
-const defaultHandler: ExportedHandler<Env> = {
+const defaultHandler: ExportedHandler<OAuthEnv> = {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		if (url.pathname === "/authorize") return handleAuthorize(request, env);
@@ -297,7 +315,7 @@ const unusedProtectedHandler = {
 	},
 };
 
-const oauthProvider = new OAuthProvider<Env>({
+const oauthProvider = new OAuthProvider<OAuthEnv>({
 	// `/mcp` intentionally remains in the default handler so anonymous quote-only calls keep
 	// working. OAuth bearer validation for `/mcp` is performed with OAUTH_PROVIDER.unwrapToken().
 	// This private sentinel route satisfies OAuthProvider's required api-handler configuration.
@@ -336,16 +354,17 @@ const oauthProvider = new OAuthProvider<Env>({
 });
 
 export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		return oauthProvider.fetch(request, env, ctx);
+	fetch(request: Request, env: CoreEnv, ctx: ExecutionContext) {
+		return oauthProvider.fetch(request, oauthRuntimeEnv(env), ctx);
 	},
-	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+	async scheduled(controller: ScheduledController, env: CoreEnv, ctx: ExecutionContext) {
+		const runtimeEnv = oauthRuntimeEnv(env);
 		await coreWorker.scheduled(controller, env);
 		ctx.waitUntil(
 			oauthProvider
-				.purgeExpiredData(env, { batchSize: 25 })
+				.purgeExpiredData(runtimeEnv, { batchSize: 25 })
 				.then(() => undefined)
 				.catch(() => undefined),
 		);
 	},
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<CoreEnv>;

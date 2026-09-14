@@ -16,9 +16,6 @@
 		{
 			"binding": "PORTFOLIO_UNIVERSE",
 		},
-		{
-			"binding": "OAUTH_KV",
-		},
 	],
 	"d1_databases": [
 		{
