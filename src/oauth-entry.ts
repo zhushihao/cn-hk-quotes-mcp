@@ -268,7 +268,11 @@ function tokenHasMarketRead(summary: TokenSummary<OAuthProps>): boolean {
 	);
 }
 
-async function handleMcp(request: Request, env: OAuthEnv, ctx: ExecutionContext): Promise<Response> {
+async function handleMcp(
+	request: Request,
+	env: OAuthEnv,
+	ctx: ExecutionContext,
+): Promise<Response> {
 	const token = bearerToken(request);
 	if (token === null) {
 		// Hybrid contract: anonymous MCP remains available, but core projects it to quote-only.
