@@ -8,6 +8,7 @@ type DiagnosticDetail = Record<string, string | number | boolean | null>;
 
 const TABLE = "oauth_diag_v1";
 const MAX_ROWS = 100;
+const OAUTH_SERVER_METADATA_PATH = "/.well-known/oauth-authorization-server";
 
 async function ensureTable(db: D1Database): Promise<void> {
 	await db
@@ -112,6 +113,36 @@ function authorizeResponseDetail(response: Response): DiagnosticDetail {
 	}
 }
 
+async function applyIssuerAdvertisementCompat(
+	request: Request,
+	response: Response,
+): Promise<Response> {
+	const url = new URL(request.url);
+	if (
+		request.method !== "GET" ||
+		url.pathname !== OAUTH_SERVER_METADATA_PATH ||
+		!response.ok
+	) {
+		return response;
+	}
+	try {
+		const metadata = (await response.clone().json()) as Record<string, unknown>;
+		if (!("authorization_response_iss_parameter_supported" in metadata)) return response;
+		delete metadata.authorization_response_iss_parameter_supported;
+		const headers = new Headers(response.headers);
+		headers.delete("Content-Length");
+		headers.set("Content-Type", "application/json; charset=utf-8");
+		headers.set("Cache-Control", "no-store");
+		return new Response(JSON.stringify(metadata), {
+			status: response.status,
+			statusText: response.statusText,
+			headers,
+		});
+	} catch {
+		return response;
+	}
+}
+
 async function readLatest(env: Env): Promise<Response> {
 	const db = env.RESEARCH_REPLICA;
 	if (!db) return Response.json({ available: false }, { status: 503 });
@@ -156,6 +187,7 @@ export default {
 		let response: Response;
 		try {
 			response = await oauthWorker.fetch(request, env, ctx);
+			response = await applyIssuerAdvertisementCompat(request, response);
 		} catch (error) {
 			if (tokenRequest || authorizePost || mcpRequest) {
 				ctx.waitUntil(
