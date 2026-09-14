@@ -29,8 +29,8 @@ type OAuthEnv = CoreEnv & {
 /**
  * OAuth state is intentionally kept out of Workers KV. The account-wide free-tier KV write
  * allowance is shared with the LIVE control plane and can be exhausted independently of OAuth.
- * A KV-compatible adapter backed by the Collector's private D1 database gives OAuth its own
- * table and quota while leaving PORTFOLIO_UNIVERSE and PORTFOLIO_UNIVERSE_TOKEN untouched.
+ * The adapter uses a separate D1 table, NOT a separate D1 quota: Research and OAuth still
+ * share RESEARCH_REPLICA. PORTFOLIO_UNIVERSE and PORTFOLIO_UNIVERSE_TOKEN are untouched.
  */
 function oauthRuntimeEnv(env: CoreEnv): OAuthEnv {
 	if (!env.RESEARCH_REPLICA) {
@@ -137,18 +137,17 @@ function resourceMetadataUrl(request: Request): string {
 }
 
 function oauthChallenge(request: Request, error = "invalid_token", status = 401): Response {
-	const challenge = [
-		"Bearer",
+	const parameters = [
 		`resource_metadata="${resourceMetadataUrl(request)}"`,
 		`scope="${MARKET_READ_SCOPE}"`,
 		`error="${error}"`,
-	].join(" ");
+	].join(", ");
 	return new Response(JSON.stringify({ error }), {
 		status,
 		headers: {
 			"Content-Type": "application/json; charset=utf-8",
 			"Cache-Control": "no-store",
-			"WWW-Authenticate": challenge,
+			"WWW-Authenticate": `Bearer ${parameters}`,
 		},
 	});
 }
@@ -177,12 +176,28 @@ function validRequestedScopes(authRequest: AuthRequest): string[] | null {
 	return [...requested];
 }
 
-function authorizationHeaders(): HeadersInit {
+/**
+ * Only call with redirectUri returned by OAuthProvider.parseAuthRequest: the provider has
+ * already checked the registered client's exact callback. Chromium applies form-action to
+ * the cross-origin redirect after the form POST as well as the initial same-origin POST.
+ * Include that validated callback origin, never a wildcard or an unvalidated query value.
+ * The callback URI is revalidated by completeAuthorization before a code is created.
+ */
+function authorizationHeaders(verifiedRedirectUri: string): HeadersInit {
+	const callback = new URL(verifiedRedirectUri);
+	const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(callback.hostname);
+	if (
+		(callback.protocol !== "https:" && !(callback.protocol === "http:" && loopback)) ||
+		callback.username ||
+		callback.password
+	) {
+		throw new Error("Unsupported verified OAuth callback origin");
+	}
 	return {
 		"Content-Type": "text/html; charset=utf-8",
 		"Cache-Control": "no-store",
 		"Content-Security-Policy":
-			"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+			`default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callback.origin}; base-uri 'none'; frame-ancestors 'none'`,
 		"Referrer-Policy": "no-referrer",
 	};
 }
@@ -246,6 +261,7 @@ async function renderAuthorizationError(options: {
 	clientName: string;
 	scopes: string[];
 	secret: string | undefined;
+	verifiedRedirectUri: string;
 	error: string;
 	status: number;
 }): Promise<Response> {
@@ -258,7 +274,7 @@ async function renderAuthorizationError(options: {
 			csrf,
 			error: options.error,
 		}),
-		{ status: options.status, headers: authorizationHeaders() },
+		{ status: options.status, headers: authorizationHeaders(options.verifiedRedirectUri) },
 	);
 }
 
@@ -270,10 +286,11 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 	if (parsed instanceof Response) return parsed;
 	const scopes = validRequestedScopes(parsed)!;
 	const client = await env.OAUTH_PROVIDER.lookupClient(parsed.clientId);
-	const clientName = client?.clientName || "ChatGPT";
+	const clientName = client?.clientName || "OAuth 客户端";
 	const url = new URL(request.url);
 	const action = `${url.pathname}${url.search}`;
 	const ownerSecret = env.COLLECTOR_MCP_CLIENT_TOKEN;
+	const verifiedRedirectUri = parsed.redirectUri;
 
 	if (request.method === "GET") {
 		const csrf = await createAuthFormToken(action, ownerSecret);
@@ -283,12 +300,13 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 				clientName,
 				scopes,
 				secret: ownerSecret,
+				verifiedRedirectUri,
 				error: "服务端授权密钥尚未配置，请稍后重试。",
 				status: 503,
 			});
 		}
 		return new Response(authorizationPage({ action, clientName, scopes, csrf }), {
-			headers: authorizationHeaders(),
+			headers: authorizationHeaders(verifiedRedirectUri),
 		});
 	}
 
@@ -301,6 +319,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 			clientName,
 			scopes,
 			secret: ownerSecret,
+			verifiedRedirectUri,
 			error: "服务端授权密钥尚未配置，请稍后重试。",
 			status: 503,
 		});
@@ -312,6 +331,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 			clientName,
 			scopes,
 			secret: ownerSecret,
+			verifiedRedirectUri,
 			error: "授权会话已过期或无效，请返回 ChatGPT 重新发起授权。",
 			status: 400,
 		});
@@ -323,6 +343,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 			clientName,
 			scopes,
 			secret: ownerSecret,
+			verifiedRedirectUri,
 			error: "授权密钥不匹配，请确认使用当前生效的授权密钥。",
 			status: 401,
 		});
@@ -336,11 +357,13 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
 		scope: scopes,
 		props: { principal, scopes } satisfies OAuthProps,
 	});
+	// Explicit POST -> GET prevents forwarding the owner-key body to the callback.
 	return new Response(null, {
-		status: 302,
+		status: 303,
 		headers: {
 			Location: redirectTo,
 			"Cache-Control": "no-store",
+			"Referrer-Policy": "no-referrer",
 		},
 	});
 }
