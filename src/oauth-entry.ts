@@ -54,7 +54,10 @@ async function sha256(value: string): Promise<Uint8Array> {
 	return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
 }
 
-async function constantTimeSecretEquals(candidate: string, configured: string | undefined): Promise<boolean> {
+async function constantTimeSecretEquals(
+	candidate: string,
+	configured: string | undefined,
+): Promise<boolean> {
 	if (!configured || !candidate || candidate.length > MAX_OWNER_KEY_LENGTH) return false;
 	const [left, right] = await Promise.all([sha256(candidate), sha256(configured)]);
 	let difference = 0;
@@ -119,10 +122,10 @@ function authorizationPage(options: {
 	csrf: string;
 	error?: string;
 }): string {
-	const scopeList = options.scopes.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`).join("");
-	const error = options.error
-		? `<p class=\"error\">${escapeHtml(options.error)}</p>`
-		: "";
+	const scopeList = options.scopes
+		.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`)
+		.join("");
+	const error = options.error ? `<p class=\"error\">${escapeHtml(options.error)}</p>` : "";
 	return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -286,7 +289,7 @@ const defaultHandler: ExportedHandler<Env> = {
 	},
 };
 
-const unusedProtectedHandler: ExportedHandler<Env> = {
+const unusedProtectedHandler = {
 	fetch() {
 		return new Response("Not Found", { status: 404 });
 	},
@@ -337,7 +340,10 @@ export default {
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
 		await coreWorker.scheduled(controller, env);
 		ctx.waitUntil(
-			oauthProvider.purgeExpiredData(env, { batchSize: 25 }).then(() => undefined).catch(() => undefined),
+			oauthProvider
+				.purgeExpiredData(env, { batchSize: 25 })
+				.then(() => undefined)
+				.catch(() => undefined),
 		);
 	},
 } satisfies ExportedHandler<Env>;
