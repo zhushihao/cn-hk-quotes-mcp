@@ -100,3 +100,19 @@ jobs:
                   if attempt == 30:
                       raise RuntimeError(f"OAuth DCR storage probe failed after deployment wait: HTTP {exc.code}: {body[:500]}") from exc
                   time.sleep(10)
+
+      - name: Print sanitized OAuth stage trace
+        shell: python
+        run: |
+          import json
+          import urllib.request
+
+          url = "https://cn-hk-quotes-mcp.zhushihao710.workers.dev/__oauth_diag/latest"
+          request = urllib.request.Request(
+              url,
+              headers={"Accept": "application/json", "User-Agent": "quantpro-oauth-diag-reader/1"},
+          )
+          with urllib.request.urlopen(request, timeout=15) as response:
+              body = json.loads(response.read().decode("utf-8"))
+          print("SANITIZED_OAUTH_TRACE")
+          print(json.dumps(body, indent=2, sort_keys=True))
