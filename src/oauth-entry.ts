@@ -77,9 +77,9 @@ function resourceMetadataUrl(request: Request): string {
 function oauthChallenge(request: Request, error = "invalid_token", status = 401): Response {
 	const challenge = [
 		"Bearer",
-		`resource_metadata=\"${resourceMetadataUrl(request)}\"`,
-		`scope=\"${MARKET_READ_SCOPE}\"`,
-		`error=\"${error}\"`,
+		`resource_metadata="${resourceMetadataUrl(request)}"`,
+		`scope="${MARKET_READ_SCOPE}"`,
+		`error="${error}"`,
 	].join(" ");
 	return new Response(JSON.stringify({ error }), {
 		status,
@@ -125,7 +125,7 @@ function authorizationPage(options: {
 	const scopeList = options.scopes
 		.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`)
 		.join("");
-	const error = options.error ? `<p class=\"error\">${escapeHtml(options.error)}</p>` : "";
+	const error = options.error ? `<p class="error">${escapeHtml(options.error)}</p>` : "";
 	return `<!doctype html>
 <html lang="zh-CN">
 <head>
