@@ -118,11 +118,7 @@ async function applyIssuerAdvertisementCompat(
 	response: Response,
 ): Promise<Response> {
 	const url = new URL(request.url);
-	if (
-		request.method !== "GET" ||
-		url.pathname !== OAUTH_SERVER_METADATA_PATH ||
-		!response.ok
-	) {
+	if (request.method !== "GET" || url.pathname !== OAUTH_SERVER_METADATA_PATH || !response.ok) {
 		return response;
 	}
 	try {
