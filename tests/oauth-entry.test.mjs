@@ -6,24 +6,40 @@ async function source(path) {
 	return readFile(new URL(path, import.meta.url), "utf8");
 }
 
-test("wrangler routes OAuth through the proven private KV binding instead of broken auto-provisioning", async () => {
+test("OAuth state is stored in an isolated D1 table instead of account-wide Workers KV", async () => {
 	const wrangler = await source("../wrangler.jsonc");
 	const oauth = await source("../src/oauth-entry.ts");
+	const adapter = await source("../src/d1-oauth-kv.ts");
 	assert.match(wrangler, /"main": "src\/oauth-entry\.ts"/);
+	assert.match(wrangler, /"binding": "RESEARCH_REPLICA"/);
 	assert.match(wrangler, /"binding": "PORTFOLIO_UNIVERSE"/);
 	assert.doesNotMatch(wrangler, /"binding": "OAUTH_KV"/);
-	assert.match(oauth, /OAUTH_KV: env\.PORTFOLIO_UNIVERSE/);
-	assert.match(oauth, /PORTFOLIO_UNIVERSE KV binding is required for OAuth storage/);
+	assert.match(oauth, /OAUTH_KV: createD1OAuthKv\(env\.RESEARCH_REPLICA\)/);
+	assert.match(oauth, /RESEARCH_REPLICA D1 binding is required for OAuth storage/);
+	assert.doesNotMatch(oauth, /OAUTH_KV: env\.PORTFOLIO_UNIVERSE/);
+	assert.match(adapter, /OAUTH_TABLE = "oauth_kv_v1"/);
+	assert.match(adapter, /ON CONFLICT\(kv_key\) DO UPDATE/);
+	assert.match(adapter, /list_complete:/);
 });
 
-test("shared physical KV keeps QuantPro LIVE keys on a disjoint live-portfolio prefix", async () => {
+test("LIVE universe remains on its original KV keyspace and is not used as OAuth persistence", async () => {
+	const oauth = await source("../src/oauth-entry.ts");
 	const liveUniverse = await source("../src/live-universe.ts");
 	const portfolioStatus = await source("../src/portfolio-status.ts");
 	const portfolioDelta = await source("../src/portfolio-delta.ts");
+	assert.doesNotMatch(oauth, /createD1OAuthKv\(env\.PORTFOLIO_UNIVERSE/);
 	assert.match(liveUniverse, /LIVE_UNIVERSE_KV_KEY = "live-portfolio\/current"/);
 	assert.match(portfolioStatus, /PORTFOLIO_STATUS_KV_KEY = "live-portfolio\/status"/);
 	assert.match(portfolioDelta, /PORTFOLIO_UNIVERSE_BASELINE_KV_KEY = "live-portfolio\/private\//);
 	assert.match(portfolioDelta, /PORTFOLIO_UNIVERSE_DELTA_KV_KEY = "live-portfolio\/private\//);
+});
+
+test("temporary production storage diagnostic is removed after identifying the KV daily quota root cause", async () => {
+	const oauth = await source("../src/oauth-entry.ts");
+	assert.doesNotMatch(oauth, /STORAGE_SMOKE_USER_AGENT/);
+	assert.doesNotMatch(oauth, /probePortfolioUniverseWrite/);
+	assert.doesNotMatch(oauth, /PORTFOLIO_UNIVERSE_DIRECT/);
+	assert.doesNotMatch(oauth, /OAUTH_PROVIDER_DCR/);
 });
 
 test("OAuth discovery advertises market:read and offline refresh support with PKCE S256 only", async () => {
@@ -84,7 +100,12 @@ test("owner secret stays out of rendered HTML, OAuth props and logs", async () =
 
 test("internal universe credential remains outside the OAuth adapter", async () => {
 	const oauth = await source("../src/oauth-entry.ts");
-	assert.doesNotMatch(oauth, /PORTFOLIO_UNIVERSE_TOKEN/);
+	const runtimeStart = oauth.indexOf("function oauthRuntimeEnv");
+	const runtimeEnd = oauth.indexOf("function escapeHtml", runtimeStart);
+	const runtime = oauth.slice(runtimeStart, runtimeEnd);
+	assert.match(runtime, /createD1OAuthKv\(env\.RESEARCH_REPLICA\)/);
+	assert.doesNotMatch(runtime, /PORTFOLIO_UNIVERSE_TOKEN/);
+	assert.doesNotMatch(runtime, /env\.PORTFOLIO_UNIVERSE/);
 	const core = await source("../src/index.ts");
 	const internalStart = core.indexOf("function requestInternalUniverseStatus");
 	const internalEnd = core.indexOf("function requestMcpMarketReadStatus", internalStart);

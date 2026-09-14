@@ -4,6 +4,7 @@ import OAuthProvider, {
 	type TokenSummary,
 } from "@cloudflare/workers-oauth-provider";
 
+import { createD1OAuthKv } from "./d1-oauth-kv";
 import coreWorker from "./index";
 
 const ORIGIN = "https://cn-hk-quotes-mcp.zhushihao710.workers.dev";
@@ -13,7 +14,6 @@ const OFFLINE_ACCESS_SCOPE = "offline_access";
 const OWNER_USER_ID = "quantpro-owner";
 const CSRF_COOKIE = "qp_oauth_csrf";
 const MAX_OWNER_KEY_LENGTH = 512;
-const STORAGE_SMOKE_USER_AGENT = "quantpro-prod-oauth-storage-smoke/1";
 
 type CoreEnv = Parameters<typeof coreWorker.fetch>[1];
 type OAuthProps = {
@@ -25,56 +25,17 @@ type OAuthEnv = CoreEnv & {
 	OAUTH_PROVIDER: OAuthHelpers;
 };
 
-type StorageProbeResult = {
-	ok: boolean;
-	stage: "PORTFOLIO_UNIVERSE_DIRECT" | "OAUTH_PROVIDER_DCR";
-	error_name?: string;
-	error_message?: string;
-};
-
+/**
+ * OAuth state is intentionally kept out of Workers KV. The account-wide free-tier KV write
+ * allowance is shared with the LIVE control plane and can be exhausted independently of OAuth.
+ * A KV-compatible adapter backed by the Collector's private D1 database gives OAuth its own
+ * table and quota while leaving PORTFOLIO_UNIVERSE and PORTFOLIO_UNIVERSE_TOKEN untouched.
+ */
 function oauthRuntimeEnv(env: CoreEnv): OAuthEnv {
-	if (!env.PORTFOLIO_UNIVERSE) {
-		throw new Error("PORTFOLIO_UNIVERSE KV binding is required for OAuth storage");
+	if (!env.RESEARCH_REPLICA) {
+		throw new Error("RESEARCH_REPLICA D1 binding is required for OAuth storage");
 	}
-	return { ...env, OAUTH_KV: env.PORTFOLIO_UNIVERSE } as OAuthEnv;
-}
-
-function diagnosticError(error: unknown): Pick<StorageProbeResult, "error_name" | "error_message"> {
-	if (error instanceof Error) {
-		return {
-			error_name: error.name.slice(0, 80),
-			error_message: error.message.replace(/[\r\n]+/gu, " ").slice(0, 300),
-		};
-	}
-	return { error_name: "UnknownError", error_message: String(error).slice(0, 300) };
-}
-
-async function probePortfolioUniverseWrite(env: CoreEnv): Promise<StorageProbeResult> {
-	if (!env.PORTFOLIO_UNIVERSE) {
-		return {
-			ok: false,
-			stage: "PORTFOLIO_UNIVERSE_DIRECT",
-			error_name: "MissingBinding",
-			error_message: "PORTFOLIO_UNIVERSE is not bound",
-		};
-	}
-	const key = `oauth-health:${crypto.randomUUID()}`;
-	try {
-		await env.PORTFOLIO_UNIVERSE.put(key, "1", { expirationTtl: 60 });
-		const stored = await env.PORTFOLIO_UNIVERSE.get(key);
-		await env.PORTFOLIO_UNIVERSE.delete(key);
-		if (stored !== "1") {
-			return {
-				ok: false,
-				stage: "PORTFOLIO_UNIVERSE_DIRECT",
-				error_name: "ReadAfterWriteMismatch",
-				error_message: "KV read-after-write did not return the probe value",
-			};
-		}
-		return { ok: true, stage: "PORTFOLIO_UNIVERSE_DIRECT" };
-	} catch (error) {
-		return { ok: false, stage: "PORTFOLIO_UNIVERSE_DIRECT", ...diagnosticError(error) };
-	}
+	return { ...env, OAUTH_KV: createD1OAuthKv(env.RESEARCH_REPLICA) } as OAuthEnv;
 }
 
 function escapeHtml(value: string): string {
@@ -386,31 +347,8 @@ const oauthProvider = new OAuthProvider<OAuthEnv>({
 });
 
 export default {
-	async fetch(request: Request, env: CoreEnv, ctx: ExecutionContext) {
-		const runtimeEnv = oauthRuntimeEnv(env);
-		const isStorageSmoke =
-			new URL(request.url).pathname === "/oauth/register" &&
-			request.method === "POST" &&
-			request.headers.get("User-Agent") === STORAGE_SMOKE_USER_AGENT;
-		if (isStorageSmoke) {
-			const directProbe = await probePortfolioUniverseWrite(env);
-			if (!directProbe.ok) {
-				return Response.json(directProbe, { status: 500 });
-			}
-			try {
-				return await oauthProvider.fetch(request, runtimeEnv, ctx);
-			} catch (error) {
-				return Response.json(
-					{
-						ok: false,
-						stage: "OAUTH_PROVIDER_DCR",
-						...diagnosticError(error),
-					} satisfies StorageProbeResult,
-					{ status: 500 },
-				);
-			}
-		}
-		return oauthProvider.fetch(request, runtimeEnv, ctx);
+	fetch(request: Request, env: CoreEnv, ctx: ExecutionContext) {
+		return oauthProvider.fetch(request, oauthRuntimeEnv(env), ctx);
 	},
 	async scheduled(controller: ScheduledController, env: CoreEnv, ctx: ExecutionContext) {
 		const runtimeEnv = oauthRuntimeEnv(env);
