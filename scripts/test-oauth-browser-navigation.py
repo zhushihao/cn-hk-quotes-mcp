@@ -1,10 +1,9 @@
-"""Browser navigation regression. Only synthetic credentials and loopback servers.
+"""Historical CSP counterexample using real Chromium and synthetic loopback servers.
 
-This tests the CSP shipped in oauth-entry.ts against actual Chromium navigation.
-It is NOT ChatGPT or ChatGPT Automation acceptance. No production secrets are read.
+The actual Worker page is tested separately by test-oauth-runtime.py.
+This is NOT ChatGPT or ChatGPT Automation acceptance. No production secrets are read.
 """
 import json
-import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,12 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from playwright.sync_api import sync_playwright
 
-
 source = Path("src/oauth-entry.ts").read_text(encoding="utf-8")
-match = re.search(r'"Content-Security-Policy"\s*:\s*("(?:[^"\\]|\\.)*")', source)
-if not match:
-    raise RuntimeError("Could not extract the real authorization page CSP")
-current_policy = json.loads(match.group(1))
 original_policy = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 callback_hits = []
 post_hits = []
@@ -133,7 +127,7 @@ finally:
 output = {
     "test_type": "real Chromium, isolated synthetic servers; NOT real ChatGPT acceptance",
     "browser_version": browser_version,
-    "current_source_has_self_only_form_action": "form-action 'self';" in current_policy,
+    "current_source_has_self_only_form_action": "form-action 'self';" in source,
     "results": results,
 }
 Path("oauth-browser-navigation-results.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
