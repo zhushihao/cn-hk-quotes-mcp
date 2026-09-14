@@ -1,9 +1,8 @@
-"""Run the actual Worker locally with an isolated D1/KV/R2 and synthetic identities.
+"""Real Worker/D1/Chromium integration with isolated, synthetic credentials.
 
-No Cloudflare account, real owner key, LIVE records or ChatGPT credentials are used.
-A real Chromium follows the actual consent page; only the final ChatGPT callback is
-intercepted with a synthetic receiver. This is NOT real ChatGPT/Automation acceptance.
-Only named assertions and boolean evidence are printed or saved as artifacts.
+The browser visits the real consent page and an actual cross-origin loopback
+callback server. No ChatGPT account or production credential is used. This does
+NOT satisfy real ChatGPT or real scheduled Automation acceptance.
 """
 import base64
 import hashlib
@@ -14,22 +13,41 @@ import re
 import secrets
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
 RESOURCE = "https://cn-hk-quotes-mcp.zhushihao710.workers.dev/mcp"
-CALLBACK = "https://chatgpt.com/connector/oauth/quantpro-isolated-e2e"
 BASE = "http://127.0.0.1:18787"
-OWNER = secrets.token_hex(32)
-INTERNAL = secrets.token_hex(32)
-INGEST = secrets.token_hex(32)
-REPORT = {"test_type": "isolated real Workerd + real D1 + real Chromium; synthetic callback; NOT ChatGPT acceptance", "checks": []}
+OWNER, INTERNAL, INGEST = (secrets.token_hex(32) for _ in range(3))
+REPORT = {"test_type": "isolated real Workerd + D1 + Chromium + loopback callback; NOT ChatGPT acceptance", "checks": [], "all_pass": False}
+CALLBACK_HITS = []
+
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        CALLBACK_HITS.append({"method": "GET", "body_length": 0, "query": urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<h1>Isolated callback received</h1>")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        CALLBACK_HITS.append({"method": "POST", "body_length": length, "query": {}})
+        self.send_response(400)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -38,10 +56,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 opener = urllib.request.build_opener(NoRedirect())
+CALLBACK = ""
 
 
-def check(name, passed, **safe_details):
-    result = {"check": name, "pass": bool(passed), **safe_details}
+def check(name, passed, **details):
+    result = {"check": name, "pass": bool(passed), **details}
     REPORT["checks"].append(result)
     print(json.dumps(result), flush=True)
     if not passed:
@@ -50,7 +69,7 @@ def check(name, passed, **safe_details):
 
 def http(path, *, method="GET", payload=None, form=None, bearer=None, headers=None):
     if not path.startswith("/"):
-        raise AssertionError("All non-browser HTTP calls must stay on the isolated local Worker")
+        raise AssertionError("HTTP helper is restricted to the isolated Worker")
     actual_headers = {"Accept": "application/json", **(headers or {})}
     data = None
     if payload is not None:
@@ -67,17 +86,14 @@ def http(path, *, method="GET", payload=None, form=None, bearer=None, headers=No
     except urllib.error.HTTPError as error:
         response = error
     with response:
-        raw = response.read(1024 * 1024).decode("utf-8", errors="replace")
-        return response.status, response.headers, raw
+        return response.status, response.headers, response.read(1024 * 1024).decode("utf-8", errors="replace")
 
 
 def register(auth_method):
     status, _, raw = http("/oauth/register", method="POST", payload={
         "client_name": "QuantPro isolated test " + auth_method,
-        "redirect_uris": [CALLBACK],
-        "token_endpoint_auth_method": auth_method,
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
+        "redirect_uris": [CALLBACK], "token_endpoint_auth_method": auth_method,
+        "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"],
     })
     body = json.loads(raw)
     check("DCR_" + auth_method, status == 201 and bool(body.get("client_id")), http_status=status)
@@ -85,15 +101,12 @@ def register(auth_method):
 
 
 def authorization(client, **overrides):
-    verifier = secrets.token_urlsafe(48)
+    verifier, state = secrets.token_urlsafe(48), secrets.token_urlsafe(24)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-    state = secrets.token_urlsafe(24)
     parameters = {
-        "response_type": "code", "client_id": client["client_id"],
-        "redirect_uri": CALLBACK, "scope": "market:read offline_access",
-        "state": state, "code_challenge": challenge, "code_challenge_method": "S256",
-        "resource": RESOURCE,
-        **overrides,
+        "response_type": "code", "client_id": client["client_id"], "redirect_uri": CALLBACK,
+        "scope": "market:read offline_access", "state": state, "code_challenge": challenge,
+        "code_challenge_method": "S256", "resource": RESOURCE, **overrides,
     }
     return "/authorize?" + urllib.parse.urlencode(parameters), verifier, state
 
@@ -102,7 +115,8 @@ def form_state(path):
     status, headers, raw = http(path)
     check("consent_get", status == 200 and OWNER not in raw, http_status=status)
     policy = headers.get("Content-Security-Policy", "")
-    check("actual_page_CSP_allows_only_validated_callback_origin", "form-action 'self' https://chatgpt.com;" in policy and "*" not in policy)
+    origin = CALLBACK.rsplit("/", 1)[0]
+    check("actual_page_CSP_allows_only_validated_callback_origin", "form-action 'self' " + origin + ";" in policy and "*" not in policy)
     match = re.search(r'name="csrf" value="([^"]+)"', raw)
     check("signed_form_state_present", bool(match))
     return html.unescape(match.group(1))
@@ -112,32 +126,31 @@ def submit_code(path, state):
     csrf = form_state(path)
     status, headers, raw = http(path, method="POST", form={"csrf": csrf, "owner_key": OWNER})
     location = headers.get("Location", "")
-    parsed = urllib.parse.urlsplit(location)
-    parameters = urllib.parse.parse_qs(parsed.query)
-    check("consent_POST_303", status == 303 and parsed.scheme == "https" and parsed.netloc == "chatgpt.com", http_status=status)
+    parameters = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
+    check("consent_POST_303", status == 303 and location.startswith(CALLBACK + "?"), http_status=status)
     check("callback_state_preserved_no_long_lived_secret", parameters.get("state") == [state] and OWNER not in location and OWNER not in raw and bool(parameters.get("code")))
     return parameters["code"][0]
 
 
-def token(client, form):
-    auth_method = client["token_endpoint_auth_method"]
+def client_auth(client, form):
     form = {"client_id": client["client_id"], **form}
     headers = {}
-    if auth_method == "client_secret_basic":
+    if client["token_endpoint_auth_method"] == "client_secret_basic":
         pair = urllib.parse.quote(client["client_id"], safe="") + ":" + urllib.parse.quote(client["client_secret"], safe="")
         headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
-    elif auth_method == "client_secret_post":
+    elif client["token_endpoint_auth_method"] == "client_secret_post":
         form["client_secret"] = client["client_secret"]
+    return form, headers
+
+
+def token(client, form):
+    form, headers = client_auth(client, form)
     status, response_headers, raw = http("/oauth/token", method="POST", form=form, headers=headers)
-    body = json.loads(raw) if raw else {}
-    return status, response_headers, body
+    return status, response_headers, json.loads(raw) if raw else {}
 
 
 def exchange(client, code, verifier, **overrides):
-    return token(client, {
-        "grant_type": "authorization_code", "code": code, "code_verifier": verifier,
-        "redirect_uri": CALLBACK, "resource": RESOURCE, **overrides,
-    })
+    return token(client, {"grant_type": "authorization_code", "code": code, "code_verifier": verifier, "redirect_uri": CALLBACK, "resource": RESOURCE, **overrides})
 
 
 def mcp(method, params=None, bearer=None):
@@ -157,49 +170,40 @@ def initialize(bearer=None):
 
 
 def control(bearer=None):
-    status, headers, body = mcp("tools/call", {"name": "get_control_plane_status", "arguments": {}}, bearer)
+    status, _, body = mcp("tools/call", {"name": "get_control_plane_status", "arguments": {}}, bearer)
     content = body.get("result", {}).get("content", [])
-    value = json.loads(content[0]["text"]) if content else {}
-    return status, value
+    return status, json.loads(content[0]["text"]) if content else {}
 
 
 def browser_consent(browser, client):
     path, verifier, state = authorization(client)
     context = browser.new_context()
-    callbacks = []
-    page_errors = []
+    CALLBACK_HITS.clear()
+    errors = []
     try:
-        def route_request(route):
-            parsed = urllib.parse.urlsplit(route.request.url)
-            if parsed.scheme == "https" and parsed.netloc == "chatgpt.com" and parsed.path == "/connector/oauth/quantpro-isolated-e2e":
-                callbacks.append({"method": route.request.method, "body": route.request.post_data, "query": urllib.parse.parse_qs(parsed.query)})
-                route.fulfill(status=200, content_type="text/html", body="<h1>Synthetic callback reached</h1>")
-            elif parsed.scheme == "http" and parsed.netloc == "127.0.0.1:18787":
-                route.continue_()
-            else:
-                route.abort()
-        context.route("**/*", route_request)
         page = context.new_page()
-        page.on("console", lambda message: page_errors.append(message.text) if message.type == "error" else None)
+        page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
         response = page.goto(BASE + path)
         check("browser_actual_consent_page_200", response.status == 200)
         page.locator("#owner_key").fill(OWNER)
-        with page.expect_request(lambda request: request.url.startswith(CALLBACK + "?"), timeout=10000):
-            page.get_by_role("button", name="授权只读访问").click(no_wait_after=True)
-        page.wait_for_timeout(250)
-        check("browser_callback_really_reached", len(callbacks) == 1)
-        callback = callbacks[0]
-        check("browser_callback_GET_without_owner_body", callback["method"] == "GET" and callback["body"] is None)
+        page.get_by_role("button", name="授权只读访问").click(no_wait_after=True)
+        for _ in range(100):
+            if CALLBACK_HITS:
+                break
+            page.wait_for_timeout(50)
+        check("browser_callback_really_received_by_server", len(CALLBACK_HITS) == 1)
+        callback = CALLBACK_HITS[0]
+        check("browser_callback_GET_without_owner_body", callback["method"] == "GET" and callback["body_length"] == 0)
         check("browser_callback_state_and_code", callback["query"].get("state") == [state] and bool(callback["query"].get("code")))
-        check("browser_no_form_action_violation", not any("form-action" in message for message in page_errors))
+        check("browser_no_form_action_violation", not any("form-action" in message for message in errors))
         return callback["query"]["code"][0], verifier
     finally:
         context.close()
 
 
 def run_checks():
-    status, _, metadata_raw = http("/.well-known/oauth-authorization-server")
-    metadata = json.loads(metadata_raw)
+    status, _, raw = http("/.well-known/oauth-authorization-server")
+    metadata = json.loads(raw)
     check("real_Worker_discovery", status == 200 and "S256" in metadata.get("code_challenge_methods_supported", []))
     status, _, _ = initialize()
     check("anonymous_MCP_initialize_still_works", status == 200, http_status=status)
@@ -225,8 +229,8 @@ def run_checks():
     check("wrong_owner_is_401_not_callback", status == 401 and "授权密钥不匹配" in raw, http_status=status)
     status, _, raw = http(path, method="POST", form={"csrf": "tampered", "owner_key": OWNER})
     check("tampered_form_state_is_400", status == 400 and "授权会话已过期或无效" in raw, http_status=status)
-    altered_path, _, _ = authorization(public_client)
-    status, _, _ = http(altered_path, method="POST", form={"csrf": csrf, "owner_key": OWNER})
+    other_path, _, _ = authorization(public_client)
+    status, _, _ = http(other_path, method="POST", form={"csrf": csrf, "owner_key": OWNER})
     check("signed_state_bound_to_exact_authorization_request", status == 400, http_status=status)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -257,25 +261,18 @@ def run_checks():
                 check("refresh_downscope_" + auth_method, status == 200 and downscoped.get("scope") == "offline_access", http_status=status)
                 status, _, _ = initialize(downscoped["access_token"])
                 check("token_without_market_scope_denied_" + auth_method, status == 403, http_status=status)
-                # The library implements RFC 7009 at the advertised revocation endpoint.
-                revocation_url = metadata.get("revocation_endpoint", "")
-                revocation_path = urllib.parse.urlsplit(revocation_url).path
+                revocation_path = urllib.parse.urlsplit(metadata.get("revocation_endpoint", "")).path
                 check("revocation_endpoint_advertised", bool(revocation_path))
-                auth_headers = {}
-                revocation_form = {"client_id": client["client_id"], "token": downscoped.get("refresh_token", refreshed["refresh_token"]), "token_type_hint": "refresh_token"}
-                if auth_method == "client_secret_basic":
-                    pair = client["client_id"] + ":" + client["client_secret"]
-                    auth_headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
-                elif auth_method == "client_secret_post":
-                    revocation_form["client_secret"] = client["client_secret"]
-                status, _, _ = http(revocation_path, method="POST", form=revocation_form, headers=auth_headers)
+                revoke_token = downscoped.get("refresh_token", refreshed["refresh_token"])
+                revoke_form, revoke_headers = client_auth(client, {"token": revoke_token, "token_type_hint": "refresh_token"})
+                status, _, _ = http(revocation_path, method="POST", form=revoke_form, headers=revoke_headers)
                 check("grant_revocation_" + auth_method, status == 200, http_status=status)
                 status, _, _ = initialize(refreshed["access_token"])
                 check("revoked_access_token_denied_" + auth_method, status == 401, http_status=status)
-                status, _, _ = token(client, {"grant_type": "refresh_token", "refresh_token": revocation_form["token"]})
+                status, _, _ = token(client, {"grant_type": "refresh_token", "refresh_token": revoke_token})
                 check("revoked_refresh_denied_" + auth_method, status == 400, http_status=status)
             client = register("none")
-            path, verifier, state = authorization(client)
+            path, _, state = authorization(client)
             code = submit_code(path, state)
             status, _, _ = exchange(client, code, secrets.token_urlsafe(48))
             check("wrong_PKCE_verifier_rejected", status == 400, http_status=status)
@@ -284,7 +281,12 @@ def run_checks():
 
 
 process = None
+callback_server = None
+completed = False
 try:
+    callback_server = ThreadingHTTPServer(("127.0.0.1", 0), CallbackHandler)
+    threading.Thread(target=callback_server.serve_forever, daemon=True).start()
+    CALLBACK = f"http://127.0.0.1:{callback_server.server_port}/callback"
     with tempfile.TemporaryDirectory(prefix=".oauth-e2e-", dir=ROOT) as directory:
         directory = Path(directory)
         config = {
@@ -300,11 +302,10 @@ try:
         config_path.write_text(json.dumps(config), encoding="utf-8")
         child_env = dict(os.environ)
         for name in list(child_env):
-            if name.startswith(("CLOUDFLARE_", "CF_ACCESS_", "COLLECTOR_", "PORTFOLIO_", "RESEARCH_REPLICA_INGEST")):
+            if name.startswith(("CLOUDFLARE_", "CF_ACCESS_", "COLLECTOR_", "PORTFOLIO_", "RESEARCH_REPLICA_INGEST")) or name in ("GITHUB_TOKEN", "GH_TOKEN"):
                 del child_env[name]
         child_env["WRANGLER_SEND_METRICS"] = "false"
-        log_path = directory / "worker.log"
-        with log_path.open("w", encoding="utf-8") as log:
+        with (directory / "worker.log").open("w", encoding="utf-8") as log:
             process = subprocess.Popen([str(ROOT / "node_modules/.bin/wrangler"), "dev", "--local", "--config", str(config_path), "--ip", "127.0.0.1", "--port", "18787", "--inspector-port", "0", "--persist-to", str(directory / "state")], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=child_env)
             try:
                 ready = False
@@ -319,15 +320,9 @@ try:
                     except (urllib.error.URLError, TimeoutError, OSError):
                         pass
                     time.sleep(1)
-                if not ready:
-                    text = log_path.read_text(encoding="utf-8")
-                    safe_errors = [line for line in text.splitlines() if "ERROR" in line or "Could not resolve" in line or "Cannot find" in line]
-                    for line in safe_errors[:12]:
-                        for value in [OWNER, INTERNAL, INGEST]:
-                            line = line.replace(value, "[REDACTED]")
-                        print(line)
                 check("isolated_worker_ready", ready)
                 run_checks()
+                completed = True
             finally:
                 process.terminate()
                 try:
@@ -336,8 +331,17 @@ try:
                     process.kill()
                     process.wait()
                 process = None
+except Exception as error:
+    # Never expose exceptions containing callback query strings or token responses.
+    REPORT["exception_type"] = type(error).__name__
+    print(json.dumps({"integration_failed": True, "exception_type": type(error).__name__}))
 finally:
     if process is not None:
         process.kill()
-    REPORT["all_pass"] = bool(REPORT["checks"]) and all(item["pass"] for item in REPORT["checks"])
+    if callback_server is not None:
+        callback_server.shutdown()
+        callback_server.server_close()
+    REPORT["all_pass"] = completed and bool(REPORT["checks"]) and all(item["pass"] for item in REPORT["checks"])
     (ROOT / "oauth-runtime-results.json").write_text(json.dumps(REPORT, indent=2), encoding="utf-8")
+if not REPORT["all_pass"]:
+    raise SystemExit(1)
