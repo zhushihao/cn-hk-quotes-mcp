@@ -13,6 +13,7 @@ const OFFLINE_ACCESS_SCOPE = "offline_access";
 const OWNER_USER_ID = "quantpro-owner";
 const CSRF_COOKIE = "qp_oauth_csrf";
 const MAX_OWNER_KEY_LENGTH = 512;
+const STORAGE_SMOKE_USER_AGENT = "quantpro-prod-oauth-storage-smoke/1";
 
 type CoreEnv = Parameters<typeof coreWorker.fetch>[1];
 type OAuthProps = {
@@ -24,18 +25,56 @@ type OAuthEnv = CoreEnv & {
 	OAUTH_PROVIDER: OAuthHelpers;
 };
 
-/**
- * The production PORTFOLIO_UNIVERSE namespace is an existing, proven private KV binding.
- * OAuthProvider owns disjoint key prefixes (`client:`, `grant:`, `token:` and EMA keys), while
- * the LIVE control plane owns only `live-portfolio/...` keys. Reusing the physical namespace
- * avoids relying on a second auto-provisioned binding that was present in discovery metadata
- * but threw 1101 on every write. Credentials and authorization semantics remain independent.
- */
+type StorageProbeResult = {
+	ok: boolean;
+	stage: "PORTFOLIO_UNIVERSE_DIRECT" | "OAUTH_PROVIDER_DCR";
+	error_name?: string;
+	error_message?: string;
+};
+
 function oauthRuntimeEnv(env: CoreEnv): OAuthEnv {
 	if (!env.PORTFOLIO_UNIVERSE) {
 		throw new Error("PORTFOLIO_UNIVERSE KV binding is required for OAuth storage");
 	}
 	return { ...env, OAUTH_KV: env.PORTFOLIO_UNIVERSE } as OAuthEnv;
+}
+
+function diagnosticError(error: unknown): Pick<StorageProbeResult, "error_name" | "error_message"> {
+	if (error instanceof Error) {
+		return {
+			error_name: error.name.slice(0, 80),
+			error_message: error.message.replace(/[\r\n]+/gu, " ").slice(0, 300),
+		};
+	}
+	return { error_name: "UnknownError", error_message: String(error).slice(0, 300) };
+}
+
+async function probePortfolioUniverseWrite(env: CoreEnv): Promise<StorageProbeResult> {
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return {
+			ok: false,
+			stage: "PORTFOLIO_UNIVERSE_DIRECT",
+			error_name: "MissingBinding",
+			error_message: "PORTFOLIO_UNIVERSE is not bound",
+		};
+	}
+	const key = `oauth-health:${crypto.randomUUID()}`;
+	try {
+		await env.PORTFOLIO_UNIVERSE.put(key, "1", { expirationTtl: 60 });
+		const stored = await env.PORTFOLIO_UNIVERSE.get(key);
+		await env.PORTFOLIO_UNIVERSE.delete(key);
+		if (stored !== "1") {
+			return {
+				ok: false,
+				stage: "PORTFOLIO_UNIVERSE_DIRECT",
+				error_name: "ReadAfterWriteMismatch",
+				error_message: "KV read-after-write did not return the probe value",
+			};
+		}
+		return { ok: true, stage: "PORTFOLIO_UNIVERSE_DIRECT" };
+	} catch (error) {
+		return { ok: false, stage: "PORTFOLIO_UNIVERSE_DIRECT", ...diagnosticError(error) };
+	}
 }
 
 function escapeHtml(value: string): string {
@@ -275,7 +314,6 @@ async function handleMcp(
 ): Promise<Response> {
 	const token = bearerToken(request);
 	if (token === null) {
-		// Hybrid contract: anonymous MCP remains available, but core projects it to quote-only.
 		return coreWorker.fetch(withAuthorization(request, null), env, ctx);
 	}
 	if (!token) return oauthChallenge(request);
@@ -292,9 +330,6 @@ async function handleMcp(
 	}
 	if (!tokenHasMarketRead(summary)) return oauthChallenge(request);
 
-	// The old static credential is no longer a client credential. It is now a server-only
-	// bridge between the OAuth gateway and the unchanged core market-read gate. External
-	// Authorization is never forwarded verbatim, so a copied bridge secret cannot bypass OAuth.
 	const bridgeSecret = env.COLLECTOR_MCP_CLIENT_TOKEN;
 	const forwarded = withAuthorization(request, bridgeSecret ? `Bearer ${bridgeSecret}` : null);
 	return coreWorker.fetch(forwarded, env, ctx);
@@ -316,9 +351,6 @@ const unusedProtectedHandler = {
 };
 
 const oauthProvider = new OAuthProvider<OAuthEnv>({
-	// `/mcp` intentionally remains in the default handler so anonymous quote-only calls keep
-	// working. OAuth bearer validation for `/mcp` is performed with OAUTH_PROVIDER.unwrapToken().
-	// This private sentinel route satisfies OAuthProvider's required api-handler configuration.
 	apiRoute: "/__oauth_provider_protected",
 	apiHandler: unusedProtectedHandler,
 	defaultHandler,
@@ -354,8 +386,31 @@ const oauthProvider = new OAuthProvider<OAuthEnv>({
 });
 
 export default {
-	fetch(request: Request, env: CoreEnv, ctx: ExecutionContext) {
-		return oauthProvider.fetch(request, oauthRuntimeEnv(env), ctx);
+	async fetch(request: Request, env: CoreEnv, ctx: ExecutionContext) {
+		const runtimeEnv = oauthRuntimeEnv(env);
+		const isStorageSmoke =
+			new URL(request.url).pathname === "/oauth/register" &&
+			request.method === "POST" &&
+			request.headers.get("User-Agent") === STORAGE_SMOKE_USER_AGENT;
+		if (isStorageSmoke) {
+			const directProbe = await probePortfolioUniverseWrite(env);
+			if (!directProbe.ok) {
+				return Response.json(directProbe, { status: 500 });
+			}
+			try {
+				return await oauthProvider.fetch(request, runtimeEnv, ctx);
+			} catch (error) {
+				return Response.json(
+					{
+						ok: false,
+						stage: "OAUTH_PROVIDER_DCR",
+						...diagnosticError(error),
+					} satisfies StorageProbeResult,
+					{ status: 500 },
+				);
+			}
+		}
+		return oauthProvider.fetch(request, runtimeEnv, ctx);
 	},
 	async scheduled(controller: ScheduledController, env: CoreEnv, ctx: ExecutionContext) {
 		const runtimeEnv = oauthRuntimeEnv(env);
