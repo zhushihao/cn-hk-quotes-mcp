@@ -1,0 +1,23 @@
+name: OAuth Format Diagnostic
+on:
+  push:
+    branches: [issue-8-auth-e2e-recovery]
+permissions:
+  contents: read
+jobs:
+  format-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - name: Print only checked-in OAuth source formatting differences
+        run: |
+          npx oxfmt --write src/oauth-entry.ts
+          git diff -- src/oauth-entry.ts
+          git diff --exit-code -- src/oauth-entry.ts
