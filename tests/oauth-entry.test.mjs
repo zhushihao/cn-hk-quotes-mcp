@@ -73,7 +73,10 @@ test("ChatGPT issuer compatibility omits RFC 9207 advertisement and strips iss o
 	assert.match(diagnostics, /redirect\.hostname === "chatgpt\.com"/);
 	assert.match(diagnostics, /redirect\.pathname\.startsWith\("\/connector\/oauth\/"\)/);
 	assert.match(diagnostics, /redirect\.searchParams\.delete\("iss"\)/);
-	assert.match(diagnostics, /if \(authorizePost\) response = applyChatGptCallbackIssuerCompat\(response\)/);
+	assert.match(
+		diagnostics,
+		/if \(authorizePost\) response = applyChatGptCallbackIssuerCompat\(response\)/,
+	);
 	assert.match(diagnostics, /iss_present: url\.searchParams\.has\("iss"\)/);
 });
 
