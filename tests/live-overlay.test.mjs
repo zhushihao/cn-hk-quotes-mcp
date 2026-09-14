@@ -16,6 +16,7 @@ import {
 	projectCallerSnapshot,
 	redactInstrumentCodes,
 	resolveLiveOverlayStatus,
+	resolveMarketReadLiveOverlayStatus,
 } from "../src/live-overlay.ts";
 import { validateSnapshot } from "../src/portfolio-validation.ts";
 
@@ -194,6 +195,49 @@ test("gate: only an exact bearer match unlocks the LIVE overlay; both skip state
 	for (const status of LIVE_OVERLAY_STATUSES) {
 		assert.equal(isLiveOverlayEnabled(status), status === "ENABLED");
 	}
+});
+
+test("Issue #8 market:read MCP credential is independent from the internal universe token", () => {
+	const externalToken = "synthetic-chatgpt-client-token";
+	const internalUniverseToken = "synthetic-internal-universe-token";
+
+	assert.equal(
+		resolveMarketReadLiveOverlayStatus(`Bearer ${externalToken}`, externalToken, "market:read"),
+		"ENABLED",
+	);
+	assert.equal(
+		resolveMarketReadLiveOverlayStatus(
+			`Bearer ${externalToken}`,
+			externalToken,
+			"research:read",
+		),
+		"SKIPPED_INSUFFICIENT_SCOPE",
+	);
+	assert.equal(
+		resolveMarketReadLiveOverlayStatus(`Bearer ${externalToken}`, externalToken, ""),
+		"SKIPPED_INSUFFICIENT_SCOPE",
+	);
+	assert.equal(
+		resolveMarketReadLiveOverlayStatus(`Bearer wrong`, externalToken, "market:read"),
+		"SKIPPED_UNAUTHORIZED",
+	);
+	assert.equal(
+		resolveMarketReadLiveOverlayStatus(null, externalToken, "market:read"),
+		"SKIPPED_UNAUTHORIZED",
+	);
+	assert.equal(
+		resolveMarketReadLiveOverlayStatus(`Bearer ${externalToken}`, undefined, "market:read"),
+		"SKIPPED_TOKEN_NOT_CONFIGURED",
+	);
+	assert.equal(
+		resolveMarketReadLiveOverlayStatus(
+			`Bearer ${internalUniverseToken}`,
+			externalToken,
+			"market:read",
+		),
+		"SKIPPED_UNAUTHORIZED",
+		"the internal PORTFOLIO_UNIVERSE_TOKEN must never authorize the external MCP client",
+	);
 });
 
 test("anonymous get_portfolio_quotes: no overlay, no error, no LIVE code / hash / count leak", async () => {
@@ -503,24 +547,62 @@ test("client-facing text scrubber removes security codes but never mangles hashe
 	assert.equal(redactInstrumentCodes(""), "");
 });
 
-test("D-1 wiring: the MCP surface derives the gate from the current request header", async () => {
+test("Issue #8 wiring: external MCP market:read and internal universe auth are separate fail-closed gates", async () => {
 	const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
 
-	// 1. 工厂按请求构造，门取本请求的 Authorization 头（含 legacy/modern 两条腿）。
+	// 1. MCP 工厂只走外部 client credential + market:read gate。
 	assert.match(source, /createMcpHandler\(\(ctx\) =>/);
-	assert.match(source, /createServer\(env, requestLiveOverlayStatus\(ctx\.requestInfo, env\)\)/);
-	assert.match(source, /request\?\.headers\.get\("Authorization"\)/);
-	// 2. 判定实现与写入端点鉴权同源（不存在第二套口径）。
 	assert.match(
 		source,
-		/function isUniverseAuthorized\(request: Request, env: Env\): boolean \{\s*return isLiveOverlayEnabled\(requestLiveOverlayStatus\(request, env\)\);/,
+		/const liveOverlayStatus = requestMcpMarketReadStatus\(ctx\.requestInfo, env\);/,
 	);
+	assert.match(source, /return createServer\(env, liveOverlayStatus\);/);
+	assert.match(source, /request\?\.headers\.get\("Authorization"\)/);
+	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_TOKEN/);
+	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_SCOPES/);
+	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_ID/);
+	assert.match(source, /status === "ENABLED" && !env\.COLLECTOR_MCP_CLIENT_ID\?\.trim\(\)/);
+	// 2. 内部 universe API 继续只认内部 token，且绝不调用 MCP gate。
+	assert.match(
+		source,
+		/function isUniverseAuthorized\(request: Request, env: Env\): boolean \{\s*return isLiveOverlayEnabled\(requestInternalUniverseStatus\(request, env\)\);/,
+	);
+	assert.match(source, /env\.PORTFOLIO_UNIVERSE_TOKEN/);
+	const internalGate = source.slice(
+		source.indexOf("function requestInternalUniverseStatus"),
+		source.indexOf("function requestMcpMarketReadStatus"),
+	);
+	assert.doesNotMatch(internalGate, /COLLECTOR_MCP_CLIENT_TOKEN|COLLECTOR_MCP_CLIENT_SCOPES/);
+	const mcpGate = source.slice(
+		source.indexOf("function requestMcpMarketReadStatus"),
+		source.indexOf("function isUniverseAuthorized"),
+	);
+	assert.doesNotMatch(mcpGate, /PORTFOLIO_UNIVERSE_TOKEN/);
 	// 3. get_portfolio_quotes 把门传给叠加出口，且两处 control_plane_status 都带降级标注。
 	const toolStart = source.indexOf('"get_portfolio_quotes"');
 	const toolBody = source.slice(toolStart, source.indexOf('"get_control_plane_status"'));
 	assert.ok(toolStart > 0);
 	assert.match(toolBody, /\{ liveOverlayStatus \},/);
 	assert.equal((toolBody.match(/live_overlay_status: liveOverlayStatus/g) ?? []).length, 2);
+	assert.equal(
+		(toolBody.match(/market_read_auth: marketReadAuditFields\(env, liveOverlayStatus\)/g) ?? [])
+			.length,
+		2,
+	);
+	assert.match(source, /auth_mode: MARKET_READ_AUTH_MODE/);
+	assert.match(
+		source,
+		/client_id: authenticated \? env\?\.COLLECTOR_MCP_CLIENT_ID\?\.trim\(\) \|\| null : null/,
+	);
+	assert.match(source, /scopes: authenticated \? \[MARKET_READ_SCOPE\] : \[\]/);
+	const authLog = source.slice(
+		source.indexOf('bridgeContext("mcp:market-read-auth")'),
+		source.indexOf("return createServer(env, liveOverlayStatus);"),
+	);
+	assert.doesNotMatch(
+		authLog,
+		/Authorization|COLLECTOR_MCP_CLIENT_TOKEN|PORTFOLIO_UNIVERSE_TOKEN/,
+	);
 	// 4. 叠加出口唯一，且其缺省是 fail-closed。
 	assert.match(source, /liveOverlayStatus \?\? "SKIPPED_UNAUTHORIZED"/);
 	assert.match(source, /liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED"/);

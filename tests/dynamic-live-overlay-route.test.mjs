@@ -213,6 +213,25 @@ async function writeCompleteUniverse(kv, active, generatedAt = new Date().toISOS
 	return { contentHash, generatedAt };
 }
 
+test("Issue #8 external market:read credential cannot unlock internal universe endpoints", async () => {
+	const env = await liveEnv([{ market: "CN", exchange: "SZ", code: "002409" }]);
+	env.COLLECTOR_MCP_CLIENT_TOKEN = "external-client";
+	env.COLLECTOR_MCP_CLIENT_ID = "chatgpt-production";
+	env.COLLECTOR_MCP_CLIENT_SCOPES = "market:read";
+
+	for (const pathname of ["/api/quote-universe", "/api/portfolio-quotes"]) {
+		const response = await worker.fetch(
+			new Request(`https://collector.example${pathname}`, {
+				headers: { Authorization: "Bearer external-client" },
+			}),
+			env,
+			context(),
+		);
+		assert.equal(response.status, 401, `${pathname} must keep the internal-token boundary`);
+		assert.deepEqual(await response.json(), { error: "UNAUTHORIZED" });
+	}
+});
+
 test("new legal LIVE identity is fetched dynamically then passes the unchanged coverage gate", async () => {
 	const env = await liveEnv([{ market: "CN", exchange: "SZ", code: "002409" }]);
 	const response = await privateDynamicRequest(env, async (input) => {

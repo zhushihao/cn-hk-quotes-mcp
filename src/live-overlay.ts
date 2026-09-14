@@ -5,17 +5,18 @@
  * （`node --test` 可直接导入，与本仓 `live-universe.ts` / `portfolio-status.ts`
  * 同纪律）；请求路径与响应构造的接线在 `index.ts`：
  *
- * 1. 鉴权门：`get_portfolio_quotes` 只在请求携带有效
- *    `Authorization: Bearer <PORTFOLIO_UNIVERSE_TOKEN>` 时才允许应用 LIVE 叠加
- *    （读 KV universe、coverage gate、`holding_status=ACTIVE` 等）。
+ * 1. 鉴权门：LIVE 叠加只有在调用方通过对应请求面的 bearer gate 后才允许应用
+ *    （读 KV universe、coverage gate、`holding_status=ACTIVE` 等）。MCP 面由独立的
+ *    Collector client credential + `market:read` 决定；内部 universe API 继续由
+ *    `PORTFOLIO_UNIVERSE_TOKEN` 决定，两者禁止互相代用。
  *    - 未携带 / 不匹配 → **不报错**，按「无 universe」路径回退既有 legacy 目录视图
  *      （与 `universe_present=false` 时的行为一致），只在
  *      `control_plane_status.live_overlay_status` 标注降级原因；
- *    - `PORTFOLIO_UNIVERSE_TOKEN` 未配置 → 一律 fail-closed（同样走 legacy 路径）；
+ *    - 对应 credential 未配置 → 一律 fail-closed（同样走 legacy 路径）；
  *    - 已通过门后：coverage 缺失 → 保持既有 fail-closed 报错；三态未知 / 锚不新鲜
  *      → 保持既有静默回退 legacy（J-11），两者语义均不变。
- *    判定口径与既有 `isUniverseAuthorized()`（写入端点的鉴权）**完全同源**：
- *    `isUniverseAuthorized()` 现在就由本模块的 `resolveLiveOverlayStatus()` 实现。
+ *    bearer 精确匹配的底层口径由 `resolveLiveOverlayStatus()` 复用；MCP 再叠加
+ *    `market:read` scope gate，内部写入端点不共享外部 client credential。
  *
  * 2. 去泄漏：面向调用方的错误 / 提示文本**不得包含具体证券代码**（coverage 缺失、
  *    identity、stale 等一律去码），缺失**数量**可以保留。
@@ -49,15 +50,21 @@ export type LiveOverlayStatus =
 	| "ENABLED"
 	/** 请求未携带 / 未携带匹配的 `Authorization: Bearer <token>` → 降级为 legacy 目录视图。 */
 	| "SKIPPED_UNAUTHORIZED"
-	/** 服务端未配置 `PORTFOLIO_UNIVERSE_TOKEN` → 无法鉴权，一律 fail-closed 降级。 */
-	| "SKIPPED_TOKEN_NOT_CONFIGURED";
+	/** 服务端未配置对应 credential → 无法鉴权，一律 fail-closed 降级。 */
+	| "SKIPPED_TOKEN_NOT_CONFIGURED"
+	/** credential 正确，但该 client 未获 `market:read` → fail-closed 降级。 */
+	| "SKIPPED_INSUFFICIENT_SCOPE";
 
 /** 全部取值（供测试穷举与文档锁定，避免新增取值时漏改消费侧）。 */
 export const LIVE_OVERLAY_STATUSES: readonly LiveOverlayStatus[] = [
 	"ENABLED",
 	"SKIPPED_UNAUTHORIZED",
 	"SKIPPED_TOKEN_NOT_CONFIGURED",
+	"SKIPPED_INSUFFICIENT_SCOPE",
 ];
+
+/** ChatGPT / Automation 读取 LIVE market overlay 的最小批准 scope。 */
+export const MARKET_READ_SCOPE = "market:read";
 
 /**
  * 鉴权门判定（与既有 `isUniverseAuthorized()` 同口径）：
@@ -75,6 +82,30 @@ export function resolveLiveOverlayStatus(
 ): LiveOverlayStatus {
 	if (!configuredToken) return "SKIPPED_TOKEN_NOT_CONFIGURED";
 	return authorizationHeader === `Bearer ${configuredToken}` ? "ENABLED" : "SKIPPED_UNAUTHORIZED";
+}
+
+/**
+ * QuantPro Collector MCP 外部 client 的 LIVE market read 门。
+ *
+ * 与 `PORTFOLIO_UNIVERSE_TOKEN` **刻意解耦**：调用方传入的是独立的
+ * Collector MCP client credential；credential 通过后还必须显式具备
+ * `market:read`。token 值不会被返回、记录或写入任何 tool schema。
+ */
+export function resolveMarketReadLiveOverlayStatus(
+	authorizationHeader: string | null | undefined,
+	configuredClientToken: string | null | undefined,
+	configuredScopes: string | null | undefined,
+): LiveOverlayStatus {
+	const credentialStatus = resolveLiveOverlayStatus(authorizationHeader, configuredClientToken);
+	if (credentialStatus !== "ENABLED") return credentialStatus;
+
+	const scopes = new Set(
+		(configuredScopes ?? "")
+			.split(/[\s,]+/)
+			.map((scope) => scope.trim())
+			.filter(Boolean),
+	);
+	return scopes.has(MARKET_READ_SCOPE) ? "ENABLED" : "SKIPPED_INSUFFICIENT_SCOPE";
 }
 
 /** 门是否放行（唯一判据：`=== "ENABLED"`；其余取值一律不放行，fail-closed）。 */

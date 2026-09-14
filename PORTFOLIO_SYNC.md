@@ -105,37 +105,44 @@ Cloudflare 先验证上游行情快照自身结构，再将 KV 中的 LIVE activ
 
 最后一条意味着：Cloudflare MCP 已经可以动态消费“现有行情目录覆盖到的”持仓；要做到买入一个此前从未在行情目录出现的代码也能立刻报价，上游 `cn-hk-quotes-proxy` 还需要进一步支持任意动态 code 拉取。
 
-## LIVE 叠加的调用方鉴权门（issue #15 D-1 选项 A）
+## LIVE 叠加的调用方鉴权门（issue #15 D-1 + issue #8 `market:read`）
 
 LIVE 叠加（读 KV `live-portfolio/current`、coverage 对账、`holding_status=ACTIVE`
-标记、`portfolio_version=live:<content_hash>`）**只对携带有效凭据的调用方生效**：
+标记、`portfolio_version=live:<content_hash>`）只对正式授权的外部 MCP client 生效。外部
+ChatGPT / ChatGPT Automation 鉴权与内部 universe API 保护凭据是两条独立边界：
 
-- 判据：`Authorization` 头逐字节等于 `Bearer <PORTFOLIO_UNIVERSE_TOKEN>`。判定实现与
-  写入端点鉴权**同源**（`src/live-overlay.ts` 的 `resolveLiveOverlayStatus()`；
-  `src/index.ts` 的 `isUniverseAuthorized()` 就是它的布尔投影），不做大小写/空格宽松化。
-- **匿名（无 token / token 不匹配）**：`get_portfolio_quotes` **不读 KV、不判三态、
-  不报错**，直接回退既有 legacy 目录视图——与 `universe_present=false` 时的行为一致
-  （legacy 目录自报的 `ACTIVE` 行与 `summary` 原样保留）。**不暴露** LIVE active 集、
-  LIVE 真相的数量口径、universe hash（无 `live_universe` 字段）、也不暴露 coverage 缺失代码。
-- **`PORTFOLIO_UNIVERSE_TOKEN` 未配置**：一律 fail-closed，同样走 legacy 路径（任何请求头都不看）。
-- **已带 token 且通过**：语义与加门之前完全一致——coverage 缺失仍 fail-closed 报错；
-  三态未知 / 锚不新鲜仍静默回退 legacy（J-11/C-5）。
+- **外部 MCP 面**：`Authorization` 必须逐字节匹配 Cloudflare secret
+  `COLLECTOR_MCP_CLIENT_TOKEN`，同时服务端必须配置非空 `COLLECTOR_MCP_CLIENT_ID`，且
+  `COLLECTOR_MCP_CLIENT_SCOPES` 显式包含 `market:read`。生产 identity 为
+  `chatgpt-production`；secret 不写 Git、不进 Prompt、不进 tool schema、不进日志/响应。
+- **内部 universe / 动态诊断面**：`POST/GET /api/quote-universe` 与
+  `GET /api/portfolio-quotes` 继续只认 `PORTFOLIO_UNIVERSE_TOKEN`。外部 MCP credential
+  不能调用这些内部端点；内部 token 也不能给 MCP client 解锁 LIVE overlay。
+- **匿名 / 错 credential**：MCP `get_portfolio_quotes` 不读 LIVE KV、不判三态、不报鉴权错误，
+  继续投影为 quote-only，并标注 `SKIPPED_UNAUTHORIZED`；不得暴露 LIVE active 集、数量、
+  universe hash 或 coverage 缺失代码。
+- **外部 credential 未配置**：`SKIPPED_TOKEN_NOT_CONFIGURED`，fail-closed；
+  credential 正确但缺 `market:read`：`SKIPPED_INSUFFICIENT_SCOPE`，fail-closed；
+  缺 production client identity 也按未授权 fail-closed。
+- **外部 credential + identity + `market:read` 全部通过**：`ENABLED`。随后是否实际叠加仍由
+  既有三态、freshness 与 coverage gate 决定；coverage 缺失仍硬失败，三态未知 / 锚不新鲜
+  仍按 J-11/C-5 保守处理。issue #8 不修改 LIVE/QMT 持仓生成逻辑。
 
-### `control_plane_status.live_overlay_status`（新增降级标注）
+### `control_plane_status.live_overlay_status` 与脱敏鉴权审计
 
-`get_portfolio_quotes` 返回体的 `control_plane_status` 新增字段 `live_overlay_status`
-（`get_control_plane_status` 工具同步返回），取值恰三值：
+`get_portfolio_quotes` 与 `get_control_plane_status` 都返回 `live_overlay_status`：
 
 | 取值 | 含义 |
 |------|------|
-| `ENABLED` | token 校验通过；随后是否**真的**叠加仍由三态与 coverage 决定 |
-| `SKIPPED_UNAUTHORIZED` | 请求未携带 / 未携带匹配的 token → 降级为 legacy 目录视图 |
-| `SKIPPED_TOKEN_NOT_CONFIGURED` | 服务端未配置 `PORTFOLIO_UNIVERSE_TOKEN` → fail-closed 降级 |
+| `ENABLED` | 外部 client credential、production identity 与 `market:read` 均通过；后续仍受三态 / freshness / coverage 约束 |
+| `SKIPPED_UNAUTHORIZED` | 匿名、credential 错误，或缺 production client identity → quote-only |
+| `SKIPPED_TOKEN_NOT_CONFIGURED` | 服务端未配置外部 `COLLECTOR_MCP_CLIENT_TOKEN` → fail-closed |
+| `SKIPPED_INSUFFICIENT_SCOPE` | credential 正确但未授予 `market:read` → fail-closed |
 
-其余 sanitized 控制面字段口径未变：`mode` 描述的是控制面/KV 形态（`universe_present`
-决定 `LIVE_DYNAMIC` / `LEGACY_FALLBACK`），**不表示本次调用是否叠加**——判断本次是否叠加
-只看 `live_overlay_status`。因此匿名调用的典型形态是 `mode=LIVE_DYNAMIC` +
-`live_overlay_status=SKIPPED_UNAUTHORIZED`。
+MCP 控制面同时带 `market_read_auth` 脱敏审计块，只允许出现认证模式、是否通过、批准的
+client identity 与 scope；未授权时 `client_id=null`、`scopes=[]`。任何 bearer/secret 值都不得
+进入该块或结构化日志。`mode` 仍描述 KV/控制面形态，不代表本次调用是否获得 LIVE overlay；
+匿名典型形态仍是 `mode=LIVE_DYNAMIC` + `live_overlay_status=SKIPPED_UNAUTHORIZED`。
 
 ### 错误文本不含证券代码
 
@@ -149,15 +156,15 @@ CN:002409, CN:002975` 已改为 `upstream quote catalog is missing 2 LIVE positi
 
 ## Worker 接口
 
-- MCP `get_portfolio_quotes`：**携带有效 `PORTFOLIO_UNIVERSE_TOKEN` bearer 时**消费 KV LKG；匿名调用回退旧行情目录行为并在 `control_plane_status.live_overlay_status` 标注降级原因（`SKIPPED_UNAUTHORIZED` / `SKIPPED_TOKEN_NOT_CONFIGURED`），不返回 LIVE active 集、数量或 hash（见上文「LIVE 叠加的调用方鉴权门」）。KV 尚未初始化时保持旧行情目录行为，便于无中断迁移。
+- MCP `get_portfolio_quotes`：正式外部 client credential + `chatgpt-production` identity + `market:read` 才可消费 LIVE KV；匿名/未授权继续 quote-only。
 - `POST /api/github-auth/probe`：仅验证 GitHub 登录身份和私有仓写权限，不写 KV，用于无副作用链路验收。
 - `POST /api/github-auth/quote-universe`：仅接受通过 GitHub 实时身份校验的 LIVE 请求，并严格验证 `quote-universe/1` 后写 KV。
 - `POST /api/github-auth/portfolio-status`：同样仅接受 GitHub 实时身份校验的 LIVE 请求，严格验证 `portfolio-status/1`（精确六键）后写 KV key `live-portfolio/status`；失败语义与 universe 端点一致（401 / 413 / 400），非法件拒写且不破坏旧件。
 - `GET /api/control-plane-status`：只返回 KV binding、universe 是否存在/新鲜、`GITHUB_VERIFIED_PUSH` 模式，以及 `portfolio_state` 三态枚举（附 `stale` 与双轨锚留痕）；不返回代码、数量或 hash。
 - Cron：继续只跑旧公开行情桥；LIVE universe 由 OIDC push 独立更新，失败不会破坏 KV LKG。
-- `POST /api/quote-universe`：旧直推入口保留但不是生产路径；仍需 `PORTFOLIO_UNIVERSE_TOKEN`，未配置时始终拒绝。
-- `GET /api/quote-universe`：同样需要 bearer token，用于受控诊断，不开放匿名读取真实 active set。
-- `GET /api/portfolio-quotes`：同样需要 bearer token，返回动态投影，避免新增一个匿名真实持仓接口；三态未知或锚过期时返回 503（`LIVE_UNIVERSE_STALE` / `PORTFOLIO_UNKNOWN`），不静默回退静态目录（该端点是「LIVE 动态投影」诊断面）。
+- `POST /api/quote-universe`：旧直推入口保留但不是生产路径；仍只认内部 `PORTFOLIO_UNIVERSE_TOKEN`。
+- `GET /api/quote-universe`：同样只认内部 token，用于受控诊断，不开放匿名读取真实 active set。
+- `GET /api/portfolio-quotes`：同样只认内部 token，返回动态投影；外部 MCP credential 不可替代内部 token。
 
 Cloudflare KV binding `PORTFOLIO_UNIVERSE` 由 `wrangler.jsonc` 声明；Workers Builds 部署时可自动 provision。生产链不要求 LIVE 保存 Cloudflare Account ID / Namespace ID / API Token。
 
@@ -182,6 +189,6 @@ Cloudflare KV binding `PORTFOLIO_UNIVERSE` 由 `wrangler.jsonc` 声明；Workers
 9. `portfolio-status/1` 精确六键、三态边界（恰 24h / 恰 10 天 / 超 1 秒 / 无基线）、
    J-4 保守复核、双轨锚两形态，以及 `stale`/`portfolio_state` 消费口径均由
    `tests/portfolio-status.test.mjs` 与 `tests/live-universe.test.mjs` 锁定。
-10. D-1 选项 A 口径由 `tests/live-overlay.test.mjs` 锁定：匿名不叠加 / 不报错 / 无代码与
-   数量泄漏；有效 token 行为与加门前一致；token 未配置 fail-closed；
-   coverage 缺失仍 fail-closed 但文本只含数量；`live_overlay_status` 三值。
+10. D-1 / issue #8 口径由 `tests/live-overlay.test.mjs` 与隐私 wiring 测试锁定：匿名不叠加 / 不报错 / 无代码与
+   数量泄漏；外部 client credential 与内部 universe token 不可互相授权；缺 token / identity /
+   `market:read` 均 fail-closed；coverage 缺失仍 fail-closed；`live_overlay_status` 四值。

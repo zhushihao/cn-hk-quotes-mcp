@@ -11,10 +11,12 @@ import {
 import { recordPortfolioUniverseObservation, type PortfolioDeltaState } from "./portfolio-delta";
 import {
 	LiveCoverageError,
+	MARKET_READ_SCOPE,
 	isLiveOverlayEnabled,
 	projectCallerSnapshot,
 	redactInstrumentCodes,
 	resolveLiveOverlayStatus,
+	resolveMarketReadLiveOverlayStatus,
 	type LiveOverlayStatus,
 } from "./live-overlay";
 import {
@@ -49,7 +51,14 @@ const GITHUB_API_VERSION = "2022-11-28";
 interface Env {
 	GITHUB_TOKEN: string;
 	PORTFOLIO_UNIVERSE?: KVNamespace;
+	/** 内部 universe API / writer 保护 secret；不得作为 ChatGPT MCP client credential。 */
 	PORTFOLIO_UNIVERSE_TOKEN?: string;
+	/** 外部 QuantPro Collector MCP client credential（Cloudflare secret；不进入 Git / Prompt / tool schema）。 */
+	COLLECTOR_MCP_CLIENT_TOKEN?: string;
+	/** 该 credential 映射的非敏感生产 client identity，仅用于配置/审计说明。 */
+	COLLECTOR_MCP_CLIENT_ID?: string;
+	/** 空格或逗号分隔的批准 scopes；LIVE overlay 至少要求 market:read。 */
+	COLLECTOR_MCP_CLIENT_SCOPES?: string;
 	/** 旧行情 origin（cn-hk-quotes-proxy / chatgpt.site）启用 Cloudflare Access 后注入。 */
 	CF_ACCESS_CLIENT_ID?: string;
 	CF_ACCESS_CLIENT_SECRET?: string;
@@ -204,6 +213,19 @@ function logBridgeFailure(
 		error_type: error instanceof Error ? error.name : typeof error,
 		error_message: safeErrorMessage(error),
 	});
+}
+
+const MARKET_READ_AUTH_MODE = "BEARER_CLIENT_CREDENTIAL" as const;
+
+/** Sanitized production-principal audit fields. Never contains a bearer/secret. */
+function marketReadAuditFields(env: Env | undefined, liveOverlayStatus: LiveOverlayStatus) {
+	const authenticated = isLiveOverlayEnabled(liveOverlayStatus);
+	return {
+		auth_mode: MARKET_READ_AUTH_MODE,
+		authenticated,
+		client_id: authenticated ? env?.COLLECTOR_MCP_CLIENT_ID?.trim() || null : null,
+		scopes: authenticated ? [MARKET_READ_SCOPE] : [],
+	};
 }
 
 /** KV 中的 LIVE 面（投影 + 状态件）与推导出的消费侧呈现口径。 */
@@ -671,7 +693,7 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 		"get_portfolio_quotes",
 		{
 			description:
-				"获取 A/H 结构化行情快照。LIVE 动态持仓由 Cloudflare quote-universe/1 层独立驱动，且**仅对携带有效 PORTFOLIO_UNIVERSE_TOKEN bearer 的调用方生效**（匿名调用返回 quote-only 投影视图，不含任何持仓身份/数量字段，并在 control_plane_status.live_overlay_status 标注 SKIPPED_*）。返回价格、涨跌幅、成交量、成交额、日内高低点、市场状态、行情时间、来源、质量状态、分组、Portfolio Status 和映射关系等。仅用于只读行情查询。",
+				"获取 A/H 结构化行情快照。LIVE 动态持仓由 Cloudflare quote-universe/1 层独立驱动，且仅对通过 QuantPro Collector MCP client credential 并获批 market:read scope 的调用方生效；该外部 credential 与内部 PORTFOLIO_UNIVERSE_TOKEN 解耦。匿名/未授权调用继续返回 quote-only 投影视图，不含任何持仓身份/数量字段，并在 control_plane_status.live_overlay_status 标注 SKIPPED_*。仅用于只读行情查询。",
 			inputSchema: z.object({}),
 		},
 		async () => {
@@ -692,6 +714,7 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 					? {
 							...(await getControlPlaneStatus(env)),
 							live_overlay_status: liveOverlayStatus,
+							market_read_auth: marketReadAuditFields(env, liveOverlayStatus),
 						}
 					: {
 							status: "DEGRADED",
@@ -705,6 +728,7 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 							freshness_anchor_fallback: false,
 							mode: "LEGACY_FALLBACK",
 							live_overlay_status: liveOverlayStatus,
+							market_read_auth: marketReadAuditFields(env, liveOverlayStatus),
 						};
 				return {
 					content: [
@@ -748,8 +772,8 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 		},
 		async () => {
 			const context = bridgeContext("mcp:get_public_quotes");
-				try {
-					const snapshot = await fetchPublicQuoteSnapshot(context, env);
+			try {
+				const snapshot = await fetchPublicQuoteSnapshot(context, env);
 				return {
 					content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
 				};
@@ -790,6 +814,7 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 						{
 							...(await getControlPlaneStatus(env ?? ({} as Env))),
 							live_overlay_status: liveOverlayStatus,
+							market_read_auth: marketReadAuditFields(env, liveOverlayStatus),
 						},
 						null,
 						2,
@@ -810,13 +835,20 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 	};
 	const researchRead = async (operation: () => Promise<unknown>) => {
 		try {
-			return { content: [{ type: "text" as const, text: JSON.stringify(await operation(), null, 2) }] };
+			return {
+				content: [
+					{ type: "text" as const, text: JSON.stringify(await operation(), null, 2) },
+				],
+			};
 		} catch (error) {
 			const safe =
 				error instanceof ResearchBoundaryError
 					? error.asError()
 					: new ResearchBoundaryError("STORE_UNAVAILABLE").asError();
-			return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
+			return {
+				isError: true,
+				content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }],
+			};
 		}
 	};
 	const unsupportedResearchRead = () => ({
@@ -824,21 +856,105 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 		content: [
 			{
 				type: "text" as const,
-				text: JSON.stringify({ status: "UNSUPPORTED", ...new ResearchBoundaryError("UNSUPPORTED_OPERATION").asError() }, null, 2),
+				text: JSON.stringify(
+					{
+						status: "UNSUPPORTED",
+						...new ResearchBoundaryError("UNSUPPORTED_OPERATION").asError(),
+					},
+					null,
+					2,
+				),
 			},
 		],
 	});
 
-	server.registerTool("search_documents", { description: "在 Collector 的 PUBLIC Research replica 中搜索文档元数据。", inputSchema: z.object({ query: z.string().optional(), limit: z.number().int().min(1).max(100).optional() }) }, async ({ query, limit }) => researchRead(() => researchAdapter().searchDocuments(query, limit)));
-	server.registerTool("get_document", { description: "读取 Collector replica 中经 SHA-256 校验的 PUBLIC 文档正文。", inputSchema: z.object({ document_id: z.string().min(1) }) }, async ({ document_id }) => researchRead(() => researchAdapter().getDocument(document_id)));
-	server.registerTool("search_evidence", { description: "列出 Collector replica 中的 PUBLIC Evidence。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().searchEvidence(limit)));
-	server.registerTool("get_evidence", { description: "读取 Collector replica 中指定的 PUBLIC Evidence。", inputSchema: z.object({ evidence_id: z.string().min(1) }) }, async ({ evidence_id }) => researchRead(() => researchAdapter().getEvidence(evidence_id)));
-	server.registerTool("get_theme_accumulator", { description: "读取指定主题的 PUBLIC Evidence Accumulator。", inputSchema: z.object({ subject_key: z.string().min(1) }) }, async ({ subject_key }) => researchRead(() => researchAdapter().getThemeAccumulator(subject_key)));
-	server.registerTool("get_company_evidence_state", { description: "读取指定公司的 PUBLIC Evidence Accumulator 状态。", inputSchema: z.object({ company: z.string().min(1) }) }, async ({ company }) => researchRead(() => researchAdapter().getCompanyEvidenceState(company)));
-	server.registerTool("get_coverage_status", { description: "读取 Collector replica 中的 PUBLIC Research Coverage。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().getCoverageStatus(limit)));
-	server.registerTool("get_source_health", { description: "读取 Research source health；当前 replica 未复制该能力时明确返回 UNSUPPORTED。", inputSchema: z.object({}) }, async () => unsupportedResearchRead());
-	server.registerTool("list_research_jobs", { description: "列出 Collector replica 中的 PUBLIC QUEUED Research Job。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().listResearchJobs(limit)));
-	server.registerTool("get_research_job_context", { description: "读取 Collector replica 中指定 PUBLIC QUEUED Research Job 的上下文。", inputSchema: z.object({ job_id: z.string().min(1) }) }, async ({ job_id }) => researchRead(() => researchAdapter().getResearchJobContext(job_id)));
+	server.registerTool(
+		"search_documents",
+		{
+			description: "在 Collector 的 PUBLIC Research replica 中搜索文档元数据。",
+			inputSchema: z.object({
+				query: z.string().optional(),
+				limit: z.number().int().min(1).max(100).optional(),
+			}),
+		},
+		async ({ query, limit }) =>
+			researchRead(() => researchAdapter().searchDocuments(query, limit)),
+	);
+	server.registerTool(
+		"get_document",
+		{
+			description: "读取 Collector replica 中经 SHA-256 校验的 PUBLIC 文档正文。",
+			inputSchema: z.object({ document_id: z.string().min(1) }),
+		},
+		async ({ document_id }) => researchRead(() => researchAdapter().getDocument(document_id)),
+	);
+	server.registerTool(
+		"search_evidence",
+		{
+			description: "列出 Collector replica 中的 PUBLIC Evidence。",
+			inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+		},
+		async ({ limit }) => researchRead(() => researchAdapter().searchEvidence(limit)),
+	);
+	server.registerTool(
+		"get_evidence",
+		{
+			description: "读取 Collector replica 中指定的 PUBLIC Evidence。",
+			inputSchema: z.object({ evidence_id: z.string().min(1) }),
+		},
+		async ({ evidence_id }) => researchRead(() => researchAdapter().getEvidence(evidence_id)),
+	);
+	server.registerTool(
+		"get_theme_accumulator",
+		{
+			description: "读取指定主题的 PUBLIC Evidence Accumulator。",
+			inputSchema: z.object({ subject_key: z.string().min(1) }),
+		},
+		async ({ subject_key }) =>
+			researchRead(() => researchAdapter().getThemeAccumulator(subject_key)),
+	);
+	server.registerTool(
+		"get_company_evidence_state",
+		{
+			description: "读取指定公司的 PUBLIC Evidence Accumulator 状态。",
+			inputSchema: z.object({ company: z.string().min(1) }),
+		},
+		async ({ company }) =>
+			researchRead(() => researchAdapter().getCompanyEvidenceState(company)),
+	);
+	server.registerTool(
+		"get_coverage_status",
+		{
+			description: "读取 Collector replica 中的 PUBLIC Research Coverage。",
+			inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+		},
+		async ({ limit }) => researchRead(() => researchAdapter().getCoverageStatus(limit)),
+	);
+	server.registerTool(
+		"get_source_health",
+		{
+			description:
+				"读取 Research source health；当前 replica 未复制该能力时明确返回 UNSUPPORTED。",
+			inputSchema: z.object({}),
+		},
+		async () => unsupportedResearchRead(),
+	);
+	server.registerTool(
+		"list_research_jobs",
+		{
+			description: "列出 Collector replica 中的 PUBLIC QUEUED Research Job。",
+			inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+		},
+		async ({ limit }) => researchRead(() => researchAdapter().listResearchJobs(limit)),
+	);
+	server.registerTool(
+		"get_research_job_context",
+		{
+			description: "读取 Collector replica 中指定 PUBLIC QUEUED Research Job 的上下文。",
+			inputSchema: z.object({ job_id: z.string().min(1) }),
+		},
+		async ({ job_id }) => researchRead(() => researchAdapter().getResearchJobContext(job_id)),
+	);
 
 	return server;
 }
@@ -937,21 +1053,35 @@ async function handleResearchReplicaIngest(request: Request, env: Env): Promise<
 	}
 }
 
-/**
- * 请求级 LIVE 叠加门判定（D-1 选项 A）：取 `Authorization` 头与既有
- * `PORTFOLIO_UNIVERSE_TOKEN` 比对。判定实现与写入端点鉴权**同源**
- * （`live-overlay.resolveLiveOverlayStatus()`），此处只做请求对象到原始头的适配。
- */
-function requestLiveOverlayStatus(request: Request | undefined, env: Env): LiveOverlayStatus {
+/** 内部 universe API / writer 鉴权；只认 PORTFOLIO_UNIVERSE_TOKEN。 */
+function requestInternalUniverseStatus(request: Request | undefined, env: Env): LiveOverlayStatus {
 	return resolveLiveOverlayStatus(
 		request?.headers.get("Authorization") ?? null,
 		env.PORTFOLIO_UNIVERSE_TOKEN,
 	);
 }
 
-/** 沿用既有口径：token 未配置或请求头不匹配 → 未授权（fail-closed，`!== "ENABLED"`）。 */
+/**
+ * 外部 ChatGPT / Automation MCP 鉴权；只认独立 Collector client credential，
+ * 并要求 market:read。绝不回退到 PORTFOLIO_UNIVERSE_TOKEN。
+ */
+function requestMcpMarketReadStatus(request: Request | undefined, env: Env): LiveOverlayStatus {
+	const status = resolveMarketReadLiveOverlayStatus(
+		request?.headers.get("Authorization") ?? null,
+		env.COLLECTOR_MCP_CLIENT_TOKEN,
+		env.COLLECTOR_MCP_CLIENT_SCOPES,
+	);
+	// A credential without an explicit production client identity is not an auditable principal.
+	// Fail closed rather than silently granting an identity-less LIVE read.
+	if (status === "ENABLED" && !env.COLLECTOR_MCP_CLIENT_ID?.trim()) {
+		return "SKIPPED_UNAUTHORIZED";
+	}
+	return status;
+}
+
+/** 内部 token 未配置或请求头不匹配 → 未授权（fail-closed，`!== "ENABLED"`）。 */
 function isUniverseAuthorized(request: Request, env: Env): boolean {
-	return isLiveOverlayEnabled(requestLiveOverlayStatus(request, env));
+	return isLiveOverlayEnabled(requestInternalUniverseStatus(request, env));
 }
 
 async function handleUniverseApi(request: Request, env: Env): Promise<Response> {
@@ -1246,7 +1376,7 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 			context,
 			env,
 			// 本端点已在上面用同一入口鉴权（未授权直接 401），故门必为放行态。
-			{ liveOverlayStatus: requestLiveOverlayStatus(request, env) },
+			{ liveOverlayStatus: requestInternalUniverseStatus(request, env) },
 		);
 		return jsonResponse(upstream.snapshot);
 	} catch (error) {
@@ -1291,11 +1421,16 @@ export default {
 		if (url.pathname === "/api/public/quotes") return handlePublicQuotes(request, env);
 		if (url.pathname === "/api/portfolio-quotes")
 			return handleDynamicPortfolioQuotes(request, env);
-		// MCP 面（含 `get_portfolio_quotes`）：按**本请求**的 Authorization 头判定 LIVE 叠加门
-		// （D-1 选项 A）。工厂按请求构造 server，故 `ctx.requestInfo` 就是当前请求。
-		const handler = createMcpHandler((ctx) =>
-			createServer(env, requestLiveOverlayStatus(ctx.requestInfo, env)),
-		);
+		// MCP 面（含 `get_portfolio_quotes`）：外部 client auth 与内部 universe token 解耦。
+		// 工厂按请求构造 server，故 `ctx.requestInfo` 就是当前请求；market:read 不足一律 fail-closed。
+		const handler = createMcpHandler((ctx) => {
+			const liveOverlayStatus = requestMcpMarketReadStatus(ctx.requestInfo, env);
+			logBridgeStage(bridgeContext("mcp:market-read-auth"), "mcp_market_read_auth", {
+				...marketReadAuditFields(env, liveOverlayStatus),
+				live_overlay_status: liveOverlayStatus,
+			});
+			return createServer(env, liveOverlayStatus);
+		});
 		return handler(request, env, ctx);
 	},
 	async scheduled(controller: ScheduledController, env: Env) {

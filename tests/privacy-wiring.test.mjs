@@ -59,3 +59,27 @@ test("private LIVE surface is preserved alongside the public one (dual contract)
 	assert.match(gatedBody, /return jsonResponse\(upstream\.snapshot\);/);
 	assert.doesNotMatch(gatedBody, /toPublicQuoteSnapshot/);
 });
+
+test("Issue #8 auth split cannot make the internal universe token an MCP credential", async () => {
+	const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
+	const internalGate = source.slice(
+		source.indexOf("function requestInternalUniverseStatus"),
+		source.indexOf("function requestMcpMarketReadStatus"),
+	);
+	const mcpGate = source.slice(
+		source.indexOf("function requestMcpMarketReadStatus"),
+		source.indexOf("function isUniverseAuthorized"),
+	);
+	assert.match(internalGate, /PORTFOLIO_UNIVERSE_TOKEN/);
+	assert.doesNotMatch(internalGate, /COLLECTOR_MCP_CLIENT_TOKEN/);
+	assert.match(mcpGate, /COLLECTOR_MCP_CLIENT_TOKEN/);
+	assert.match(mcpGate, /COLLECTOR_MCP_CLIENT_SCOPES/);
+	assert.match(mcpGate, /COLLECTOR_MCP_CLIENT_ID/);
+	const auditHelper = source.slice(
+		source.indexOf("function marketReadAuditFields"),
+		source.indexOf("/** KV 中的 LIVE 面"),
+	);
+	assert.match(auditHelper, /MARKET_READ_AUTH_MODE/);
+	assert.doesNotMatch(auditHelper, /COLLECTOR_MCP_CLIENT_TOKEN|PORTFOLIO_UNIVERSE_TOKEN/);
+	assert.doesNotMatch(mcpGate, /PORTFOLIO_UNIVERSE_TOKEN/);
+});
