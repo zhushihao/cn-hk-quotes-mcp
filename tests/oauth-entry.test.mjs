@@ -58,7 +58,7 @@ test("OAuth discovery advertises market:read and offline refresh support with PK
 	assert.match(oauth, /authorizeEndpoint: "\/authorize"/);
 });
 
-test("ChatGPT issuer compatibility omits the RFC 9207 advertisement without stripping the callback issuer", async () => {
+test("ChatGPT issuer compatibility omits RFC 9207 advertisement and strips iss only from ChatGPT connector callbacks", async () => {
 	const diagnostics = await source("../src/oauth-diagnostics-entry.ts");
 	assert.match(
 		diagnostics,
@@ -69,8 +69,12 @@ test("ChatGPT issuer compatibility omits the RFC 9207 advertisement without stri
 		diagnostics,
 		/response = await applyIssuerAdvertisementCompat\(request, response\)/,
 	);
+	assert.match(diagnostics, /function applyChatGptCallbackIssuerCompat/);
+	assert.match(diagnostics, /redirect\.hostname === "chatgpt\.com"/);
+	assert.match(diagnostics, /redirect\.pathname\.startsWith\("\/connector\/oauth\/"\)/);
+	assert.match(diagnostics, /redirect\.searchParams\.delete\("iss"\)/);
+	assert.match(diagnostics, /if \(authorizePost\) response = applyChatGptCallbackIssuerCompat\(response\)/);
 	assert.match(diagnostics, /iss_present: url\.searchParams\.has\("iss"\)/);
-	assert.doesNotMatch(diagnostics, /url\.searchParams\.delete\("iss"\)/);
 });
 
 test("anonymous MCP remains quote-only compatible while OAuth bearer is validated before core", async () => {
