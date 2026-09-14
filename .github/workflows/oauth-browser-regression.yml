@@ -6,7 +6,8 @@ on:
   pull_request:
     paths:
       - 'src/oauth*.ts'
-      - 'scripts/test-oauth-browser-navigation.py'
+      - 'src/d1-oauth-kv.ts'
+      - 'scripts/test-oauth-*.py'
       - '.github/workflows/oauth-browser-regression.yml'
   workflow_dispatch:
 
@@ -21,23 +22,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install isolated browser test dependencies
+      - name: Install isolated test dependencies
         run: |
+          npm install --no-audit --no-fund
           python -m pip install playwright==1.55.0
           python -m playwright install --with-deps chromium
-      - name: Prove consent navigation and body isolation in Chromium
+      - name: Prove historical browser failure and corrected navigation
         run: python scripts/test-oauth-browser-navigation.py
+      - name: Test actual Worker browser consent, D1, token exchange, refresh and revocation
+        run: python scripts/test-oauth-runtime.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: oauth-browser-navigation-proof
-          path: oauth-browser-navigation-results.json
+          name: oauth-browser-and-runtime-proof
+          path: |
+            oauth-browser-navigation-results.json
+            oauth-runtime-results.json
           retention-days: 7
 
   public-protocol-diagnostic:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
