@@ -100,7 +100,12 @@ test("owner secret stays out of rendered HTML, OAuth props and logs", async () =
 
 test("internal universe credential remains outside the OAuth adapter", async () => {
 	const oauth = await source("../src/oauth-entry.ts");
-	assert.doesNotMatch(oauth, /PORTFOLIO_UNIVERSE_TOKEN/);
+	const runtimeStart = oauth.indexOf("function oauthRuntimeEnv");
+	const runtimeEnd = oauth.indexOf("function escapeHtml", runtimeStart);
+	const runtime = oauth.slice(runtimeStart, runtimeEnd);
+	assert.match(runtime, /createD1OAuthKv\(env\.RESEARCH_REPLICA\)/);
+	assert.doesNotMatch(runtime, /PORTFOLIO_UNIVERSE_TOKEN/);
+	assert.doesNotMatch(runtime, /env\.PORTFOLIO_UNIVERSE/);
 	const core = await source("../src/index.ts");
 	const internalStart = core.indexOf("function requestInternalUniverseStatus");
 	const internalEnd = core.indexOf("function requestMcpMarketReadStatus", internalStart);
