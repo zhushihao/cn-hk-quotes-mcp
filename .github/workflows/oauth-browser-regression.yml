@@ -1,0 +1,77 @@
+name: OAuth Browser Regression
+
+on:
+  push:
+    branches: [issue-8-auth-e2e-recovery]
+  pull_request:
+    paths:
+      - 'src/oauth*.ts'
+      - 'scripts/test-oauth-browser-navigation.py'
+      - '.github/workflows/oauth-browser-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-navigation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install isolated browser test dependencies
+        run: |
+          python -m pip install playwright==1.55.0
+          python -m playwright install --with-deps chromium
+      - name: Prove consent navigation and body isolation in Chromium
+        run: python scripts/test-oauth-browser-navigation.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oauth-browser-navigation-proof
+          path: oauth-browser-navigation-results.json
+          retention-days: 7
+
+  public-protocol-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Bounded anonymous initialize probes (no credential or private data)
+        shell: python
+        run: |
+          import json
+          import urllib.error
+          import urllib.request
+          origin = 'https://cn-hk-quotes-mcp.zhushihao710.workers.dev'
+          payload = json.dumps({
+              'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+              'params': {'protocolVersion': '2025-03-26', 'capabilities': {},
+                         'clientInfo': {'name': 'quantpro-anonymous-protocol-diagnostic', 'version': '1'}}
+          }).encode()
+          results = []
+          for accept in ['application/json', 'application/json, text/event-stream', '*/*']:
+              request = urllib.request.Request(origin + '/mcp', data=payload, method='POST', headers={
+                  'Content-Type': 'application/json', 'Accept': accept,
+                  'User-Agent': 'quantpro-anonymous-protocol-diagnostic/1'})
+              try:
+                  response = urllib.request.urlopen(request, timeout=20)
+              except urllib.error.HTTPError as error:
+                  response = error
+              with response:
+                  body = response.read(65536)
+                  results.append({
+                      'accept_case': accept, 'http_status': response.status,
+                      'content_type': response.headers.get('Content-Type'),
+                      'challenge_present': bool(response.headers.get('WWW-Authenticate')),
+                      'body_mentions_accept': b'accept' in body.lower(),
+                      'body_mentions_event_stream': b'text/event-stream' in body.lower(),
+                      'initialize_result_present': b'protocolVersion' in body and b'serverInfo' in body,
+                  })
+          print('ANONYMOUS_INITIALIZE_DIAGNOSTIC')
+          print(json.dumps(results, indent=2))
+          print('These are transport probes, NOT ChatGPT acceptance.')
