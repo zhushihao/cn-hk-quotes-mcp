@@ -1,0 +1,71 @@
+name: Production OAuth Smoke
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  oauth-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Wait for Cloudflare deployment and verify OAuth metadata
+        shell: python
+        run: |
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          origin = "https://cn-hk-quotes-mcp.zhushihao710.workers.dev"
+          resource = f"{origin}/mcp"
+          auth_url = f"{origin}/.well-known/oauth-authorization-server"
+          resource_url = f"{origin}/.well-known/oauth-protected-resource/mcp"
+
+          last_error = None
+          for attempt in range(1, 31):
+              try:
+                  def fetch_json(url):
+                      req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "quantpro-prod-oauth-smoke/1"})
+                      with urllib.request.urlopen(req, timeout=10) as response:
+                          if response.status != 200:
+                              raise RuntimeError(f"{url} returned HTTP {response.status}")
+                          return json.loads(response.read().decode("utf-8"))
+
+                  auth = fetch_json(auth_url)
+                  protected = fetch_json(resource_url)
+
+                  assert auth.get("issuer") == origin, auth
+                  assert auth.get("authorization_endpoint") == f"{origin}/authorize", auth
+                  assert auth.get("token_endpoint") == f"{origin}/oauth/token", auth
+                  assert auth.get("registration_endpoint") == f"{origin}/oauth/register", auth
+                  assert "S256" in auth.get("code_challenge_methods_supported", []), auth
+                  scopes = set(auth.get("scopes_supported", []))
+                  assert {"market:read", "offline_access"}.issubset(scopes), auth
+
+                  assert protected.get("resource") == resource, protected
+                  assert origin in protected.get("authorization_servers", []), protected
+                  assert "market:read" in protected.get("scopes_supported", []), protected
+
+                  print("PROD_OAUTH_DISCOVERY_OK")
+                  print(json.dumps({
+                      "issuer": auth.get("issuer"),
+                      "authorization_endpoint": auth.get("authorization_endpoint"),
+                      "token_endpoint": auth.get("token_endpoint"),
+                      "registration_endpoint": auth.get("registration_endpoint"),
+                      "scopes_supported": auth.get("scopes_supported"),
+                      "code_challenge_methods_supported": auth.get("code_challenge_methods_supported"),
+                      "resource": protected.get("resource"),
+                  }, indent=2, sort_keys=True))
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  print(f"attempt {attempt}/30: {type(exc).__name__}: {exc}")
+                  if attempt == 30:
+                      raise
+                  time.sleep(10)
