@@ -154,7 +154,10 @@ code{background:#f1f2f4;padding:2px 5px;border-radius:4px}
 </main></body></html>`;
 }
 
-async function parseAuthorizationRequest(request: Request, env: Env): Promise<AuthRequest | Response> {
+async function parseAuthorizationRequest(
+	request: Request,
+	env: Env,
+): Promise<AuthRequest | Response> {
 	try {
 		const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
 		if (!validRequestedScopes(authRequest)) {
@@ -185,7 +188,8 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
 				"Content-Type": "text/html; charset=utf-8",
 				"Cache-Control": "no-store",
 				"Set-Cookie": `${CSRF_COOKIE}=${csrf}; HttpOnly; Secure; SameSite=Lax; Path=/authorize; Max-Age=600`,
-				"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+				"Content-Security-Policy":
+					"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 				"Referrer-Policy": "no-referrer",
 			},
 		});
@@ -213,7 +217,8 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
 					"Content-Type": "text/html; charset=utf-8",
 					"Cache-Control": "no-store",
 					"Set-Cookie": `${CSRF_COOKIE}=${nextCsrf}; HttpOnly; Secure; SameSite=Lax; Path=/authorize; Max-Age=600`,
-					"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+					"Content-Security-Policy":
+						"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 					"Referrer-Policy": "no-referrer",
 				},
 			},
@@ -273,10 +278,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
 	// bridge between the OAuth gateway and the unchanged core market-read gate. External
 	// Authorization is never forwarded verbatim, so a copied bridge secret cannot bypass OAuth.
 	const bridgeSecret = env.COLLECTOR_MCP_CLIENT_TOKEN;
-	const forwarded = withAuthorization(
-		request,
-		bridgeSecret ? `Bearer ${bridgeSecret}` : null,
-	);
+	const forwarded = withAuthorization(request, bridgeSecret ? `Bearer ${bridgeSecret}` : null);
 	return coreWorker.fetch(forwarded, env, ctx);
 }
 
