@@ -34,7 +34,11 @@ test("anonymous MCP remains quote-only compatible while OAuth bearer is validate
 	assert.match(body, /if \(token === null\)[\s\S]*coreWorker\.fetch\(withAuthorization\(request, null\)/);
 	assert.match(body, /OAUTH_PROVIDER\.unwrapToken<OAuthProps>\(token\)/);
 	assert.match(body, /summary\.scope\.includes\(MARKET_READ_SCOPE\)/);
-	assert.match(body, /audienceMatches\(summary\.audience\)/);
+	assert.match(body, /tokenHasMarketRead\(summary\)/);
+	const tokenGateStart = oauth.indexOf("function tokenHasMarketRead");
+	const tokenGateEnd = oauth.indexOf("async function handleMcp", tokenGateStart);
+	const tokenGate = oauth.slice(tokenGateStart, tokenGateEnd);
+	assert.match(tokenGate, /audienceMatches\(summary\.audience\)/);
 	assert.match(body, /bridgeSecret \? `Bearer \$\{bridgeSecret\}` : null/);
 });
 
