@@ -401,7 +401,11 @@ export default {
 				return await oauthProvider.fetch(request, runtimeEnv, ctx);
 			} catch (error) {
 				return Response.json(
-					{ ok: false, stage: "OAUTH_PROVIDER_DCR", ...diagnosticError(error) } satisfies StorageProbeResult,
+					{
+						ok: false,
+						stage: "OAUTH_PROVIDER_DCR",
+						...diagnosticError(error),
+					} satisfies StorageProbeResult,
 					{ status: 500 },
 				);
 			}
