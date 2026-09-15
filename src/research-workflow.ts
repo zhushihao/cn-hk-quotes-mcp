@@ -55,7 +55,7 @@ const RECEIPT_CURSOR_VERSION = "rcpt1";
 export const RESEARCH_PRODUCTION_PRINCIPAL = "chatgpt-production";
 
 /** §5.6 domain reason closed sets. */
-export const CLAIM_REASONS = ["NOT_FOUND", "TERMINAL"] as const;
+export const CLAIM_REASONS = ["NOT_FOUND", "TERMINAL", "DEFERRED"] as const;
 export const SUBMIT_REASONS = [
 	"CONFLICT",
 	"SECOND_RESULT",
@@ -150,6 +150,18 @@ export type SubmitOutcome =
 	| SubmitIdempotentReplay
 	| SubmitRejected;
 
+export const DEFER_REASONS = [
+	"RECHECK_REQUIRED",
+	"UPSTREAM_UNAVAILABLE",
+	"NEEDS_OWNER_INPUT",
+] as const;
+export type DeferReason = (typeof DEFER_REASONS)[number];
+
+export type DeferOutcome =
+	| { status: "DEFERRED"; job_id: string; recheck_at: string; request_id: string }
+	| { status: "IDEMPOTENT_REPLAY"; job_id: string; recheck_at: string; request_id: string }
+	| { status: "REJECTED"; job_id: string; reason: SubmitReason; detail: { sub_reason?: LeaseSubReason }; request_id: string };
+
 export type ResearchReceiptItem = {
 	receipt_id: string;
 	job_id: string;
@@ -170,6 +182,8 @@ export type ResearchReceiptsPage = {
 };
 
 type ReceiptCursor = { createdAt: string; eventId: string; legacy: boolean };
+
+type DeferralRow = { idempotency_key: string; recheck_at: string };
 
 /** Versioned opaque cursor for the stable `(created_at,event_id)` order. */
 function encodeReceiptCursor(createdAt: string, eventId: string): string {
@@ -295,6 +309,16 @@ async function selectTerminal(db: ResearchWorkflowDatabase, jobId: string): Prom
 	return row !== null;
 }
 
+async function selectDeferral(
+	db: ResearchWorkflowDatabase,
+	jobId: string,
+): Promise<DeferralRow | null> {
+	return db
+		.prepare("SELECT idempotency_key, recheck_at FROM research_job_deferrals WHERE job_id=?")
+		.bind(jobId)
+		.first<DeferralRow>();
+}
+
 /**
  * §A2 claim: single-owner conditional atomic preemption with fixed TTL,
  * lazy expiry recovery, same-owner idempotent re-claim, and a PRIVATE/
@@ -336,6 +360,10 @@ export async function claimResearchJob(
 		}).run();
 		return { status: "NOT_CLAIMABLE", job_id: jobId, reason: "TERMINAL", request_id: requestId };
 	}
+	const activeDeferral = await selectDeferral(db, jobId);
+	if (activeDeferral && activeDeferral.recheck_at > now) {
+		return { status: "NOT_CLAIMABLE", job_id: jobId, reason: "DEFERRED", request_id: requestId };
+	}
 
 	const expiresAt = new Date(Date.parse(now) + RESEARCH_LEASE_TTL_SECONDS * 1000).toISOString();
 	// The terminal predicate is inside the same conditional write as lease
@@ -344,9 +372,9 @@ export async function claimResearchJob(
 	const preempt = () =>
 		db
 			.prepare(
-				"INSERT INTO research_job_leases (job_id, lease_owner, claim_token, claimed_at, lease_expires_at, claim_count) SELECT ?, ?, ?, ?, ?, 1 WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) ON CONFLICT(job_id) DO UPDATE SET lease_owner=excluded.lease_owner, claim_token=excluded.claim_token, claimed_at=excluded.claimed_at, lease_expires_at=excluded.lease_expires_at, claim_count=research_job_leases.claim_count+1 WHERE research_job_leases.lease_expires_at <= ? AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=excluded.job_id)",
+				"INSERT INTO research_job_leases (job_id, lease_owner, claim_token, claimed_at, lease_expires_at, claim_count) SELECT ?, ?, ?, ?, ?, 1 WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) AND NOT EXISTS (SELECT 1 FROM research_job_deferrals WHERE job_id=? AND recheck_at > ?) ON CONFLICT(job_id) DO UPDATE SET lease_owner=excluded.lease_owner, claim_token=excluded.claim_token, claimed_at=excluded.claimed_at, lease_expires_at=excluded.lease_expires_at, claim_count=research_job_leases.claim_count+1 WHERE research_job_leases.lease_expires_at <= ? AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=excluded.job_id) AND NOT EXISTS (SELECT 1 FROM research_job_deferrals WHERE job_id=excluded.job_id AND recheck_at > ?)",
 			)
-			.bind(jobId, leaseOwner, `clt_${randomHex32()}`, now, expiresAt, jobId, now)
+			.bind(jobId, leaseOwner, `clt_${randomHex32()}`, now, expiresAt, jobId, jobId, now, now, now)
 			.run();
 
 	for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -396,6 +424,10 @@ export async function claimResearchJob(
 				origin: null, detail: eventDetail("TERMINAL"), requestId, createdAt: now,
 			}).run();
 			return { status: "NOT_CLAIMABLE", job_id: jobId, reason: "TERMINAL", request_id: requestId };
+		}
+		const deferred = await selectDeferral(db, jobId);
+		if (deferred && deferred.recheck_at > now) {
+			return { status: "NOT_CLAIMABLE", job_id: jobId, reason: "DEFERRED", request_id: requestId };
 		}
 		const current = await selectLease(db, jobId);
 		if (!current || current.lease_expires_at <= now) continue; // raced; retry once
@@ -944,6 +976,79 @@ export async function submitResearchResultProposal(
 		job_status: "QUEUED",
 		request_id: requestId,
 	};
+}
+
+/**
+ * Remote defer is the only way an Automation can give a claimed job back
+ * before lease expiry.  It is deliberately not a RESEARCH-local transition:
+ * the D1 batch writes a durable recheck gate and releases precisely the
+ * caller's still-effective fenced lease.  Formal completion remains owned
+ * exclusively by submitResearchResultProposal.
+ */
+export async function deferResearchJob(
+	db: ResearchWorkflowDatabase,
+	input: {
+		jobId: string;
+		claimToken: string;
+		idempotencyKey: string;
+		reason: DeferReason;
+		recheckAt: string;
+		callerPrincipal: string;
+		requestId: string;
+		now: string;
+	},
+): Promise<DeferOutcome> {
+	const { jobId, callerPrincipal, requestId } = input;
+	if (typeof jobId !== "string" || jobId.length < 1 || jobId.length > RESEARCH_CLAIM_JOB_ID_MAX_LENGTH) fail("FILTERED");
+	if (typeof callerPrincipal !== "string" || !callerPrincipal) fail("INTEGRITY_FAILED");
+	if (typeof input.idempotencyKey !== "string" || !RESEARCH_IDEMPOTENCY_KEY_PATTERN.test(input.idempotencyKey)) {
+		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
+	}
+	if (!(DEFER_REASONS as readonly string[]).includes(input.reason)) {
+		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
+	}
+	const now = normalizedIso(input.now, "now");
+	const recheckAt = normalizedIso(input.recheckAt, "recheck_at");
+	if (recheckAt <= now) {
+		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
+	}
+	const existing = await selectDeferral(db, jobId);
+	if (existing) {
+		if (existing.idempotency_key === input.idempotencyKey) {
+			return { status: "IDEMPOTENT_REPLAY", job_id: jobId, recheck_at: existing.recheck_at, request_id: requestId };
+		}
+		return { status: "REJECTED", job_id: jobId, reason: "CONFLICT", detail: {}, request_id: requestId };
+	}
+
+	// INSERT is conditional on the exact live lease and terminal absence.  It
+	// and the fenced release share one D1 transaction, so defer vs submit has
+	// a single winner and cannot leave a terminal job with a lease.
+	const result = await db.batch([
+		db
+			.prepare(
+				"INSERT INTO research_job_deferrals (job_id, idempotency_key, lease_owner, reason, recheck_at, deferred_at, request_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) AND EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND lease_expires_at > ?)",
+			)
+			.bind(jobId, input.idempotencyKey, callerPrincipal, input.reason, recheckAt, now, requestId, jobId, jobId, callerPrincipal, input.claimToken, now),
+		db
+			.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND lease_expires_at > ?")
+			.bind(jobId, callerPrincipal, input.claimToken, now),
+	] as never);
+	const inserted = Number((result as Array<{ meta?: { changes?: number } }>)[0]?.meta?.changes ?? 0);
+	if (inserted === 1) {
+		return { status: "DEFERRED", job_id: jobId, recheck_at: recheckAt, request_id: requestId };
+	}
+	const replay = await selectDeferral(db, jobId);
+	if (replay?.idempotency_key === input.idempotencyKey) {
+		return { status: "IDEMPOTENT_REPLAY", job_id: jobId, recheck_at: replay.recheck_at, request_id: requestId };
+	}
+	if (replay) return { status: "REJECTED", job_id: jobId, reason: "CONFLICT", detail: {}, request_id: requestId };
+	if (await selectTerminal(db, jobId)) return { status: "REJECTED", job_id: jobId, reason: "SECOND_RESULT", detail: {}, request_id: requestId };
+	const lease = await selectLease(db, jobId);
+	let subReason: LeaseSubReason = "NO_LEASE";
+	if (lease && lease.lease_expires_at <= now) subReason = "EXPIRED";
+	else if (lease && lease.claim_token !== input.claimToken) subReason = "TOKEN_MISMATCH";
+	else if (lease && lease.lease_owner !== callerPrincipal) subReason = "OWNER_MISMATCH";
+	return { status: "REJECTED", job_id: jobId, reason: "LEASE_INVALID", detail: { sub_reason: subReason }, request_id: requestId };
 }
 
 /**

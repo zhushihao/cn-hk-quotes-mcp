@@ -18,6 +18,7 @@ class SqliteD1 {
 			"0001_research_replica.sql",
 			"0003_research_workflow.sql",
 			"0004_research_replica_v4.sql",
+			"0005_research_workflow_deferrals.sql",
 		]) {
 			this.sqlite.exec(readFileSync(path.join("migrations", migration), "utf8"));
 		}
@@ -196,5 +197,77 @@ test("G09 opaque receipt cursor reaches all 501 same-timestamp events without re
 	await assert.rejects(
 		() => workflow.listResearchJobReceipts(db, { since: "rcpt1.not-base64", limit: 1, now: NOW }),
 		(error) => error?.error_code === "INTEGRITY_FAILED",
+	);
+});
+
+test("G08 defer is a fenced remote release, retries idempotently, and recheck gates claims", async () => {
+	const db = new SqliteD1();
+	db.seedJob("job-defer");
+	const lease = await workflow.claimResearchJob(db, {
+		jobId: "job-defer", leaseOwner: "synthetic-defer", requestId: "req-defer-claim", now: NOW,
+	});
+	assert.equal(lease.status, "CLAIMED");
+	const input = {
+		jobId: "job-defer", claimToken: lease.claim_token, idempotencyKey: "defer-key-0001",
+		reason: "RECHECK_REQUIRED", recheckAt: "2026-09-15T00:30:00.000Z",
+		callerPrincipal: "synthetic-defer", requestId: "req-defer", now: NOW,
+	};
+	const deferred = await workflow.deferResearchJob(db, input);
+	assert.equal(deferred.status, "DEFERRED");
+	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_leases WHERE job_id=?", "job-defer"), 0);
+	const duplicate = await workflow.deferResearchJob(db, { ...input, requestId: "req-defer-retry" });
+	assert.equal(duplicate.status, "IDEMPOTENT_REPLAY");
+	const early = await workflow.claimResearchJob(db, {
+		jobId: "job-defer", leaseOwner: "synthetic-next", requestId: "req-early", now: "2026-09-15T00:10:00.000Z",
+	});
+	assert.equal(early.status, "NOT_CLAIMABLE");
+	assert.equal(early.reason, "DEFERRED");
+	const afterRecheck = await workflow.claimResearchJob(db, {
+		jobId: "job-defer", leaseOwner: "synthetic-next", requestId: "req-recheck", now: "2026-09-15T00:31:00.000Z",
+	});
+	assert.equal(afterRecheck.status, "CLAIMED");
+});
+
+test("G09 terminal-versus-claim leaves no effective lease", async () => {
+	const db = new SqliteD1();
+	db.seedJob("job-terminal-race");
+	db.sqlite.prepare(
+		"INSERT INTO research_job_terminal (job_id, terminal_status, proposal_id, completed_at) VALUES ('job-terminal-race', 'COMPLETED', 'prp-existing', ?)",
+	).run(NOW);
+	const outcome = await workflow.claimResearchJob(db, {
+		jobId: "job-terminal-race", leaseOwner: "synthetic-racer", requestId: "req-race", now: NOW,
+	});
+	assert.equal(outcome.status, "NOT_CLAIMABLE");
+	assert.equal(outcome.reason, "TERMINAL");
+	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_leases WHERE job_id=?", "job-terminal-race"), 0);
+});
+
+test("G09 submit-versus-defer has one winner and never leaves terminal plus lease", async () => {
+	const db = new SqliteD1();
+	db.seedJob("job-submit-defer");
+	const lease = await workflow.claimResearchJob(db, {
+		jobId: "job-submit-defer", leaseOwner: workflow.RESEARCH_PRODUCTION_PRINCIPAL, requestId: "req-race-claim", now: NOW,
+	});
+	assert.equal(lease.status, "CLAIMED");
+	const [submitted, deferred] = await Promise.all([
+		workflow.submitResearchResultProposal(db, {
+			jobId: "job-submit-defer", claimToken: lease.claim_token, idempotencyKey: "submit-defer-submit",
+			origin: "CHATGPT", proposal: proposal("job-submit-defer"), callerPrincipal: workflow.RESEARCH_PRODUCTION_PRINCIPAL,
+			requestId: "req-race-submit", now: NOW,
+		}),
+		workflow.deferResearchJob(db, {
+			jobId: "job-submit-defer", claimToken: lease.claim_token, idempotencyKey: "submit-defer-defer",
+			reason: "RECHECK_REQUIRED", recheckAt: "2026-09-15T00:30:00.000Z",
+			callerPrincipal: workflow.RESEARCH_PRODUCTION_PRINCIPAL, requestId: "req-race-defer", now: NOW,
+		}),
+	]);
+	assert.equal(
+		(submitted.status === "ACCEPTED" ? 1 : 0) + (deferred.status === "DEFERRED" ? 1 : 0),
+		1,
+	);
+	assert.equal(
+		db.count("SELECT COUNT(*) AS count FROM research_job_terminal WHERE job_id=?", "job-submit-defer") *
+			db.count("SELECT COUNT(*) AS count FROM research_job_leases WHERE job_id=?", "job-submit-defer"),
+		0,
 	);
 });

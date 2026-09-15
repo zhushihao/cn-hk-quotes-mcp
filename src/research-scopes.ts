@@ -82,3 +82,25 @@ export function resolveResearchClientId(
 	if (typeof forwardedClientId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(forwardedClientId)) return null;
 	return forwardedClientId;
 }
+
+/** All three grants are required: client allowlist, scope, and job namespace. */
+export function permitsFormalResearchOperation(input: {
+	clientId: string | null;
+	scopes: ReadonlySet<string>;
+	requiredScope: string;
+	configuredClientIds: string | null | undefined;
+	configuredNamespaces: string | null | undefined;
+	jobId: string;
+}): boolean {
+	if (!input.clientId || !input.scopes.has(input.requiredScope)) return false;
+	// These identities belong to engineering, RESEARCH transport, or receipt
+	// consumption roles.  Configuration cannot accidentally promote any of
+	// them into a formal ChatGPT result owner merely by adding a scope.
+	if (new Set(["codex", "engineering", "producer", "receipt-reader", "receipt_reader"]).has(input.clientId.toLowerCase())) {
+		return false;
+	}
+	const clients = parseScopeList(input.configuredClientIds);
+	const namespaces = parseScopeList(input.configuredNamespaces);
+	if (!clients.has(input.clientId) || namespaces.size === 0) return false;
+	return [...namespaces].some((namespace) => input.jobId.startsWith(`${namespace}:`));
+}

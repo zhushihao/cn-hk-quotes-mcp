@@ -43,10 +43,12 @@ import {
 	RESEARCH_SUBMIT_SCOPE,
 	resolveResearchScopes,
 	resolveResearchClientId,
+	permitsFormalResearchOperation,
 } from "./research-scopes.ts";
 import {
 	RESEARCH_PRODUCTION_PRINCIPAL,
 	claimResearchJob,
+	deferResearchJob,
 	listResearchJobReceipts,
 	submitResearchResultProposal,
 } from "./research-workflow.ts";
@@ -75,6 +77,8 @@ interface Env {
 	COLLECTOR_MCP_CLIENT_SCOPES?: string;
 	/** Exact OAuth client-id allowlist for formal Research queue operations. */
 	COLLECTOR_MCP_FORMAL_CLIENT_IDS?: string;
+	/** Prefix allowlist for formal Research jobs, e.g. `research-formal`. */
+	COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES?: string;
 	/** 旧行情 origin（cn-hk-quotes-proxy / chatgpt.site）启用 Cloudflare Access 后注入。 */
 	CF_ACCESS_CLIENT_ID?: string;
 	CF_ACCESS_CLIENT_SECRET?: string;
@@ -891,9 +895,6 @@ export function createServer(
 		}
 	};
 	const researchRead = researchDomain;
-	const formalClientIds = new Set((env?.COLLECTOR_MCP_FORMAL_CLIENT_IDS ?? "").split(/[\s,]+/).filter(Boolean));
-	const isFormalResearchClient = (): boolean =>
-		researchClientId !== null && formalClientIds.has(researchClientId);
 	const callerPrincipal = (): string => RESEARCH_PRODUCTION_PRINCIPAL;
 	const requireResearchScope = (scope: string, tool: string) => {
 		if (researchScopes.has(scope)) return null;
@@ -915,8 +916,15 @@ export function createServer(
 			content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }],
 		};
 	};
-	const requireFormalResearchClient = (tool: string) => {
-		if (isFormalResearchClient()) return null;
+	const requireFormalResearchClient = (tool: string, requiredScope: string, jobId: string) => {
+		if (permitsFormalResearchOperation({
+			clientId: researchClientId,
+			scopes: researchScopes,
+			requiredScope,
+			configuredClientIds: env?.COLLECTOR_MCP_FORMAL_CLIENT_IDS,
+			configuredNamespaces: env?.COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES,
+			jobId,
+		})) return null;
 		const safe = new ResearchBoundaryError("FILTERED").asError();
 		console.log(JSON.stringify({ event: "research_tool_client_denied", tool, client_id: researchClientId ?? null, request_id: safe.request_id }));
 		return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
@@ -1038,7 +1046,7 @@ export function createServer(
 		async ({ job_id }) => {
 			const denied = requireResearchScope(RESEARCH_CLAIM_SCOPE, "claim_research_job");
 			if (denied) return denied;
-			const clientDenied = requireFormalResearchClient("claim_research_job");
+			const clientDenied = requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE, job_id);
 			if (clientDenied) return clientDenied;
 			return researchRead(async () =>
 				claimResearchJob(researchWorkflowDb(), {
@@ -1066,7 +1074,7 @@ export function createServer(
 		async ({ job_id, claim_token, idempotency_key, origin, proposal }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "submit_research_result_proposal");
 			if (denied) return denied;
-			const clientDenied = requireFormalResearchClient("submit_research_result_proposal");
+			const clientDenied = requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE, job_id);
 			if (clientDenied) return clientDenied;
 			return researchRead(async () =>
 				submitResearchResultProposal(researchWorkflowDb(), {
@@ -1075,6 +1083,38 @@ export function createServer(
 					idempotencyKey: idempotency_key,
 					origin,
 					proposal,
+					callerPrincipal: callerPrincipal(),
+					requestId: crypto.randomUUID().replaceAll("-", ""),
+					now: new Date().toISOString(),
+				}),
+			);
+		},
+	);
+	server.registerTool(
+		"defer_research_job",
+		{
+			description:
+				"远端延期当前正式租约到指定 recheck 时刻并原子释放租约；defer 不产生完成终态，正式终态仅由提交 result proposal 产生。需要 research:submit scope。",
+			inputSchema: z.object({
+				job_id: z.string().min(1),
+				claim_token: z.string().min(1),
+				idempotency_key: z.string().min(1),
+				reason: z.enum(["RECHECK_REQUIRED", "UPSTREAM_UNAVAILABLE", "NEEDS_OWNER_INPUT"]),
+				recheck_at: z.string().datetime(),
+			}),
+		},
+		async ({ job_id, claim_token, idempotency_key, reason, recheck_at }) => {
+			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "defer_research_job");
+			if (denied) return denied;
+			const clientDenied = requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE, job_id);
+			if (clientDenied) return clientDenied;
+			return researchRead(async () =>
+				deferResearchJob(researchWorkflowDb(), {
+					jobId: job_id,
+					claimToken: claim_token,
+					idempotencyKey: idempotency_key,
+					reason,
+					recheckAt: recheck_at,
 					callerPrincipal: callerPrincipal(),
 					requestId: crypto.randomUUID().replaceAll("-", ""),
 					now: new Date().toISOString(),
