@@ -38,9 +38,11 @@ import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portf
 import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
 import {
 	FORWARDED_SCOPES_HEADER,
+	FORWARDED_CLIENT_ID_HEADER,
 	RESEARCH_CLAIM_SCOPE,
 	RESEARCH_SUBMIT_SCOPE,
 	resolveResearchScopes,
+	resolveResearchClientId,
 } from "./research-scopes.ts";
 import {
 	RESEARCH_PRODUCTION_PRINCIPAL,
@@ -71,6 +73,8 @@ interface Env {
 	COLLECTOR_MCP_CLIENT_ID?: string;
 	/** 空格或逗号分隔的批准 scopes；LIVE overlay 至少要求 market:read。 */
 	COLLECTOR_MCP_CLIENT_SCOPES?: string;
+	/** Exact OAuth client-id allowlist for formal Research queue operations. */
+	COLLECTOR_MCP_FORMAL_CLIENT_IDS?: string;
 	/** 旧行情 origin（cn-hk-quotes-proxy / chatgpt.site）启用 Cloudflare Access 后注入。 */
 	CF_ACCESS_CLIENT_ID?: string;
 	CF_ACCESS_CLIENT_SECRET?: string;
@@ -663,6 +667,7 @@ export function createServer(
 	env?: Env,
 	liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED",
 	researchScopes: ReadonlySet<string> = new Set(),
+	researchClientId: string | null = null,
 ) {
 	const server = new McpServer({
 		name: "QuantPro Collector",
@@ -886,8 +891,10 @@ export function createServer(
 		}
 	};
 	const researchRead = researchDomain;
-	const callerPrincipal = (environment: Env | undefined): string =>
-		environment?.COLLECTOR_MCP_CLIENT_ID?.trim() || RESEARCH_PRODUCTION_PRINCIPAL;
+	const formalClientIds = new Set((env?.COLLECTOR_MCP_FORMAL_CLIENT_IDS ?? "").split(/[\s,]+/).filter(Boolean));
+	const isFormalResearchClient = (): boolean =>
+		researchClientId !== null && formalClientIds.has(researchClientId);
+	const callerPrincipal = (): string => RESEARCH_PRODUCTION_PRINCIPAL;
 	const requireResearchScope = (scope: string, tool: string) => {
 		if (researchScopes.has(scope)) return null;
 		const safe = new ResearchBoundaryError("FILTERED").asError();
@@ -899,7 +906,7 @@ export function createServer(
 				tool,
 				required_scope: scope,
 				granted_scopes: [...researchScopes].sort(),
-				principal: callerPrincipal(env),
+				principal: researchClientId ?? "unverified-client",
 				request_id: safe.request_id,
 			}),
 		);
@@ -907,6 +914,12 @@ export function createServer(
 			isError: true as const,
 			content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }],
 		};
+	};
+	const requireFormalResearchClient = (tool: string) => {
+		if (isFormalResearchClient()) return null;
+		const safe = new ResearchBoundaryError("FILTERED").asError();
+		console.log(JSON.stringify({ event: "research_tool_client_denied", tool, client_id: researchClientId ?? null, request_id: safe.request_id }));
+		return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
 	};
 
 	server.registerTool(
@@ -1025,10 +1038,12 @@ export function createServer(
 		async ({ job_id }) => {
 			const denied = requireResearchScope(RESEARCH_CLAIM_SCOPE, "claim_research_job");
 			if (denied) return denied;
+			const clientDenied = requireFormalResearchClient("claim_research_job");
+			if (clientDenied) return clientDenied;
 			return researchRead(async () =>
 				claimResearchJob(researchWorkflowDb(), {
 					jobId: job_id,
-					leaseOwner: callerPrincipal(env),
+					leaseOwner: callerPrincipal(),
 					requestId: crypto.randomUUID().replaceAll("-", ""),
 					now: new Date().toISOString(),
 				}),
@@ -1051,6 +1066,8 @@ export function createServer(
 		async ({ job_id, claim_token, idempotency_key, origin, proposal }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "submit_research_result_proposal");
 			if (denied) return denied;
+			const clientDenied = requireFormalResearchClient("submit_research_result_proposal");
+			if (clientDenied) return clientDenied;
 			return researchRead(async () =>
 				submitResearchResultProposal(researchWorkflowDb(), {
 					jobId: job_id,
@@ -1058,7 +1075,7 @@ export function createServer(
 					idempotencyKey: idempotency_key,
 					origin,
 					proposal,
-					callerPrincipal: callerPrincipal(env),
+					callerPrincipal: callerPrincipal(),
 					requestId: crypto.randomUUID().replaceAll("-", ""),
 					now: new Date().toISOString(),
 				}),
@@ -1196,9 +1213,6 @@ async function handleResearchReplicaReceipts(request: Request, env: Env): Promis
 	}
 	const url = new URL(request.url);
 	const since = url.searchParams.get("since");
-	if (since !== null && Number.isNaN(Date.parse(since))) {
-		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
-	}
 	const limitParam = url.searchParams.get("limit");
 	let limit: number | undefined;
 	if (limitParam !== null) {
@@ -1610,7 +1624,12 @@ export default {
 				env.COLLECTOR_MCP_CLIENT_TOKEN,
 				env.COLLECTOR_MCP_CLIENT_SCOPES,
 			);
-			return createServer(env, liveOverlayStatus, researchScopes);
+			const researchClientId = resolveResearchClientId(
+				ctx.requestInfo?.headers.get("Authorization") ?? null,
+				ctx.requestInfo?.headers.get(FORWARDED_CLIENT_ID_HEADER) ?? null,
+				env.COLLECTOR_MCP_CLIENT_TOKEN,
+			);
+			return createServer(env, liveOverlayStatus, researchScopes, researchClientId);
 		});
 		return handler(request, env, ctx);
 	},

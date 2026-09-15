@@ -34,6 +34,8 @@ export const RESEARCH_SUBMIT_SCOPE = "research:submit";
  * copy before setting its own value.
  */
 export const FORWARDED_SCOPES_HEADER = "X-QuantPro-Client-Scopes";
+/** Authenticated OAuth client identity, stamped only by the OAuth bridge. */
+export const FORWARDED_CLIENT_ID_HEADER = "X-QuantPro-Client-Id";
 
 /** Parse a space/comma separated scope list into a set (order-insensitive). */
 function parseScopeList(value: string | null | undefined): Set<string> {
@@ -68,4 +70,15 @@ export function resolveResearchScopes(
 		if (configured.has(scope)) effective.add(scope);
 	}
 	return effective;
+}
+
+/** A client identity is trusted only on the authenticated bridge path. */
+export function resolveResearchClientId(
+	authorizationHeader: string | null | undefined,
+	forwardedClientId: string | null | undefined,
+	configuredToken: string | null | undefined,
+): string | null {
+	if (!configuredToken || authorizationHeader !== `Bearer ${configuredToken}`) return null;
+	if (typeof forwardedClientId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(forwardedClientId)) return null;
+	return forwardedClientId;
 }

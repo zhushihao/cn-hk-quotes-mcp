@@ -43,6 +43,7 @@ export const RESEARCH_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9:_-]{8,128}$/;
 /** §5.4 receipts page ceiling. */
 export const RECEIPTS_MAX_LIMIT = 500;
 export const RECEIPTS_SCHEMA_VERSION = "collector-receipts-v1";
+const RECEIPT_CURSOR_VERSION = "rcpt1";
 
 /**
  * The production client identity that formal (origin=CHATGPT) proposals are
@@ -167,6 +168,32 @@ export type ResearchReceiptsPage = {
 	next_since: string | null;
 	receipts: ResearchReceiptItem[];
 };
+
+type ReceiptCursor = { createdAt: string; eventId: string; legacy: boolean };
+
+/** Versioned opaque cursor for the stable `(created_at,event_id)` order. */
+function encodeReceiptCursor(createdAt: string, eventId: string): string {
+	return `${RECEIPT_CURSOR_VERSION}.${btoa(JSON.stringify({ v: 1, t: createdAt, e: eventId }))}`;
+}
+
+function decodeReceiptCursor(value: string | null | undefined): ReceiptCursor | null {
+	if (value === undefined || value === null || value === "") return null;
+	if (!value.startsWith(`${RECEIPT_CURSOR_VERSION}.`)) {
+		// Timestamp-only callers are retained only as an overlap-replay upgrade
+		// entry.  Their response always upgrades them to an opaque cursor.
+		return { createdAt: normalizedIso(value, "since"), eventId: "", legacy: true };
+	}
+	try {
+		const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_VERSION.length + 1)));
+		if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.t !== "string" || typeof parsed.e !== "string" || !parsed.e) {
+			fail("INTEGRITY_FAILED");
+		}
+		return { createdAt: normalizedIso(parsed.t, "cursor"), eventId: parsed.e, legacy: false };
+	} catch (error) {
+		if (error instanceof ResearchBoundaryError) throw error;
+		fail("INTEGRITY_FAILED");
+	}
+}
 
 function fail(errorCode: "FILTERED" | "STORE_UNAVAILABLE" | "INTEGRITY_FAILED"): never {
 	throw new ResearchBoundaryError(errorCode);
@@ -311,14 +338,15 @@ export async function claimResearchJob(
 	}
 
 	const expiresAt = new Date(Date.parse(now) + RESEARCH_LEASE_TTL_SECONDS * 1000).toISOString();
-	// §A2 atomic preemption, verbatim.  D1/SQLite write serialization makes
-	// the conditional upsert the final arbiter under concurrency.
+	// The terminal predicate is inside the same conditional write as lease
+	// creation/preemption.  A stale pre-read can therefore never create a live
+	// lease after completion has committed.
 	const preempt = () =>
 		db
 			.prepare(
-				"INSERT INTO research_job_leases (job_id, lease_owner, claim_token, claimed_at, lease_expires_at, claim_count) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(job_id) DO UPDATE SET lease_owner=excluded.lease_owner, claim_token=excluded.claim_token, claimed_at=excluded.claimed_at, lease_expires_at=excluded.lease_expires_at, claim_count=research_job_leases.claim_count+1 WHERE research_job_leases.lease_expires_at <= ?",
+				"INSERT INTO research_job_leases (job_id, lease_owner, claim_token, claimed_at, lease_expires_at, claim_count) SELECT ?, ?, ?, ?, ?, 1 WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) ON CONFLICT(job_id) DO UPDATE SET lease_owner=excluded.lease_owner, claim_token=excluded.claim_token, claimed_at=excluded.claimed_at, lease_expires_at=excluded.lease_expires_at, claim_count=research_job_leases.claim_count+1 WHERE research_job_leases.lease_expires_at <= ? AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=excluded.job_id)",
 			)
-			.bind(jobId, leaseOwner, `clt_${randomHex32()}`, now, expiresAt, now)
+			.bind(jobId, leaseOwner, `clt_${randomHex32()}`, now, expiresAt, jobId, now)
 			.run();
 
 	for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -361,6 +389,13 @@ export async function claimResearchJob(
 				claim_count: Number(lease.claim_count),
 				request_id: requestId,
 			};
+		}
+		if (await selectTerminal(db, jobId)) {
+			await eventStatement(db, {
+				jobId, eventType: "CLAIM_DENIED", actor: leaseOwner, proposalId: null,
+				origin: null, detail: eventDetail("TERMINAL"), requestId, createdAt: now,
+			}).run();
+			return { status: "NOT_CLAIMABLE", job_id: jobId, reason: "TERMINAL", request_id: requestId };
 		}
 		const current = await selectLease(db, jobId);
 		if (!current || current.lease_expires_at <= now) continue; // raced; retry once
@@ -925,22 +960,26 @@ export async function listResearchJobReceipts(
 	const generatedAt = normalizedIso(input.now, "now");
 	const limit = input.limit ?? RECEIPTS_MAX_LIMIT;
 	if (!Number.isInteger(limit) || limit < 1 || limit > RECEIPTS_MAX_LIMIT) fail("INTEGRITY_FAILED");
-	let since: string | null = null;
-	if (input.since !== undefined && input.since !== null && input.since !== "") {
-		since = normalizedIso(input.since, "since");
-	}
-	const statement = since
+	const cursor = decodeReceiptCursor(input.since);
+	const statement = cursor && !cursor.legacy
 		? db
 				.prepare(
-					"SELECT job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events WHERE created_at >= ? ORDER BY created_at ASC, event_id ASC LIMIT ?",
+					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events WHERE created_at > ? OR (created_at = ? AND event_id > ?) ORDER BY created_at ASC, event_id ASC LIMIT ?",
 				)
-				.bind(since, limit)
+				.bind(cursor.createdAt, cursor.createdAt, cursor.eventId, limit)
+		: cursor
+		? db
+				.prepare(
+					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events WHERE created_at >= ? ORDER BY created_at ASC, event_id ASC LIMIT ?",
+				)
+				.bind(cursor.createdAt, limit)
 		: db
 				.prepare(
-					"SELECT job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events ORDER BY created_at ASC, event_id ASC LIMIT ?",
+					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events ORDER BY created_at ASC, event_id ASC LIMIT ?",
 				)
 				.bind(limit);
 	let rows: Array<{
+		event_id: string;
 		job_id: string;
 		event_type: string;
 		actor: string;
@@ -952,6 +991,7 @@ export async function listResearchJobReceipts(
 	}>;
 	try {
 		rows = (await statement.all<{
+			event_id: string;
 			job_id: string;
 			event_type: string;
 			actor: string;
@@ -974,7 +1014,7 @@ export async function listResearchJobReceipts(
 			reason = null;
 		}
 		receipts.push({
-			receipt_id: `rcpt_${(await sha256Hex(`${row.job_id}|${row.event_type}|${row.created_at}|${row.request_id}`)).slice(0, 40)}`,
+			receipt_id: `rcpt_${(await sha256Hex(row.event_id)).slice(0, 40)}`,
 			job_id: row.job_id,
 			event_type: row.event_type,
 			occurred_at: row.created_at,
@@ -985,7 +1025,9 @@ export async function listResearchJobReceipts(
 			detail: { reason },
 		});
 	}
-	const nextSince = receipts.length > 0 ? receipts[receipts.length - 1].occurred_at : since;
+	const nextSince = rows.length > 0
+		? encodeReceiptCursor(rows[rows.length - 1].created_at, rows[rows.length - 1].event_id)
+		: input.since ?? null;
 	return {
 		schema_version: RECEIPTS_SCHEMA_VERSION,
 		generated_at: generatedAt,
