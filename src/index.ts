@@ -39,14 +39,16 @@ import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-project
 import {
 	FORWARDED_SCOPES_HEADER,
 	FORWARDED_CLIENT_ID_HEADER,
+	FORWARDED_ISSUER_HEADER,
 	RESEARCH_CLAIM_SCOPE,
 	RESEARCH_SUBMIT_SCOPE,
 	resolveResearchScopes,
 	resolveResearchClientId,
+	resolveResearchIssuer,
+	formalResearchOwner,
 	permitsFormalResearchOperation,
 } from "./research-scopes.ts";
 import {
-	RESEARCH_PRODUCTION_PRINCIPAL,
 	claimResearchJob,
 	deferResearchJob,
 	listResearchJobReceipts,
@@ -672,6 +674,7 @@ export function createServer(
 	liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED",
 	researchScopes: ReadonlySet<string> = new Set(),
 	researchClientId: string | null = null,
+	researchIssuer: string | null = null,
 ) {
 	const server = new McpServer({
 		name: "QuantPro Collector",
@@ -895,7 +898,7 @@ export function createServer(
 		}
 	};
 	const researchRead = researchDomain;
-	const callerPrincipal = (): string => RESEARCH_PRODUCTION_PRINCIPAL;
+	const callerPrincipal = (): Promise<string | null> => formalResearchOwner(researchIssuer, researchClientId);
 	const requireResearchScope = (scope: string, tool: string) => {
 		if (researchScopes.has(scope)) return null;
 		const safe = new ResearchBoundaryError("FILTERED").asError();
@@ -919,6 +922,7 @@ export function createServer(
 	const requireFormalResearchClient = (tool: string, requiredScope: string, jobId: string) => {
 		if (permitsFormalResearchOperation({
 			clientId: researchClientId,
+			issuer: researchIssuer,
 			scopes: researchScopes,
 			requiredScope,
 			configuredClientIds: env?.COLLECTOR_MCP_FORMAL_CLIENT_IDS,
@@ -1048,10 +1052,12 @@ export function createServer(
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE, job_id);
 			if (clientDenied) return clientDenied;
+			const owner = await callerPrincipal();
+			if (!owner) return requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE, job_id)!;
 			return researchRead(async () =>
 				claimResearchJob(researchWorkflowDb(), {
 					jobId: job_id,
-					leaseOwner: callerPrincipal(),
+					leaseOwner: owner,
 					requestId: crypto.randomUUID().replaceAll("-", ""),
 					now: new Date().toISOString(),
 				}),
@@ -1066,24 +1072,28 @@ export function createServer(
 			inputSchema: z.object({
 				job_id: z.string().min(1),
 				claim_token: z.string().min(1),
+				expected_generation: z.number().int().min(1),
 				idempotency_key: z.string().min(1),
 				origin: z.enum(["CHATGPT", "SYNTHETIC", "REPLAY"]).optional(),
 				proposal: z.record(z.string(), z.unknown()),
 			}),
 		},
-		async ({ job_id, claim_token, idempotency_key, origin, proposal }) => {
+		async ({ job_id, claim_token, expected_generation, idempotency_key, origin, proposal }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "submit_research_result_proposal");
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE, job_id);
 			if (clientDenied) return clientDenied;
+			const owner = await callerPrincipal();
+			if (!owner) return requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE, job_id)!;
 			return researchRead(async () =>
 				submitResearchResultProposal(researchWorkflowDb(), {
 					jobId: job_id,
 					claimToken: claim_token,
+					expectedGeneration: expected_generation,
 					idempotencyKey: idempotency_key,
 					origin,
 					proposal,
-					callerPrincipal: callerPrincipal(),
+					callerPrincipal: owner,
 					requestId: crypto.randomUUID().replaceAll("-", ""),
 					now: new Date().toISOString(),
 				}),
@@ -1098,24 +1108,28 @@ export function createServer(
 			inputSchema: z.object({
 				job_id: z.string().min(1),
 				claim_token: z.string().min(1),
+				expected_generation: z.number().int().min(1),
 				idempotency_key: z.string().min(1),
 				reason: z.enum(["RECHECK_REQUIRED", "UPSTREAM_UNAVAILABLE", "NEEDS_OWNER_INPUT"]),
 				recheck_at: z.string().datetime(),
 			}),
 		},
-		async ({ job_id, claim_token, idempotency_key, reason, recheck_at }) => {
+		async ({ job_id, claim_token, expected_generation, idempotency_key, reason, recheck_at }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "defer_research_job");
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE, job_id);
 			if (clientDenied) return clientDenied;
+			const owner = await callerPrincipal();
+			if (!owner) return requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE, job_id)!;
 			return researchRead(async () =>
 				deferResearchJob(researchWorkflowDb(), {
 					jobId: job_id,
 					claimToken: claim_token,
+					expectedGeneration: expected_generation,
 					idempotencyKey: idempotency_key,
 					reason,
 					recheckAt: recheck_at,
-					callerPrincipal: callerPrincipal(),
+					callerPrincipal: owner,
 					requestId: crypto.randomUUID().replaceAll("-", ""),
 					now: new Date().toISOString(),
 				}),
@@ -1669,7 +1683,12 @@ export default {
 				ctx.requestInfo?.headers.get(FORWARDED_CLIENT_ID_HEADER) ?? null,
 				env.COLLECTOR_MCP_CLIENT_TOKEN,
 			);
-			return createServer(env, liveOverlayStatus, researchScopes, researchClientId);
+			const researchIssuer = resolveResearchIssuer(
+				ctx.requestInfo?.headers.get("Authorization") ?? null,
+				ctx.requestInfo?.headers.get(FORWARDED_ISSUER_HEADER) ?? null,
+				env.COLLECTOR_MCP_CLIENT_TOKEN,
+			);
+			return createServer(env, liveOverlayStatus, researchScopes, researchClientId, researchIssuer);
 		});
 		return handler(request, env, ctx);
 	},

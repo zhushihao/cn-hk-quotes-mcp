@@ -1,8 +1,10 @@
 const OAUTH_TABLE = "oauth_kv_v1";
 const DEFAULT_LIST_LIMIT = 1000;
 const MAX_LIST_LIMIT = 1000;
+const TABLE_NAME_PATTERN = /^[a-z_][a-z0-9_]*$/;
 
-let schemaReady: Promise<void> | null = null;
+/** Schema-readiness cache keyed by the concrete D1 binding, then by table name. */
+const schemaReadyByDatabase = new WeakMap<D1Database, Map<string, Promise<void>>>();
 
 type StoredRow = {
 	value: string;
@@ -37,11 +39,23 @@ function nowSeconds(): number {
 	return Math.floor(Date.now() / 1000);
 }
 
-async function ensureSchema(db: D1Database): Promise<void> {
-	if (!schemaReady) {
-		schemaReady = db
+function assertTableName(table: string): void {
+	if (!TABLE_NAME_PATTERN.test(table)) {
+		throw new TypeError("D1 KV adapter table name must be a lowercase SQL identifier");
+	}
+}
+
+function ensureSchema(db: D1Database, table: string): Promise<void> {
+	let byTable = schemaReadyByDatabase.get(db);
+	if (!byTable) {
+		byTable = new Map();
+		schemaReadyByDatabase.set(db, byTable);
+	}
+	let ready = byTable.get(table);
+	if (!ready) {
+		ready = db
 			.prepare(
-				`CREATE TABLE IF NOT EXISTS ${OAUTH_TABLE} (
+				`CREATE TABLE IF NOT EXISTS ${table} (
 					kv_key TEXT PRIMARY KEY NOT NULL,
 					value TEXT NOT NULL,
 					expires_at INTEGER
@@ -50,11 +64,12 @@ async function ensureSchema(db: D1Database): Promise<void> {
 			.run()
 			.then(() => undefined)
 			.catch((error) => {
-				schemaReady = null;
+				byTable.delete(table);
 				throw error;
 			});
+		byTable.set(table, ready);
 	}
-	await schemaReady;
+	return ready;
 }
 
 function normalizeReadType(options?: KvReadType | KvGetOptions): KvReadType {
@@ -91,17 +106,22 @@ function textToArrayBuffer(value: string): ArrayBuffer {
 }
 
 /**
- * `workers-oauth-provider` currently persists through the Workers KV interface. The account's
- * free-tier KV writes are also used by the LIVE control plane and can exhaust the account-wide
- * 1,000 writes/day quota. This adapter gives OAuth an isolated SQL table in the already-private
- * Collector D1 database while preserving the narrow KV surface the provider actually uses.
+ * KV-compatible persistence backed by a table in the Collector's private D1 database.
+ *
+ * The account's free-tier Workers KV write allowance (1,000 writes/day, account-wide) is shared
+ * by every KV namespace. Both known consumers of it exceeded that budget: OAuth state (issue #8)
+ * and the LIVE control plane, whose per-round universe/status/delta writes alone consume roughly
+ * three writes per minute across the trading-day publish window (issue #17). Each consumer gets
+ * its own isolated SQL table and no longer competes for the KV quota. The table name is a fixed
+ * lowercase identifier asserted at creation, never derived from request data.
  */
-export function createD1OAuthKv(db: D1Database): KVNamespace {
+export function createD1Kv(db: D1Database, table: string): KVNamespace {
+	assertTableName(table);
 	const adapter = {
 		async get(key: string, options?: KvReadType | KvGetOptions): Promise<unknown> {
-			await ensureSchema(db);
+			await ensureSchema(db, table);
 			const row = await db
-				.prepare(`SELECT value, expires_at FROM ${OAUTH_TABLE} WHERE kv_key = ?1`)
+				.prepare(`SELECT value, expires_at FROM ${table} WHERE kv_key = ?1`)
 				.bind(key)
 				.first<StoredRow>();
 			if (!row) return null;
@@ -123,13 +143,13 @@ export function createD1OAuthKv(db: D1Database): KVNamespace {
 
 		async put(key: string, value: string, options?: KvPutOptions): Promise<void> {
 			if (typeof value !== "string") {
-				throw new TypeError("OAuth D1 storage only accepts string values");
+				throw new TypeError("D1 KV adapter only accepts string values");
 			}
-			await ensureSchema(db);
+			await ensureSchema(db, table);
 			const expiresAt = expirationFromOptions(options);
 			await db
 				.prepare(
-					`INSERT INTO ${OAUTH_TABLE} (kv_key, value, expires_at)
+					`INSERT INTO ${table} (kv_key, value, expires_at)
 					 VALUES (?1, ?2, ?3)
 					 ON CONFLICT(kv_key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`,
 				)
@@ -138,19 +158,19 @@ export function createD1OAuthKv(db: D1Database): KVNamespace {
 		},
 
 		async delete(key: string): Promise<void> {
-			await ensureSchema(db);
-			await db.prepare(`DELETE FROM ${OAUTH_TABLE} WHERE kv_key = ?1`).bind(key).run();
+			await ensureSchema(db, table);
+			await db.prepare(`DELETE FROM ${table} WHERE kv_key = ?1`).bind(key).run();
 		},
 
 		async list(options: KvListOptions = {}): Promise<unknown> {
-			await ensureSchema(db);
+			await ensureSchema(db, table);
 			const prefix = options.prefix ?? "";
 			const limit = listLimit(options.limit);
 			const offset = cursorOffset(options.cursor);
 			const rows = await db
 				.prepare(
 					`SELECT kv_key, expires_at
-					 FROM ${OAUTH_TABLE}
+					 FROM ${table}
 					 WHERE kv_key >= ?1 AND kv_key < ?2
 					   AND (expires_at IS NULL OR expires_at > ?3)
 					 ORDER BY kv_key
@@ -173,4 +193,13 @@ export function createD1OAuthKv(db: D1Database): KVNamespace {
 	};
 
 	return adapter as unknown as KVNamespace;
+}
+
+/**
+ * `workers-oauth-provider` currently persists through the Workers KV interface. This adapter
+ * gives OAuth an isolated SQL table in the already-private Collector D1 database while
+ * preserving the narrow KV surface the provider actually uses (issue #8).
+ */
+export function createD1OAuthKv(db: D1Database): KVNamespace {
+	return createD1Kv(db, OAUTH_TABLE);
 }

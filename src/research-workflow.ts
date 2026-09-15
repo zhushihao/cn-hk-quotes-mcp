@@ -21,6 +21,7 @@
  */
 
 import { ResearchBoundaryError, assertOutboundV2PayloadSafe } from "./research-outbound-v2.ts";
+import { isFormalResearchOwner } from "./research-scopes.ts";
 
 /** Fixed lease TTL: one fewer adversarial knob; expiry recovery covers budget exhaustion. */
 export const RESEARCH_LEASE_TTL_SECONDS = 3600;
@@ -44,15 +45,6 @@ export const RESEARCH_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9:_-]{8,128}$/;
 export const RECEIPTS_MAX_LIMIT = 500;
 export const RECEIPTS_SCHEMA_VERSION = "collector-receipts-v1";
 const RECEIPT_CURSOR_VERSION = "rcpt1";
-
-/**
- * The production client identity that formal (origin=CHATGPT) proposals are
- * anchored to.  It equals the deployed `COLLECTOR_MCP_CLIENT_ID`; local E2E
- * overrides that var with an engineering identity, which is exactly how the
- * server distinguishes shadow (SYNTHETIC) traffic from production clients
- * without trusting any client declaration.
- */
-export const RESEARCH_PRODUCTION_PRINCIPAL = "chatgpt-production";
 
 /** §5.6 domain reason closed sets. */
 export const CLAIM_REASONS = ["NOT_FOUND", "TERMINAL", "DEFERRED"] as const;
@@ -92,6 +84,8 @@ export type ClaimClaimed = {
 	claimed_at: string;
 	lease_expires_at: string;
 	claim_count: number;
+	/** Monotonic fencing generation for submit/defer expected_generation. */
+	lease_generation: number;
 	request_id: string;
 };
 
@@ -159,7 +153,13 @@ export type DeferReason = (typeof DEFER_REASONS)[number];
 
 export type DeferOutcome =
 	| { status: "DEFERRED"; job_id: string; recheck_at: string; request_id: string }
-	| { status: "IDEMPOTENT_REPLAY"; job_id: string; recheck_at: string; request_id: string }
+	| {
+			status: "IDEMPOTENT_REPLAY";
+			job_id: string;
+			recheck_at: string;
+			current_status: "DEFERRED" | "CLAIMED" | "COMPLETED" | "QUEUED";
+			request_id: string;
+	  }
 	| { status: "REJECTED"; job_id: string; reason: SubmitReason; detail: { sub_reason?: LeaseSubReason }; request_id: string };
 
 export type ResearchReceiptItem = {
@@ -181,32 +181,69 @@ export type ResearchReceiptsPage = {
 	receipts: ResearchReceiptItem[];
 };
 
-type ReceiptCursor = { createdAt: string; eventId: string; legacy: boolean };
+type ReceiptCursor = { ingressSequence: string };
 
-type DeferralRow = { idempotency_key: string; recheck_at: string };
+type DeferralRow = {
+	job_id: string;
+	idempotency_key: string;
+	recheck_at: string;
+	payload_sha256: string | null;
+};
 
-/** Versioned opaque cursor for the stable `(created_at,event_id)` order. */
-function encodeReceiptCursor(createdAt: string, eventId: string): string {
-	return `${RECEIPT_CURSOR_VERSION}.${btoa(JSON.stringify({ v: 1, t: createdAt, e: eventId }))}`;
-}
+const MAX_D1_INGRESS_SEQUENCE = 9_223_372_036_854_775_807n;
 
-function decodeReceiptCursor(value: string | null | undefined): ReceiptCursor | null {
-	if (value === undefined || value === null || value === "") return null;
-	if (!value.startsWith(`${RECEIPT_CURSOR_VERSION}.`)) {
-		// Timestamp-only callers are retained only as an overlap-replay upgrade
-		// entry.  Their response always upgrades them to an opaque cursor.
-		return { createdAt: normalizedIso(value, "since"), eventId: "", legacy: true };
-	}
+/** Lossless decimal encoding for D1's signed 64-bit ingress sequence. */
+function ingressSequenceText(value: unknown): string {
+	if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value)) fail("INTEGRITY_FAILED");
 	try {
-		const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_VERSION.length + 1)));
-		if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.t !== "string" || typeof parsed.e !== "string" || !parsed.e) {
-			fail("INTEGRITY_FAILED");
-		}
-		return { createdAt: normalizedIso(parsed.t, "cursor"), eventId: parsed.e, legacy: false };
+		if (BigInt(value) > MAX_D1_INGRESS_SEQUENCE) fail("INTEGRITY_FAILED");
+		return value;
 	} catch (error) {
 		if (error instanceof ResearchBoundaryError) throw error;
 		fail("INTEGRITY_FAILED");
 	}
+}
+
+/** Versioned opaque cursor for D1's strictly increasing ingress sequence. */
+function encodeReceiptCursor(ingressSequence: string): string {
+	return `rcpt2.${btoa(JSON.stringify({ v: 2, s: ingressSequence }))}`;
+}
+
+function decodeReceiptCursor(value: string | null | undefined): ReceiptCursor | null {
+	if (value === undefined || value === null || value === "") return null;
+	if (value.startsWith("rcpt2.")) {
+		try {
+			const parsed = JSON.parse(atob(value.slice("rcpt2.".length)));
+			const sequence = isRecord(parsed) ? parsed.s : null;
+			if (parsed === null || !isRecord(parsed) || parsed.v !== 2) {
+				fail("INTEGRITY_FAILED");
+			}
+			return { ingressSequence: ingressSequenceText(sequence) };
+		} catch (error) {
+			if (error instanceof ResearchBoundaryError) throw error;
+			fail("INTEGRITY_FAILED");
+		}
+	}
+	if (value.startsWith(`${RECEIPT_CURSOR_VERSION}.`)) {
+		// v1 used (created_at,event_id). It cannot safely order later writes,
+		// so validate its timestamp but replay the complete event log from zero.
+		try {
+			const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_VERSION.length + 1)));
+			if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.t !== "string") fail("INTEGRITY_FAILED");
+			normalizedIso(parsed.t, "cursor");
+			return { ingressSequence: "0" };
+		} catch (error) {
+			if (error instanceof ResearchBoundaryError) throw error;
+			fail("INTEGRITY_FAILED");
+		}
+	}
+	if (!value.startsWith("rcpt")) {
+		// Timestamp-only callers must also recover from sequence zero; retaining
+		// a timestamp predicate can preserve a prior silent omission forever.
+		normalizedIso(value, "since");
+		return { ingressSequence: "0" };
+	}
+	fail("INTEGRITY_FAILED");
 }
 
 function fail(errorCode: "FILTERED" | "STORE_UNAVAILABLE" | "INTEGRITY_FAILED"): never {
@@ -309,14 +346,49 @@ async function selectTerminal(db: ResearchWorkflowDatabase, jobId: string): Prom
 	return row !== null;
 }
 
+async function terminalMatchesProposal(
+	db: ResearchWorkflowDatabase,
+	jobId: string,
+	proposalId: string,
+): Promise<boolean> {
+	const row = await db
+		.prepare("SELECT job_id FROM research_job_terminal WHERE job_id=? AND proposal_id=?")
+		.bind(jobId, proposalId)
+		.first<{ job_id: string }>();
+	return row !== null;
+}
+
 async function selectDeferral(
 	db: ResearchWorkflowDatabase,
 	jobId: string,
 ): Promise<DeferralRow | null> {
 	return db
-		.prepare("SELECT idempotency_key, recheck_at FROM research_job_deferrals WHERE job_id=?")
+		.prepare("SELECT job_id, idempotency_key, recheck_at, payload_sha256 FROM research_job_deferrals WHERE job_id=?")
 		.bind(jobId)
 		.first<DeferralRow>();
+}
+
+async function selectDeferralByIdempotencyKey(
+	db: ResearchWorkflowDatabase,
+	idempotencyKey: string,
+): Promise<DeferralRow | null> {
+	return db
+		.prepare("SELECT job_id, idempotency_key, recheck_at, payload_sha256 FROM research_job_deferrals WHERE idempotency_key=?")
+		.bind(idempotencyKey)
+		.first<DeferralRow>();
+}
+
+async function deferredCurrentStatus(
+	db: ResearchWorkflowDatabase,
+	jobId: string,
+	now: string,
+): Promise<"DEFERRED" | "CLAIMED" | "COMPLETED" | "QUEUED"> {
+	if (await selectTerminal(db, jobId)) return "COMPLETED";
+	const lease = await selectLease(db, jobId);
+	if (lease && lease.lease_expires_at > now) return "CLAIMED";
+	const deferral = await selectDeferral(db, jobId);
+	if (deferral && deferral.recheck_at > now) return "DEFERRED";
+	return "QUEUED";
 }
 
 /**
@@ -369,44 +441,38 @@ export async function claimResearchJob(
 	// The terminal predicate is inside the same conditional write as lease
 	// creation/preemption.  A stale pre-read can therefore never create a live
 	// lease after completion has committed.
-	const preempt = () =>
+	const preempt = (claimToken: string) =>
 		db
 			.prepare(
 				"INSERT INTO research_job_leases (job_id, lease_owner, claim_token, claimed_at, lease_expires_at, claim_count) SELECT ?, ?, ?, ?, ?, 1 WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) AND NOT EXISTS (SELECT 1 FROM research_job_deferrals WHERE job_id=? AND recheck_at > ?) ON CONFLICT(job_id) DO UPDATE SET lease_owner=excluded.lease_owner, claim_token=excluded.claim_token, claimed_at=excluded.claimed_at, lease_expires_at=excluded.lease_expires_at, claim_count=research_job_leases.claim_count+1 WHERE research_job_leases.lease_expires_at <= ? AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=excluded.job_id) AND NOT EXISTS (SELECT 1 FROM research_job_deferrals WHERE job_id=excluded.job_id AND recheck_at > ?)",
 			)
-			.bind(jobId, leaseOwner, `clt_${randomHex32()}`, now, expiresAt, jobId, jobId, now, now, now)
-			.run();
+			.bind(jobId, leaseOwner, claimToken, now, expiresAt, jobId, jobId, now, now, now);
 
 	for (let attempt = 0; attempt < 2; attempt += 1) {
-		const prior = await selectLease(db, jobId);
-		const result = await preempt();
-		if (Number(result.meta.changes ?? 0) === 1) {
-			if (prior && prior.lease_expires_at <= now) {
-				// The superseded lease expired without a submit: audit it before
-				// the new CLAIMED so the event stream reads chronologically.
-				await eventStatement(db, {
-					jobId,
-					eventType: "LEASE_EXPIRED",
-					actor: prior.lease_owner,
-					proposalId: null,
-					origin: null,
-					detail: eventDetail(null),
-					requestId,
-					createdAt: now,
-				}).run();
-			}
-			await eventStatement(db, {
-				jobId,
-				eventType: "CLAIMED",
-				actor: leaseOwner,
-				proposalId: null,
-				origin: null,
-				detail: eventDetail(null),
-				requestId,
-				createdAt: now,
-			}).run();
-			const lease = await selectLease(db, jobId);
-			if (!lease) fail("STORE_UNAVAILABLE");
+		const claimToken = `clt_${randomHex32()}`;
+		// D1 batch is one transaction.  The two audit rows are conditional on
+		// the exact transition, so a visible lease transition never commits
+		// without its ingress event and no failed preempt mints a receipt.
+		const eventId = `evt_${randomHex32()}`;
+		const expiredEventId = `evt_${randomHex32()}`;
+		await db.batch([
+			db
+				.prepare(
+					"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, job_id, 'LEASE_EXPIRED', lease_owner, NULL, NULL, '{}', ?, ? FROM research_job_leases WHERE job_id=? AND lease_expires_at <= ? AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=research_job_leases.job_id) AND NOT EXISTS (SELECT 1 FROM research_job_deferrals WHERE job_id=research_job_leases.job_id AND recheck_at > ?)",
+				)
+				.bind(expiredEventId, requestId, now, jobId, now, now),
+			preempt(claimToken),
+			db
+				.prepare(
+					"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, job_id, 'CLAIMED', ?, NULL, NULL, '{}', ?, ? FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=?",
+				)
+				.bind(eventId, leaseOwner, requestId, now, jobId, leaseOwner, claimToken),
+		] as never);
+		// D1's INSERT-trigger UPDATE contributes to meta.changes, so a strict
+		// statement-change count is not a transition result. Re-read the
+		// committed authoritative lease by its freshly generated capability.
+		const lease = await selectLease(db, jobId);
+		if (lease && lease.lease_owner === leaseOwner && lease.claim_token === claimToken) {
 			return {
 				status: "CLAIMED",
 				job_id: jobId,
@@ -415,6 +481,7 @@ export async function claimResearchJob(
 				claimed_at: lease.claimed_at,
 				lease_expires_at: lease.lease_expires_at,
 				claim_count: Number(lease.claim_count),
+				lease_generation: Number(lease.claim_count),
 				request_id: requestId,
 			};
 		}
@@ -441,6 +508,7 @@ export async function claimResearchJob(
 				claimed_at: current.claimed_at,
 				lease_expires_at: current.lease_expires_at,
 				claim_count: Number(current.claim_count),
+				lease_generation: Number(current.claim_count),
 				request_id: requestId,
 			};
 		}
@@ -652,23 +720,35 @@ async function runProposalBatch(
 		await db.batch(statements as never);
 		return null;
 	} catch {
-		const existing = await selectProposalByIdempotencyKey(db, race.idempotencyKey).catch(
-			() => null,
-		);
-		if (!existing) fail("STORE_UNAVAILABLE");
-		const verdict = outcomeForExistingProposal(existing, race.jobId, race.prepared, race.requestId);
-		if (verdict === "CONFLICT") {
-			await writeConflictEvent(db, {
-				jobId: race.jobId,
-				existingProposalId: existing.proposal_id,
-				callerPrincipal: race.callerPrincipal,
-				requestId: race.requestId,
-				now: race.now,
-			}).catch(() => fail("STORE_UNAVAILABLE"));
-			return { status: "REJECTED", job_id: race.jobId, reason: "CONFLICT", detail: {}, request_id: race.requestId };
-		}
-		return verdict;
+		return resolveProposalRace(db, race);
 	}
+}
+
+async function resolveProposalRace(
+	db: ResearchWorkflowDatabase,
+	race: {
+		jobId: string;
+		idempotencyKey: string;
+		prepared: PreparedProposal;
+		callerPrincipal: string;
+		requestId: string;
+		now: string;
+	},
+): Promise<SubmitOutcome | null> {
+	const existing = await selectProposalByIdempotencyKey(db, race.idempotencyKey).catch(() => null);
+	if (!existing) return null;
+	const verdict = outcomeForExistingProposal(existing, race.jobId, race.prepared, race.requestId);
+	if (verdict === "CONFLICT") {
+		await writeConflictEvent(db, {
+			jobId: race.jobId,
+			existingProposalId: existing.proposal_id,
+			callerPrincipal: race.callerPrincipal,
+			requestId: race.requestId,
+			now: race.now,
+		}).catch(() => fail("STORE_UNAVAILABLE"));
+		return { status: "REJECTED", job_id: race.jobId, reason: "CONFLICT", detail: {}, request_id: race.requestId };
+	}
+	return verdict;
 }
 
 async function prepareProposal(proposal: unknown, jobId: string): Promise<PreparedProposal> {
@@ -701,6 +781,7 @@ export async function submitResearchResultProposal(
 	input: {
 		jobId: string;
 		claimToken: string;
+		expectedGeneration: number;
 		idempotencyKey: string;
 		origin?: string;
 		proposal: unknown;
@@ -714,6 +795,9 @@ export async function submitResearchResultProposal(
 		fail("FILTERED");
 	}
 	if (typeof callerPrincipal !== "string" || !callerPrincipal) fail("INTEGRITY_FAILED");
+	if (!Number.isInteger(input.expectedGeneration) || input.expectedGeneration < 1) {
+		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
+	}
 	const now = normalizedIso(input.now, "now");
 	const idempotencyKey = input.idempotencyKey;
 	if (typeof idempotencyKey !== "string" || !RESEARCH_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
@@ -755,11 +839,11 @@ export async function submitResearchResultProposal(
 		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
 	}
 	let effectiveOrigin: ResearchOrigin = declaredOrigin;
-	if (callerPrincipal !== RESEARCH_PRODUCTION_PRINCIPAL && declaredOrigin === "CHATGPT") {
+	if (!isFormalResearchOwner(callerPrincipal) && declaredOrigin === "CHATGPT") {
 		effectiveOrigin = "SYNTHETIC";
 	}
 	const productionOriginViolation =
-		callerPrincipal === RESEARCH_PRODUCTION_PRINCIPAL && declaredOrigin !== "CHATGPT";
+		isFormalResearchOwner(callerPrincipal) && declaredOrigin !== "CHATGPT";
 
 	// 3) Structure / size validation failures land as audited REJECTED rows.
 	const structureFailed =
@@ -810,6 +894,7 @@ export async function submitResearchResultProposal(
 	else if (lease.lease_expires_at <= now) subReason = "EXPIRED";
 	else if (lease.claim_token !== input.claimToken) subReason = "TOKEN_MISMATCH";
 	else if (lease.lease_owner !== callerPrincipal) subReason = "OWNER_MISMATCH";
+	else if (Number(lease.claim_count) !== input.expectedGeneration) subReason = "TOKEN_MISMATCH";
 	if (subReason !== null) {
 		const proposalId = `prp_${randomHex32()}`;
 		const outcome = await runProposalBatch(
@@ -930,38 +1015,65 @@ export async function submitResearchResultProposal(
 		createdAt: now,
 	});
 	if (effectiveOrigin === "CHATGPT") {
-		const outcome = await runProposalBatch(
-			db,
-			[
-				proposalInsert,
+		// Every formal write repeats the exact lease predicate.  This fences an
+		// old client that was pre-empted after the earlier read but before this
+		// batch began; neither a proposal nor terminal/event can then be left by
+		// a stale generation.
+		const leasePredicate =
+			"EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?) AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?)";
+		try {
+			await db.batch([
 				db
 					.prepare(
-						"INSERT INTO research_job_terminal (job_id, terminal_status, proposal_id, completed_at) VALUES (?, 'COMPLETED', ?, ?)",
+						`INSERT INTO research_proposals (proposal_id, job_id, idempotency_key, caller_principal, origin, status, reject_reason, payload_json, payload_sha256, created_at, request_id) SELECT ?, ?, ?, ?, 'CHATGPT', 'RECEIVED', NULL, ?, ?, ?, ? WHERE ${leasePredicate}`,
 					)
-					.bind(jobId, proposalId, now),
-				leaseRelease,
-				receivedEvent,
-				eventStatement(db, {
-					jobId,
-					eventType: "COMPLETED",
-					actor: callerPrincipal,
-					proposalId,
-					origin: effectiveOrigin,
-					detail: eventDetail(null),
-					requestId,
-					createdAt: now,
-				}),
-			],
-			race,
-		);
+					.bind(proposalId, jobId, idempotencyKey, callerPrincipal, prepared.payloadJson, prepared.payloadSha256, now, requestId, jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now, jobId),
+				db
+					.prepare(
+						`INSERT INTO research_job_terminal (job_id, terminal_status, proposal_id, completed_at) SELECT ?, 'COMPLETED', ?, ? WHERE ${leasePredicate}`,
+					)
+					.bind(jobId, proposalId, now, jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now, jobId),
+				db
+					.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?")
+					.bind(jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now),
+				db
+					.prepare("INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, ?, 'SUBMIT_RECEIVED', ?, ?, 'CHATGPT', '{}', ?, ? WHERE EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=? AND proposal_id=?)")
+					.bind(`evt_${randomHex32()}`, jobId, callerPrincipal, proposalId, requestId, now, jobId, proposalId),
+				db
+					.prepare("INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, ?, 'COMPLETED', ?, ?, 'CHATGPT', '{}', ?, ? WHERE EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=? AND proposal_id=?)")
+					.bind(`evt_${randomHex32()}`, jobId, callerPrincipal, proposalId, requestId, now, jobId, proposalId),
+			] as never);
+		} catch {
+			const outcome = await resolveProposalRace(db, race);
+			if (outcome) return outcome;
+			if (await selectTerminal(db, jobId)) {
+				return { status: "REJECTED", job_id: jobId, reason: "SECOND_RESULT", detail: {}, request_id: requestId };
+			}
+			return { status: "REJECTED", job_id: jobId, reason: "LEASE_INVALID", detail: {}, request_id: requestId };
+		}
+		// Trigger side effects make D1 meta.changes non-portable. The terminal
+		// row plus its idempotency proposal are the authoritative transaction
+		// outcome and distinguish a first accepted submit from a later replay.
+		const committedProposal = await selectProposalByIdempotencyKey(db, idempotencyKey);
+		if (
+			committedProposal?.proposal_id === proposalId &&
+			committedProposal.status === "RECEIVED" &&
+			await terminalMatchesProposal(db, jobId, proposalId)
+		) {
+			return {
+				status: "ACCEPTED",
+				job_id: jobId,
+				proposal_id: proposalId,
+				terminal_status: "COMPLETED",
+				request_id: requestId,
+			};
+		}
+		const outcome = await resolveProposalRace(db, race);
 		if (outcome) return outcome;
-		return {
-			status: "ACCEPTED",
-			job_id: jobId,
-			proposal_id: proposalId,
-			terminal_status: "COMPLETED",
-			request_id: requestId,
-		};
+		if (await selectTerminal(db, jobId)) {
+			return { status: "REJECTED", job_id: jobId, reason: "SECOND_RESULT", detail: {}, request_id: requestId };
+		}
+		return { status: "REJECTED", job_id: jobId, reason: "LEASE_INVALID", detail: {}, request_id: requestId };
 	}
 	const outcome = await runProposalBatch(
 		db,
@@ -990,6 +1102,7 @@ export async function deferResearchJob(
 	input: {
 		jobId: string;
 		claimToken: string;
+		expectedGeneration: number;
 		idempotencyKey: string;
 		reason: DeferReason;
 		recheckAt: string;
@@ -1001,6 +1114,9 @@ export async function deferResearchJob(
 	const { jobId, callerPrincipal, requestId } = input;
 	if (typeof jobId !== "string" || jobId.length < 1 || jobId.length > RESEARCH_CLAIM_JOB_ID_MAX_LENGTH) fail("FILTERED");
 	if (typeof callerPrincipal !== "string" || !callerPrincipal) fail("INTEGRITY_FAILED");
+	if (!Number.isInteger(input.expectedGeneration) || input.expectedGeneration < 1) {
+		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
+	}
 	if (typeof input.idempotencyKey !== "string" || !RESEARCH_IDEMPOTENCY_KEY_PATTERN.test(input.idempotencyKey)) {
 		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
 	}
@@ -1009,54 +1125,78 @@ export async function deferResearchJob(
 	}
 	const now = normalizedIso(input.now, "now");
 	const recheckAt = normalizedIso(input.recheckAt, "recheck_at");
+	const payloadSha256 = await sha256Hex(canonicalJson({
+		job_id: jobId,
+		lease_owner: callerPrincipal,
+		claim_token: input.claimToken,
+		expected_generation: input.expectedGeneration,
+		reason: input.reason,
+		recheck_at: recheckAt,
+	}));
+	const replayOutcome = async (existing: DeferralRow): Promise<DeferOutcome> => {
+		if (existing.payload_sha256 !== payloadSha256) {
+			return { status: "REJECTED", job_id: jobId, reason: "CONFLICT", detail: {}, request_id: requestId };
+		}
+		return {
+			status: "IDEMPOTENT_REPLAY",
+			job_id: jobId,
+			recheck_at: existing.recheck_at,
+			current_status: await deferredCurrentStatus(db, jobId, now),
+			request_id: requestId,
+		};
+	};
+	const sameKey = await selectDeferralByIdempotencyKey(db, input.idempotencyKey);
+	if (sameKey) return replayOutcome(sameKey);
 	if (recheckAt <= now) {
 		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
 	}
-	const existing = await selectDeferral(db, jobId);
-	if (existing) {
-		if (existing.idempotency_key === input.idempotencyKey) {
-			return { status: "IDEMPOTENT_REPLAY", job_id: jobId, recheck_at: existing.recheck_at, request_id: requestId };
-		}
+	if (await selectDeferral(db, jobId)) {
 		return { status: "REJECTED", job_id: jobId, reason: "CONFLICT", detail: {}, request_id: requestId };
 	}
 
 	// INSERT is conditional on the exact live lease and terminal absence.  It
 	// and the fenced release share one D1 transaction, so defer vs submit has
 	// a single winner and cannot leave a terminal job with a lease.
-	const result = await db.batch([
-		db
-			.prepare(
-				"INSERT INTO research_job_deferrals (job_id, idempotency_key, lease_owner, reason, recheck_at, deferred_at, request_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) AND EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND lease_expires_at > ?)",
-			)
-			.bind(jobId, input.idempotencyKey, callerPrincipal, input.reason, recheckAt, now, requestId, jobId, jobId, callerPrincipal, input.claimToken, now),
-		db
-			.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND lease_expires_at > ?")
-			.bind(jobId, callerPrincipal, input.claimToken, now),
-	] as never);
-	const inserted = Number((result as Array<{ meta?: { changes?: number } }>)[0]?.meta?.changes ?? 0);
+	let result: Array<{ meta?: { changes?: number } }>;
+	try {
+		result = await db.batch([
+			db
+				.prepare(
+					"INSERT INTO research_job_deferrals (job_id, idempotency_key, lease_owner, reason, recheck_at, deferred_at, request_id, payload_sha256, expected_generation) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) AND EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?)",
+				)
+				.bind(jobId, input.idempotencyKey, callerPrincipal, input.reason, recheckAt, now, requestId, payloadSha256, input.expectedGeneration, jobId, jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now),
+			db
+				.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?")
+				.bind(jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now),
+		] as never) as Array<{ meta?: { changes?: number } }>;
+	} catch {
+		const concurrent = await selectDeferralByIdempotencyKey(db, input.idempotencyKey).catch(() => null);
+		if (concurrent) return replayOutcome(concurrent);
+		fail("STORE_UNAVAILABLE");
+	}
+	const inserted = Number(result[0]?.meta?.changes ?? 0);
 	if (inserted === 1) {
 		return { status: "DEFERRED", job_id: jobId, recheck_at: recheckAt, request_id: requestId };
 	}
-	const replay = await selectDeferral(db, jobId);
-	if (replay?.idempotency_key === input.idempotencyKey) {
-		return { status: "IDEMPOTENT_REPLAY", job_id: jobId, recheck_at: replay.recheck_at, request_id: requestId };
-	}
-	if (replay) return { status: "REJECTED", job_id: jobId, reason: "CONFLICT", detail: {}, request_id: requestId };
+	const replay = await selectDeferralByIdempotencyKey(db, input.idempotencyKey);
+	if (replay) return replayOutcome(replay);
+	if (await selectDeferral(db, jobId)) return { status: "REJECTED", job_id: jobId, reason: "CONFLICT", detail: {}, request_id: requestId };
 	if (await selectTerminal(db, jobId)) return { status: "REJECTED", job_id: jobId, reason: "SECOND_RESULT", detail: {}, request_id: requestId };
 	const lease = await selectLease(db, jobId);
 	let subReason: LeaseSubReason = "NO_LEASE";
 	if (lease && lease.lease_expires_at <= now) subReason = "EXPIRED";
 	else if (lease && lease.claim_token !== input.claimToken) subReason = "TOKEN_MISMATCH";
 	else if (lease && lease.lease_owner !== callerPrincipal) subReason = "OWNER_MISMATCH";
+	else if (lease && Number(lease.claim_count) !== input.expectedGeneration) subReason = "TOKEN_MISMATCH";
 	return { status: "REJECTED", job_id: jobId, reason: "LEASE_INVALID", detail: { sub_reason: subReason }, request_id: requestId };
 }
 
 /**
  * §5.4 receipts: append-only event stream projected into the fixed
- * collector-receipts-v1 whitelist.  `since` replays closed-interval on
- * created_at (overlap is absorbed downstream by the RESEARCH-side UNIQUE
- * dedupe).  `claim_token`, proposal payloads, and client input are
- * structurally absent from the projection.
+ * collector-receipts-v1 whitelist.  New rcpt2 cursors advance over the D1
+ * ingress sequence, never client time or random event ids.  v1/timestamp
+ * callers replay a closed timestamp window once and receive rcpt2; the
+ * RESEARCH mirror's stable receipt dedupe absorbs that overlap.
  */
 export async function listResearchJobReceipts(
 	db: ResearchWorkflowDatabase,
@@ -1066,21 +1206,15 @@ export async function listResearchJobReceipts(
 	const limit = input.limit ?? RECEIPTS_MAX_LIMIT;
 	if (!Number.isInteger(limit) || limit < 1 || limit > RECEIPTS_MAX_LIMIT) fail("INTEGRITY_FAILED");
 	const cursor = decodeReceiptCursor(input.since);
-	const statement = cursor && !cursor.legacy
+	const statement = cursor
 		? db
 				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events WHERE created_at > ? OR (created_at = ? AND event_id > ?) ORDER BY created_at ASC, event_id ASC LIMIT ?",
+					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, CAST(ingress_sequence AS TEXT) AS ingress_sequence FROM research_job_events WHERE research_job_events.ingress_sequence > CAST(? AS INTEGER) ORDER BY research_job_events.ingress_sequence ASC LIMIT ?",
 				)
-				.bind(cursor.createdAt, cursor.createdAt, cursor.eventId, limit)
-		: cursor
-		? db
-				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events WHERE created_at >= ? ORDER BY created_at ASC, event_id ASC LIMIT ?",
-				)
-				.bind(cursor.createdAt, limit)
+				.bind(cursor.ingressSequence, limit)
 		: db
 				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at FROM research_job_events ORDER BY created_at ASC, event_id ASC LIMIT ?",
+					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, CAST(ingress_sequence AS TEXT) AS ingress_sequence FROM research_job_events ORDER BY research_job_events.ingress_sequence ASC LIMIT ?",
 				)
 				.bind(limit);
 	let rows: Array<{
@@ -1093,6 +1227,7 @@ export async function listResearchJobReceipts(
 		detail_json: string;
 		request_id: string;
 		created_at: string;
+		ingress_sequence: string;
 	}>;
 	try {
 		rows = (await statement.all<{
@@ -1105,6 +1240,7 @@ export async function listResearchJobReceipts(
 			detail_json: string;
 			request_id: string;
 			created_at: string;
+			ingress_sequence: string;
 		}>()).results ?? [];
 	} catch {
 		fail("STORE_UNAVAILABLE");
@@ -1131,7 +1267,7 @@ export async function listResearchJobReceipts(
 		});
 	}
 	const nextSince = rows.length > 0
-		? encodeReceiptCursor(rows[rows.length - 1].created_at, rows[rows.length - 1].event_id)
+		? encodeReceiptCursor(ingressSequenceText(rows[rows.length - 1].ingress_sequence))
 		: input.since ?? null;
 	return {
 		schema_version: RECEIPTS_SCHEMA_VERSION,

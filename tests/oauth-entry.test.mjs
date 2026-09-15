@@ -25,12 +25,28 @@ test("OAuth state is stored in an isolated D1 table instead of account-wide Work
 	assert.match(adapter, /list_complete:/);
 });
 
-test("LIVE universe remains on its original KV keyspace and is not used as OAuth persistence", async () => {
+// 原判词「LIVE universe remains on its original KV keyspace」(issue #8) 已被 issue #17 推翻：
+// 账户级 KV 免费写配额无法承载 LIVE 控制面发布窗口的逐轮写入，控制面改用同一私有 D1
+// 库内的独立表。键空间、契约与鉴权语义全部不变，本测试钉住迁移后的新不变量。
+test("LIVE control plane keeps its keyspace and contracts but is served from an isolated D1 table (issue #17)", async () => {
 	const oauth = await source("../src/oauth-entry.ts");
+	const adapter = await source("../src/d1-oauth-kv.ts");
 	const liveUniverse = await source("../src/live-universe.ts");
 	const portfolioStatus = await source("../src/portfolio-status.ts");
 	const portfolioDelta = await source("../src/portfolio-delta.ts");
+	// OAuth 持久化永远不借用 PORTFOLIO 键空间或表。
 	assert.doesNotMatch(oauth, /createD1OAuthKv\(env\.PORTFOLIO_UNIVERSE/);
+	assert.doesNotMatch(oauth, /createD1OAuthKv\([^)]*portfolio_kv_v1/);
+	// 控制面读写走独立 D1 表（非 OAuth 表、非账户 KV）。
+	assert.match(oauth, /const PORTFOLIO_KV_TABLE = "portfolio_kv_v1"/);
+	assert.match(
+		oauth,
+		/PORTFOLIO_UNIVERSE: createD1Kv\(env\.RESEARCH_REPLICA, PORTFOLIO_KV_TABLE\)/,
+	);
+	assert.match(adapter, /export function createD1Kv\(/);
+	assert.match(adapter, /TABLE_NAME_PATTERN/);
+	assert.doesNotMatch(oauth, /PORTFOLIO_KV_TABLE = "oauth_kv_v1"/);
+	// 键空间与契约不因存储引擎迁移而漂移。
 	assert.match(liveUniverse, /LIVE_UNIVERSE_KV_KEY = "live-portfolio\/current"/);
 	assert.match(portfolioStatus, /PORTFOLIO_STATUS_KV_KEY = "live-portfolio\/status"/);
 	assert.match(portfolioDelta, /PORTFOLIO_UNIVERSE_BASELINE_KV_KEY = "live-portfolio\/private\//);
@@ -50,9 +66,15 @@ test("OAuth discovery advertises market:read, research write scopes and offline 
 	// #5 §A4 pure increment: research:claim / research:submit join the
 	// supported list; market:read remains mandatory and offline_access stays.
 	assert.match(oauth, /scopesSupported: \[\.\.\.SUPPORTED_SCOPES\]/);
-	assert.match(oauth, /const SUPPORTED_SCOPES: readonly string\[\] = \[\n\tMARKET_READ_SCOPE,\n\tRESEARCH_CLAIM_SCOPE,\n\tRESEARCH_SUBMIT_SCOPE,\n\tOFFLINE_ACCESS_SCOPE,\n\]/);
+	assert.match(
+		oauth,
+		/const SUPPORTED_SCOPES: readonly string\[\] = \[\n\tMARKET_READ_SCOPE,\n\tRESEARCH_CLAIM_SCOPE,\n\tRESEARCH_SUBMIT_SCOPE,\n\tOFFLINE_ACCESS_SCOPE,\n\]/,
+	);
 	assert.match(oauth, /scopes_supported: \[\.\.\.RESOURCE_SUPPORTED_SCOPES\]/);
-	assert.match(oauth, /const RESOURCE_SUPPORTED_SCOPES: readonly string\[\] = \[\n\tMARKET_READ_SCOPE,\n\tRESEARCH_CLAIM_SCOPE,\n\tRESEARCH_SUBMIT_SCOPE,\n\]/);
+	assert.match(
+		oauth,
+		/const RESOURCE_SUPPORTED_SCOPES: readonly string\[\] = \[\n\tMARKET_READ_SCOPE,\n\tRESEARCH_CLAIM_SCOPE,\n\tRESEARCH_SUBMIT_SCOPE,\n\]/,
+	);
 	assert.match(oauth, /clientIdMetadataDocumentEnabled: true/);
 	assert.match(oauth, /allowImplicitFlow: false/);
 	assert.match(oauth, /allowPlainPKCE: false/);
@@ -101,6 +123,8 @@ test("anonymous MCP remains quote-only compatible while OAuth bearer is validate
 	const tokenGate = oauth.slice(tokenGateStart, tokenGateEnd);
 	assert.match(tokenGate, /audienceMatches\(summary\.audience\)/);
 	assert.match(body, /bridgeSecret \? `Bearer \$\{bridgeSecret\}` : null/);
+	assert.match(body, /headers\.delete\(FORWARDED_ISSUER_HEADER\)/);
+	assert.match(body, /headers\.set\(FORWARDED_ISSUER_HEADER, new URL\(request\.url\)\.origin\)/);
 });
 
 test("legacy static bearer cannot bypass OAuth at the public MCP route", async () => {

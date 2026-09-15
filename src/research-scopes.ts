@@ -36,6 +36,10 @@ export const RESEARCH_SUBMIT_SCOPE = "research:submit";
 export const FORWARDED_SCOPES_HEADER = "X-QuantPro-Client-Scopes";
 /** Authenticated OAuth client identity, stamped only by the OAuth bridge. */
 export const FORWARDED_CLIENT_ID_HEADER = "X-QuantPro-Client-Id";
+/** OAuth issuer stamped by the bridge together with the authenticated client id. */
+export const FORWARDED_ISSUER_HEADER = "X-QuantPro-OAuth-Issuer";
+
+const FORMAL_OWNER_PREFIX = "oauth-client:";
 
 /** Parse a space/comma separated scope list into a set (order-insensitive). */
 function parseScopeList(value: string | null | undefined): Set<string> {
@@ -83,16 +87,59 @@ export function resolveResearchClientId(
 	return forwardedClientId;
 }
 
+/**
+ * The issuer is not taken from an MCP body or a client header.  The OAuth
+ * bridge replaces this header after token validation, while the core still
+ * requires its bridge credential before accepting it.
+ */
+export function resolveResearchIssuer(
+	authorizationHeader: string | null | undefined,
+	forwardedIssuer: string | null | undefined,
+	configuredToken: string | null | undefined,
+): string | null {
+	if (!configuredToken || authorizationHeader !== `Bearer ${configuredToken}`) return null;
+	if (typeof forwardedIssuer !== "string" || forwardedIssuer.length > 512) return null;
+	try {
+		const issuer = new URL(forwardedIssuer);
+		if (issuer.protocol !== "https:" && issuer.protocol !== "http:") return null;
+		if (issuer.pathname !== "/" || issuer.search || issuer.hash) return null;
+		return issuer.origin;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Opaque, stable queue owner identity.  It binds the authenticated issuer and
+ * client id without exposing either identifier in the receipt actor field.
+ * Job and lease generation are fenced by the workflow's job row/token.
+ */
+export async function formalResearchOwner(
+	issuer: string | null,
+	clientId: string | null,
+): Promise<string | null> {
+	if (!issuer || !clientId) return null;
+	const bytes = new TextEncoder().encode(`${issuer}\u0000${clientId}`);
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	const hex = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+	return `${FORMAL_OWNER_PREFIX}${hex}`;
+}
+
+export function isFormalResearchOwner(value: string): boolean {
+	return new RegExp(`^${FORMAL_OWNER_PREFIX}[a-f0-9]{64}$`).test(value);
+}
+
 /** All three grants are required: client allowlist, scope, and job namespace. */
 export function permitsFormalResearchOperation(input: {
 	clientId: string | null;
+	issuer: string | null;
 	scopes: ReadonlySet<string>;
 	requiredScope: string;
 	configuredClientIds: string | null | undefined;
 	configuredNamespaces: string | null | undefined;
 	jobId: string;
 }): boolean {
-	if (!input.clientId || !input.scopes.has(input.requiredScope)) return false;
+	if (!input.clientId || !input.issuer || !input.scopes.has(input.requiredScope)) return false;
 	// These identities belong to engineering, RESEARCH transport, or receipt
 	// consumption roles.  Configuration cannot accidentally promote any of
 	// them into a formal ChatGPT result owner merely by adding a scope.
