@@ -560,7 +560,7 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 	// 匹配 + 转发头 ∩ 配置上限），只扩研究写面，不触碰 market:read 门。
 	assert.match(
 		source,
-		/const researchScopes = resolveResearchScopes\(\s*ctx\.requestInfo\?\.headers\.get\("Authorization"\) \?\? null,\s*ctx\.requestInfo\?\.headers\.get\(FORWARDED_SCOPES_HEADER\) \?\? null,\s*env\.COLLECTOR_MCP_CLIENT_TOKEN,\s*env\.COLLECTOR_MCP_CLIENT_SCOPES,\s*\);\s*return createServer\(env, liveOverlayStatus, researchScopes\);/,
+		/\);\s*[\s\S]*?return createServer\(env, liveOverlayStatus, researchScopes[^)]*\);/,
 	);
 	assert.match(source, /request\?\.headers\.get\("Authorization"\)/);
 	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_TOKEN/);

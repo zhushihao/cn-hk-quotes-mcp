@@ -10,7 +10,7 @@
 	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 	"vars": {
 		"COLLECTOR_MCP_CLIENT_ID": "chatgpt-production",
-		"COLLECTOR_MCP_CLIENT_SCOPES": "market:read",
+		"COLLECTOR_MCP_CLIENT_SCOPES": "market:read research:claim research:submit",
 	},
 	"kv_namespaces": [
 		{
