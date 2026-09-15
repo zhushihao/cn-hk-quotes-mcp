@@ -218,7 +218,10 @@ test("bridge strips client forwarded headers before stamping and binds principal
 		handleMcp.indexOf("headers.delete(FORWARDED_ISSUER_HEADER)"),
 	);
 	const firstSet = handleMcp.indexOf("headers.set(");
-	assert.ok(lastDelete >= 0 && firstSet > lastDelete, "all forwarded headers must be deleted before any set");
+	assert.ok(
+		lastDelete >= 0 && firstSet > lastDelete,
+		"all forwarded headers must be deleted before any set",
+	);
 
 	// principal 只能来自已验证 grant props；DCR client_id 不得再被盖章。
 	assert.match(handleMcp, /const principal = summary\.grant\.props\?\.principal;/);

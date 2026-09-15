@@ -67,8 +67,13 @@ async function stop(child) {
 	if (child.exitCode === null && !child.killed) child.kill("SIGKILL");
 }
 
-async function startWorker({ withoutD1 = false, temp = null, removeTemp = true, extraEnv = {} } = {}) {
-	const workDir = temp ?? await mkdtemp(path.join(tmpdir(), "quantpro-oauth-lifecycle-"));
+async function startWorker({
+	withoutD1 = false,
+	temp = null,
+	removeTemp = true,
+	extraEnv = {},
+} = {}) {
+	const workDir = temp ?? (await mkdtemp(path.join(tmpdir(), "quantpro-oauth-lifecycle-")));
 	const port = await availablePort();
 	const envFile = path.join(workDir, ".dev.vars");
 	const stateDir = path.join(workDir, "state");
@@ -132,7 +137,8 @@ async function startWorker({ withoutD1 = false, temp = null, removeTemp = true, 
 		await waitForWorker(origin, () => stderrLines.join("").slice(-4_000), !withoutD1);
 	} catch (error) {
 		await stop(child);
-		if (removeTemp) await rm(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+		if (removeTemp)
+			await rm(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 		throw error;
 	}
 	return {
@@ -143,7 +149,13 @@ async function startWorker({ withoutD1 = false, temp = null, removeTemp = true, 
 		},
 		async close() {
 			await stop(child);
-			if (removeTemp) await rm(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+			if (removeTemp)
+				await rm(workDir, {
+					recursive: true,
+					force: true,
+					maxRetries: 10,
+					retryDelay: 200,
+				});
 		},
 	};
 }
@@ -499,7 +511,9 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 		const fullScopes = "market:read research:claim research:submit";
 
 		// Client A: full formal round on a real job_<hash> id.
-		const codeA = await issueAuthorizationCode(worker.origin, clientA.client_id, { scope: fullScopes });
+		const codeA = await issueAuthorizationCode(worker.origin, clientA.client_id, {
+			scope: fullScopes,
+		});
 		const tokenAResponse = await exchangeCode(worker.origin, clientA.client_id, codeA);
 		assert.equal(tokenAResponse.status, 200, "formal OAuth token exchange must succeed");
 		const { access_token: accessTokenA } = await tokenAResponse.json();
@@ -516,7 +530,11 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 			"claim_research_job",
 			{ job_id: jobA },
 		);
-		assert.equal(claimA.payload.status, "CLAIMED", "real job_<hash> must be claimable without any namespace gate");
+		assert.equal(
+			claimA.payload.status,
+			"CLAIMED",
+			"real job_<hash> must be claimable without any namespace gate",
+		);
 		assert.match(claimA.payload.claim_token, /^clt_[a-f0-9]{32}$/);
 		assert.equal(claimA.payload.lease_generation, 1);
 		const submittedA = await mcpTool(
@@ -541,12 +559,18 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 				},
 			},
 		);
-		assert.equal(submittedA.payload.status, "ACCEPTED", "formal submit must complete the job under the stable principal");
+		assert.equal(
+			submittedA.payload.status,
+			"ACCEPTED",
+			"formal submit must complete the job under the stable principal",
+		);
 		assert.equal(submittedA.payload.terminal_status, "COMPLETED");
 
 		// Client B: a *different* DCR client_id, same stable principal.  The
 		// formal gate must treat it identically — DCR rotation is invisible.
-		const codeB = await issueAuthorizationCode(worker.origin, clientB.client_id, { scope: fullScopes });
+		const codeB = await issueAuthorizationCode(worker.origin, clientB.client_id, {
+			scope: fullScopes,
+		});
 		const tokenBResponse = await exchangeCode(worker.origin, clientB.client_id, codeB);
 		assert.equal(tokenBResponse.status, 200, "rotated DCR client token exchange must succeed");
 		const { access_token: accessTokenB } = await tokenBResponse.json();
@@ -563,7 +587,11 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 			"claim_research_job",
 			{ job_id: jobB },
 		);
-		assert.equal(claimB.payload.status, "CLAIMED", "rotated DCR client_id must keep the stable principal claimable");
+		assert.equal(
+			claimB.payload.status,
+			"CLAIMED",
+			"rotated DCR client_id must keep the stable principal claimable",
+		);
 
 		// PRIVATE job: eligibility is server-side record state -> NOT_FOUND
 		// (no existence oracle) even with a valid principal and full scopes.
@@ -581,7 +609,9 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 		// market:read alone can never claim or submit: a token whose grant
 		// lacks the research scopes hits the scope gate (FILTERED) first.
 		const clientC = await registerClient(worker.origin);
-		const codeC = await issueAuthorizationCode(worker.origin, clientC.client_id, { scope: "market:read" });
+		const codeC = await issueAuthorizationCode(worker.origin, clientC.client_id, {
+			scope: "market:read",
+		});
 		const tokenCResponse = await exchangeCode(worker.origin, clientC.client_id, codeC);
 		assert.equal(tokenCResponse.status, 200, "market:read-only token exchange must succeed");
 		const { access_token: accessTokenC } = await tokenCResponse.json();
@@ -590,41 +620,72 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 			capabilities: {},
 			clientInfo: { name: "issue19-market-read-only", version: "1" },
 		});
-		const deniedClaim = await mcpRpc(worker.origin, accessTokenC, initializedC.sessionId, 8, "tools/call", {
-			name: "claim_research_job",
-			arguments: { job_id: jobB },
-		});
-		assert.equal(deniedClaim.payload.result?.isError, true, "claim without research:claim must fail closed");
-		assert.match(deniedClaim.payload.result?.content?.[0]?.text ?? "", /FILTERED/u);
-		const deniedSubmit = await mcpRpc(worker.origin, accessTokenC, initializedC.sessionId, 9, "tools/call", {
-			name: "submit_research_result_proposal",
-			arguments: {
-				job_id: jobA,
-				claim_token: `clt_${"0".repeat(32)}`,
-				expected_generation: 1,
-				idempotency_key: "issue19-denied-submit",
-				proposal: {},
+		const deniedClaim = await mcpRpc(
+			worker.origin,
+			accessTokenC,
+			initializedC.sessionId,
+			8,
+			"tools/call",
+			{
+				name: "claim_research_job",
+				arguments: { job_id: jobB },
 			},
-		});
-		assert.equal(deniedSubmit.payload.result?.isError, true, "submit without research:submit must fail closed");
+		);
+		assert.equal(
+			deniedClaim.payload.result?.isError,
+			true,
+			"claim without research:claim must fail closed",
+		);
+		assert.match(deniedClaim.payload.result?.content?.[0]?.text ?? "", /FILTERED/u);
+		const deniedSubmit = await mcpRpc(
+			worker.origin,
+			accessTokenC,
+			initializedC.sessionId,
+			9,
+			"tools/call",
+			{
+				name: "submit_research_result_proposal",
+				arguments: {
+					job_id: jobA,
+					claim_token: `clt_${"0".repeat(32)}`,
+					expected_generation: 1,
+					idempotency_key: "issue19-denied-submit",
+					proposal: {},
+				},
+			},
+		);
+		assert.equal(
+			deniedSubmit.payload.result?.isError,
+			true,
+			"submit without research:submit must fail closed",
+		);
 		assert.match(deniedSubmit.payload.result?.content?.[0]?.text ?? "", /FILTERED/u);
 
 		// Formal lifecycle events from the real principal are receipt-readable.
-		const receiptsResponse = await fetch(`${worker.origin}/internal/research-replica/v2/receipts`, {
-			headers: { authorization: "Bearer synthetic-replica-ingest-token" },
-		});
+		const receiptsResponse = await fetch(
+			`${worker.origin}/internal/research-replica/v2/receipts`,
+			{
+				headers: { authorization: "Bearer synthetic-replica-ingest-token" },
+			},
+		);
 		assert.equal(receiptsResponse.status, 200);
 		const receipts = await receiptsResponse.json();
 		assert.ok(
-			receipts.receipts.some((receipt) => receipt.job_id === jobA && receipt.event_type === "CLAIMED"),
+			receipts.receipts.some(
+				(receipt) => receipt.job_id === jobA && receipt.event_type === "CLAIMED",
+			),
 			"claimed job_<hash> must surface as a receipt",
 		);
 		assert.ok(
-			receipts.receipts.some((receipt) => receipt.job_id === jobA && receipt.event_type === "COMPLETED"),
+			receipts.receipts.some(
+				(receipt) => receipt.job_id === jobA && receipt.event_type === "COMPLETED",
+			),
 			"completed job_<hash> must surface as a receipt",
 		);
 		assert.ok(
-			receipts.receipts.some((receipt) => receipt.job_id === jobB && receipt.event_type === "CLAIMED"),
+			receipts.receipts.some(
+				(receipt) => receipt.job_id === jobB && receipt.event_type === "CLAIMED",
+			),
 			"rotated-client claim must surface under the same stable principal",
 		);
 	} finally {
