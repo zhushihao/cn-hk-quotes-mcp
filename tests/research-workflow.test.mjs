@@ -12,8 +12,9 @@ const workflow = await import("../src/research-workflow.ts");
  * credential, deployed Worker, or ChatGPT Automation is involved.
  */
 class SqliteD1 {
-	constructor() {
+	constructor({ triggerInflatedChanges = false } = {}) {
 		this.sqlite = new DatabaseSync(":memory:");
+		this.triggerInflatedChanges = triggerInflatedChanges;
 		for (const migration of [
 			"0001_research_replica.sql",
 			"0003_research_workflow.sql",
@@ -26,6 +27,7 @@ class SqliteD1 {
 	}
 
 	prepare(sql) {
+		const db = this;
 		const sqlite = this.sqlite;
 		let values = [];
 		return {
@@ -35,7 +37,8 @@ class SqliteD1 {
 			},
 			async run() {
 				const result = sqlite.prepare(sql).run(...values);
-				return { meta: { changes: Number(result.changes) } };
+				const triggerChanges = db.triggerInflatedChanges && sql.includes("research_job_events") ? 1 : 0;
+				return { meta: { changes: Number(result.changes) + triggerChanges } };
 			},
 			async first() {
 				return sqlite.prepare(sql).get(...values) ?? null;
@@ -243,6 +246,41 @@ test("G09 rcpt2 ingress sequence reaches an event written between pages even whe
 	).run(NOW);
 	const second = await workflow.listResearchJobReceipts(db, { since: first.next_since, limit: 2, now: NOW });
 	assert.deepEqual(second.receipts.map((receipt) => receipt.request_id), ["req-evt-a"]);
+});
+
+test("G09 rcpt2 keeps a 64-bit decimal sequence lossless and legacy cursors replay from zero", async () => {
+	const db = new SqliteD1();
+	db.sqlite.prepare(
+		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-early', 'job-legacy', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-early', '2020-01-01T00:00:00.000Z')",
+	).run();
+	db.sqlite.prepare(
+		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, ingress_sequence) VALUES ('evt-u64', 'job-legacy', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-u64', ?, '9007199254740993')",
+	).run(NOW);
+	const timestampUpgrade = await workflow.listResearchJobReceipts(db, { since: NOW, limit: 10, now: NOW });
+	assert.deepEqual(timestampUpgrade.receipts.map((receipt) => receipt.request_id), ["req-early", "req-u64"]);
+	const v1 = `rcpt1.${btoa(JSON.stringify({ v: 1, t: NOW, e: "evt-u64" }))}`;
+	const v1Upgrade = await workflow.listResearchJobReceipts(db, { since: v1, limit: 10, now: NOW });
+	assert.deepEqual(v1Upgrade.receipts.map((receipt) => receipt.request_id), ["req-early", "req-u64"]);
+	const cursor = JSON.parse(atob(timestampUpgrade.next_since.slice("rcpt2.".length)));
+	assert.equal(typeof cursor.s, "string");
+	assert.equal(cursor.s, "9007199254740993");
+	const empty = await workflow.listResearchJobReceipts(db, { since: timestampUpgrade.next_since, limit: 10, now: NOW });
+	assert.deepEqual(empty.receipts, []);
+});
+
+test("G07/G08 trigger-sensitive D1 change counts do not turn committed claim or submit into errors", async () => {
+	const db = new SqliteD1({ triggerInflatedChanges: true });
+	db.seedJob("job-trigger-count");
+	const lease = await workflow.claimResearchJob(db, {
+		jobId: "job-trigger-count", leaseOwner: FORMAL_OWNER_A, requestId: "req-trigger-claim", now: NOW,
+	});
+	assert.equal(lease.status, "CLAIMED");
+	const submitted = await workflow.submitResearchResultProposal(db, {
+		jobId: "job-trigger-count", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		idempotencyKey: "trigger-count-submit", origin: "CHATGPT", proposal: proposal("job-trigger-count"),
+		callerPrincipal: FORMAL_OWNER_A, requestId: "req-trigger-submit", now: NOW,
+	});
+	assert.equal(submitted.status, "ACCEPTED");
 });
 
 test("G08 defer is a fenced remote release, retries idempotently, and recheck gates claims", async () => {

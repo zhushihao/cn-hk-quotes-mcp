@@ -181,7 +181,7 @@ export type ResearchReceiptsPage = {
 	receipts: ResearchReceiptItem[];
 };
 
-type ReceiptCursor = { ingressSequence: number; legacySince: string | null };
+type ReceiptCursor = { ingressSequence: string };
 
 type DeferralRow = {
 	job_id: string;
@@ -190,8 +190,22 @@ type DeferralRow = {
 	payload_sha256: string | null;
 };
 
+const MAX_D1_INGRESS_SEQUENCE = 9_223_372_036_854_775_807n;
+
+/** Lossless decimal encoding for D1's signed 64-bit ingress sequence. */
+function ingressSequenceText(value: unknown): string {
+	if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value)) fail("INTEGRITY_FAILED");
+	try {
+		if (BigInt(value) > MAX_D1_INGRESS_SEQUENCE) fail("INTEGRITY_FAILED");
+		return value;
+	} catch (error) {
+		if (error instanceof ResearchBoundaryError) throw error;
+		fail("INTEGRITY_FAILED");
+	}
+}
+
 /** Versioned opaque cursor for D1's strictly increasing ingress sequence. */
-function encodeReceiptCursor(ingressSequence: number): string {
+function encodeReceiptCursor(ingressSequence: string): string {
 	return `rcpt2.${btoa(JSON.stringify({ v: 2, s: ingressSequence }))}`;
 }
 
@@ -201,31 +215,33 @@ function decodeReceiptCursor(value: string | null | undefined): ReceiptCursor | 
 		try {
 			const parsed = JSON.parse(atob(value.slice("rcpt2.".length)));
 			const sequence = isRecord(parsed) ? parsed.s : null;
-			if (parsed === null || !isRecord(parsed) || parsed.v !== 2 || typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 1) {
+			if (parsed === null || !isRecord(parsed) || parsed.v !== 2) {
 				fail("INTEGRITY_FAILED");
 			}
-			return { ingressSequence: sequence, legacySince: null };
+			return { ingressSequence: ingressSequenceText(sequence) };
 		} catch (error) {
 			if (error instanceof ResearchBoundaryError) throw error;
 			fail("INTEGRITY_FAILED");
 		}
 	}
 	if (value.startsWith(`${RECEIPT_CURSOR_VERSION}.`)) {
-		// v1 used (created_at,event_id).  It cannot safely order writes added
-		// after a page, so replay its timestamp window and immediately upgrade.
+		// v1 used (created_at,event_id). It cannot safely order later writes,
+		// so validate its timestamp but replay the complete event log from zero.
 		try {
 			const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_VERSION.length + 1)));
 			if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.t !== "string") fail("INTEGRITY_FAILED");
-			return { ingressSequence: 0, legacySince: normalizedIso(parsed.t, "cursor") };
+			normalizedIso(parsed.t, "cursor");
+			return { ingressSequence: "0" };
 		} catch (error) {
 			if (error instanceof ResearchBoundaryError) throw error;
 			fail("INTEGRITY_FAILED");
 		}
 	}
 	if (!value.startsWith("rcpt")) {
-		// Timestamp-only callers are retained only as an overlap-replay upgrade
-		// entry.  Their response always upgrades them to an opaque cursor.
-		return { ingressSequence: 0, legacySince: normalizedIso(value, "since") };
+		// Timestamp-only callers must also recover from sequence zero; retaining
+		// a timestamp predicate can preserve a prior silent omission forever.
+		normalizedIso(value, "since");
+		return { ingressSequence: "0" };
 	}
 	fail("INTEGRITY_FAILED");
 }
@@ -330,6 +346,18 @@ async function selectTerminal(db: ResearchWorkflowDatabase, jobId: string): Prom
 	return row !== null;
 }
 
+async function terminalMatchesProposal(
+	db: ResearchWorkflowDatabase,
+	jobId: string,
+	proposalId: string,
+): Promise<boolean> {
+	const row = await db
+		.prepare("SELECT job_id FROM research_job_terminal WHERE job_id=? AND proposal_id=?")
+		.bind(jobId, proposalId)
+		.first<{ job_id: string }>();
+	return row !== null;
+}
+
 async function selectDeferral(
 	db: ResearchWorkflowDatabase,
 	jobId: string,
@@ -427,7 +455,7 @@ export async function claimResearchJob(
 		// without its ingress event and no failed preempt mints a receipt.
 		const eventId = `evt_${randomHex32()}`;
 		const expiredEventId = `evt_${randomHex32()}`;
-		const result = await db.batch([
+		await db.batch([
 			db
 				.prepare(
 					"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, job_id, 'LEASE_EXPIRED', lease_owner, NULL, NULL, '{}', ?, ? FROM research_job_leases WHERE job_id=? AND lease_expires_at <= ? AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=research_job_leases.job_id) AND NOT EXISTS (SELECT 1 FROM research_job_deferrals WHERE job_id=research_job_leases.job_id AND recheck_at > ?)",
@@ -439,11 +467,12 @@ export async function claimResearchJob(
 					"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, job_id, 'CLAIMED', ?, NULL, NULL, '{}', ?, ? FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=?",
 				)
 				.bind(eventId, leaseOwner, requestId, now, jobId, leaseOwner, claimToken),
-		] as never) as Array<{ meta?: { changes?: number } }>;
-		if (Number(result[1]?.meta?.changes ?? 0) === 1) {
-			if (Number(result[2]?.meta?.changes ?? 0) !== 1) fail("STORE_UNAVAILABLE");
-			const lease = await selectLease(db, jobId);
-			if (!lease) fail("STORE_UNAVAILABLE");
+		] as never);
+		// D1's INSERT-trigger UPDATE contributes to meta.changes, so a strict
+		// statement-change count is not a transition result. Re-read the
+		// committed authoritative lease by its freshly generated capability.
+		const lease = await selectLease(db, jobId);
+		if (lease && lease.lease_owner === leaseOwner && lease.claim_token === claimToken) {
 			return {
 				status: "CLAIMED",
 				job_id: jobId,
@@ -992,9 +1021,8 @@ export async function submitResearchResultProposal(
 		// a stale generation.
 		const leasePredicate =
 			"EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?) AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?)";
-		let accepted: Array<{ meta?: { changes?: number } }>;
 		try {
-			accepted = await db.batch([
+			await db.batch([
 				db
 					.prepare(
 						`INSERT INTO research_proposals (proposal_id, job_id, idempotency_key, caller_principal, origin, status, reject_reason, payload_json, payload_sha256, created_at, request_id) SELECT ?, ?, ?, ?, 'CHATGPT', 'RECEIVED', NULL, ?, ?, ?, ? WHERE ${leasePredicate}`,
@@ -1014,7 +1042,7 @@ export async function submitResearchResultProposal(
 				db
 					.prepare("INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, ?, 'COMPLETED', ?, ?, 'CHATGPT', '{}', ?, ? WHERE EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=? AND proposal_id=?)")
 					.bind(`evt_${randomHex32()}`, jobId, callerPrincipal, proposalId, requestId, now, jobId, proposalId),
-			] as never) as Array<{ meta?: { changes?: number } }>;
+			] as never);
 		} catch {
 			const outcome = await resolveProposalRace(db, race);
 			if (outcome) return outcome;
@@ -1023,12 +1051,14 @@ export async function submitResearchResultProposal(
 			}
 			return { status: "REJECTED", job_id: jobId, reason: "LEASE_INVALID", detail: {}, request_id: requestId };
 		}
+		// Trigger side effects make D1 meta.changes non-portable. The terminal
+		// row plus its idempotency proposal are the authoritative transaction
+		// outcome and distinguish a first accepted submit from a later replay.
+		const committedProposal = await selectProposalByIdempotencyKey(db, idempotencyKey);
 		if (
-			Number(accepted[0]?.meta?.changes ?? 0) === 1 &&
-			Number(accepted[1]?.meta?.changes ?? 0) === 1 &&
-			Number(accepted[2]?.meta?.changes ?? 0) === 1 &&
-			Number(accepted[3]?.meta?.changes ?? 0) === 1 &&
-			Number(accepted[4]?.meta?.changes ?? 0) === 1
+			committedProposal?.proposal_id === proposalId &&
+			committedProposal.status === "RECEIVED" &&
+			await terminalMatchesProposal(db, jobId, proposalId)
 		) {
 			return {
 				status: "ACCEPTED",
@@ -1176,21 +1206,15 @@ export async function listResearchJobReceipts(
 	const limit = input.limit ?? RECEIPTS_MAX_LIMIT;
 	if (!Number.isInteger(limit) || limit < 1 || limit > RECEIPTS_MAX_LIMIT) fail("INTEGRITY_FAILED");
 	const cursor = decodeReceiptCursor(input.since);
-	const statement = cursor && cursor.legacySince === null
+	const statement = cursor
 		? db
 				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, ingress_sequence FROM research_job_events WHERE ingress_sequence > ? ORDER BY ingress_sequence ASC LIMIT ?",
+					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, CAST(ingress_sequence AS TEXT) AS ingress_sequence FROM research_job_events WHERE research_job_events.ingress_sequence > CAST(? AS INTEGER) ORDER BY research_job_events.ingress_sequence ASC LIMIT ?",
 				)
 				.bind(cursor.ingressSequence, limit)
-		: cursor
-		? db
-				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, ingress_sequence FROM research_job_events WHERE created_at >= ? ORDER BY ingress_sequence ASC LIMIT ?",
-				)
-				.bind(cursor.legacySince, limit)
 		: db
 				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, ingress_sequence FROM research_job_events ORDER BY ingress_sequence ASC LIMIT ?",
+					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, CAST(ingress_sequence AS TEXT) AS ingress_sequence FROM research_job_events ORDER BY research_job_events.ingress_sequence ASC LIMIT ?",
 				)
 				.bind(limit);
 	let rows: Array<{
@@ -1203,7 +1227,7 @@ export async function listResearchJobReceipts(
 		detail_json: string;
 		request_id: string;
 		created_at: string;
-		ingress_sequence: number;
+		ingress_sequence: string;
 	}>;
 	try {
 		rows = (await statement.all<{
@@ -1216,7 +1240,7 @@ export async function listResearchJobReceipts(
 			detail_json: string;
 			request_id: string;
 			created_at: string;
-			ingress_sequence: number;
+			ingress_sequence: string;
 		}>()).results ?? [];
 	} catch {
 		fail("STORE_UNAVAILABLE");
@@ -1243,7 +1267,7 @@ export async function listResearchJobReceipts(
 		});
 	}
 	const nextSince = rows.length > 0
-		? encodeReceiptCursor(Number(rows[rows.length - 1].ingress_sequence))
+		? encodeReceiptCursor(ingressSequenceText(rows[rows.length - 1].ingress_sequence))
 		: input.since ?? null;
 	return {
 		schema_version: RECEIPTS_SCHEMA_VERSION,

@@ -67,11 +67,11 @@ async function stop(child) {
 	if (child.exitCode === null && !child.killed) child.kill("SIGKILL");
 }
 
-async function startWorker({ withoutD1 = false } = {}) {
-	const temp = await mkdtemp(path.join(tmpdir(), "quantpro-oauth-lifecycle-"));
+async function startWorker({ withoutD1 = false, temp = null, removeTemp = true, extraEnv = {} } = {}) {
+	const workDir = temp ?? await mkdtemp(path.join(tmpdir(), "quantpro-oauth-lifecycle-"));
 	const port = await availablePort();
-	const envFile = path.join(temp, ".dev.vars");
-	const stateDir = path.join(temp, "state");
+	const envFile = path.join(workDir, ".dev.vars");
+	const stateDir = path.join(workDir, "state");
 	await writeFile(
 		envFile,
 		[
@@ -80,11 +80,12 @@ async function startWorker({ withoutD1 = false } = {}) {
 			"COLLECTOR_MCP_CLIENT_SCOPES=market:read",
 			"PORTFOLIO_UNIVERSE_TOKEN=synthetic-internal-secret",
 			"GITHUB_TOKEN=synthetic-github-token",
+			...Object.entries(extraEnv).map(([key, value]) => `${key}=${value}`),
 		].join("\n"),
 	);
 	let configPath = "wrangler.jsonc";
 	if (withoutD1) {
-		configPath = path.join(temp, "wrangler.no-d1.jsonc");
+		configPath = path.join(workDir, "wrangler.no-d1.jsonc");
 		await writeFile(
 			configPath,
 			JSON.stringify({
@@ -131,16 +132,43 @@ async function startWorker({ withoutD1 = false } = {}) {
 		await waitForWorker(origin, () => stderrLines.join("").slice(-4_000), !withoutD1);
 	} catch (error) {
 		await stop(child);
-		await rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+		if (removeTemp) await rm(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 		throw error;
 	}
 	return {
 		origin,
+		stateDir,
+		async stop() {
+			await stop(child);
+		},
 		async close() {
 			await stop(child);
-			await rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+			if (removeTemp) await rm(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 		},
 	};
+}
+
+async function runLocalD1(stateDir, command, args = []) {
+	const output = [];
+	const child = spawn(
+		process.execPath,
+		[
+			path.join(ROOT, "node_modules", "wrangler", "bin", "wrangler.js"),
+			"d1",
+			...args,
+			"--config",
+			"wrangler.jsonc",
+			"--local",
+			"--persist-to",
+			stateDir,
+			...(command === null ? [] : ["--command", command]),
+		],
+		{ cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+	);
+	child.stdout.on("data", (chunk) => output.push(String(chunk)));
+	child.stderr.on("data", (chunk) => output.push(String(chunk)));
+	const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+	assert.equal(exitCode, 0, `local D1 setup must succeed: ${output.join("").slice(-4_000)}`);
 }
 
 function pkceChallenge(verifier = VERIFIER) {
@@ -209,8 +237,8 @@ async function approve(origin, authorization, ownerKey = OWNER_SECRET) {
 	});
 }
 
-async function issueAuthorizationCode(origin, clientId) {
-	const authorization = await beginAuthorization(origin, clientId);
+async function issueAuthorizationCode(origin, clientId, overrides = {}) {
+	const authorization = await beginAuthorization(origin, clientId, overrides);
 	const response = await approve(origin, authorization);
 	assert.equal(response.status, 302, "valid owner consent must return a callback redirect");
 	const location = response.headers.get("location");
@@ -256,6 +284,42 @@ async function initializeMcp(origin, accessToken) {
 			},
 		}),
 	});
+}
+
+function rpcPayload(raw, contentType) {
+	if (!contentType.includes("text/event-stream")) return JSON.parse(raw);
+	const line = raw.split("\n").find((candidate) => candidate.startsWith("data:"));
+	assert.ok(line, "MCP SSE response must contain a JSON-RPC data frame");
+	return JSON.parse(line.slice("data:".length).trim());
+}
+
+async function mcpRpc(origin, accessToken, sessionId, id, method, params) {
+	const response = await fetch(`${origin}/mcp`, {
+		method: "POST",
+		headers: {
+			...MCP_HEADERS,
+			authorization: `Bearer ${accessToken}`,
+			...(sessionId ? { "mcp-session-id": sessionId } : {}),
+		},
+		body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+	});
+	assert.equal(response.status, 200, `${method} must reach the local MCP endpoint`);
+	return {
+		payload: rpcPayload(await response.text(), response.headers.get("content-type") ?? ""),
+		sessionId: response.headers.get("mcp-session-id") ?? sessionId,
+	};
+}
+
+async function mcpTool(origin, accessToken, sessionId, id, name, args) {
+	const call = await mcpRpc(origin, accessToken, sessionId, id, "tools/call", {
+		name,
+		arguments: args,
+	});
+	const result = call.payload.result;
+	assert.ok(result && result.isError !== true, `${name} must not return a tool error`);
+	const text = result.content?.[0]?.text;
+	assert.equal(typeof text, "string", `${name} must return JSON text`);
+	return { payload: JSON.parse(text), sessionId: call.sessionId };
 }
 
 test("local Worker closes DCR → consent → PKCE → token → refresh → authenticated MCP", async (t) => {
@@ -386,4 +450,90 @@ test("missing local D1 OAuth persistence fails closed before authorization", asy
 		"unavailable D1 persistence must not issue an authorization form",
 	);
 	assert.equal(response.headers.has("location"), false);
+});
+
+test("local migrated D1 trigger preserves the first formal OAuth claim and submit outcomes", async () => {
+	const temp = await mkdtemp(path.join(tmpdir(), "quantpro-formal-workflow-"));
+	let worker = null;
+	try {
+		// Register first, then restart against the same local D1 state with this
+		// exact DCR client in the formal allowlist. This exercises the actual
+		// OAuth issuer/client identity path rather than a forged header.
+		worker = await startWorker({ temp, removeTemp: false });
+		const client = await registerClient(worker.origin);
+		const stateDir = worker.stateDir;
+		await worker.stop();
+		await runLocalD1(stateDir, null, ["migrations", "apply", "RESEARCH_REPLICA"]);
+		await runLocalD1(
+			stateDir,
+			"INSERT INTO research_records (record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at) VALUES ('job', 'research-formal:trigger-count', 'outbound_formal_trigger_count', 'PUBLIC', 'collector-outbound-v4', '{}', '2026-09-15T00:00:00.000Z', '2026-09-15T00:00:00.000Z')",
+			["execute", "RESEARCH_REPLICA"],
+		);
+		worker = await startWorker({
+			temp,
+			removeTemp: false,
+			extraEnv: {
+				COLLECTOR_MCP_CLIENT_SCOPES: "market:read research:claim research:submit",
+				COLLECTOR_MCP_FORMAL_CLIENT_IDS: client.client_id,
+				COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES: "research-formal",
+				RESEARCH_REPLICA_INGEST_TOKEN: "synthetic-replica-ingest-token",
+			},
+		});
+
+		const code = await issueAuthorizationCode(worker.origin, client.client_id, {
+			scope: "market:read research:claim research:submit",
+		});
+		const tokenResponse = await exchangeCode(worker.origin, client.client_id, code);
+		assert.equal(tokenResponse.status, 200, "formal OAuth token exchange must succeed");
+		const { access_token: accessToken } = await tokenResponse.json();
+		assert.equal(typeof accessToken, "string");
+
+		const jobId = "research-formal:trigger-count";
+
+		const initialized = await mcpRpc(worker.origin, accessToken, null, 1, "initialize", {
+			protocolVersion: "2025-03-26",
+			capabilities: {},
+			clientInfo: { name: "formal-d1-trigger-regression", version: "1" },
+		});
+		assert.ok(initialized.payload.result, "MCP initialize must succeed");
+		const claim = await mcpTool(
+			worker.origin,
+			accessToken,
+			initialized.sessionId,
+			2,
+			"claim_research_job",
+			{ job_id: jobId },
+		);
+		assert.equal(claim.payload.status, "CLAIMED", "first migrated-D1 claim must not report a false store error");
+		assert.match(claim.payload.claim_token, /^clt_[a-f0-9]{32}$/);
+		assert.equal(claim.payload.lease_generation, 1);
+
+		const submitted = await mcpTool(
+			worker.origin,
+			accessToken,
+			claim.sessionId,
+			3,
+			"submit_research_result_proposal",
+			{
+				job_id: jobId,
+				claim_token: claim.payload.claim_token,
+				expected_generation: claim.payload.lease_generation,
+				idempotency_key: "formal-trigger-count-submit",
+				origin: "CHATGPT",
+				proposal: {
+					job_id: jobId,
+					summary: "Synthetic formal D1 trigger regression result",
+					findings: [],
+					recommendation_hint: "NONE",
+					sources_consulted: [],
+					completed_at: new Date().toISOString(),
+				},
+			},
+		);
+		assert.equal(submitted.payload.status, "ACCEPTED", "first migrated-D1 submit must not become an idempotent replay");
+		assert.equal(submitted.payload.terminal_status, "COMPLETED");
+	} finally {
+		if (worker) await worker.stop();
+		await rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+	}
 });
