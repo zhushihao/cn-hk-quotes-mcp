@@ -307,7 +307,16 @@ async function step1InitializeAndCountTools() {
 	]) {
 		assertOk(step, names.includes(expected), `missing tool ${expected}`, { names });
 	}
-	evidence({ step: "1.tools", ok: true, count: names.length });
+	// #19 safety-gate compatibility: no model-facing inputSchema may
+	// advertise a credential-like claim_token parameter.
+	for (const tool of tools) {
+		assertOk(
+			step,
+			!JSON.stringify(tool.inputSchema).includes("claim_token"),
+			`${tool.name} inputSchema advertises claim_token`,
+		);
+	}
+	evidence({ step: "1.tools", ok: true, count: names.length, claim_token_free: true });
 }
 
 async function step2ReadPlane() {
@@ -433,6 +442,9 @@ async function step3ClaimContextSubmitLoop() {
 		await mainClient.callTool("claim_research_job", { job_id: jobId }),
 	);
 	assertOk(step, claim.status === "CLAIMED", `claim returned ${claim.status}`, { claim });
+	// #19 safety-gate compatibility: nothing credential-like may reach the model.
+	assertOk(step, !Object.keys(claim).includes("claim_token"), "claim response carried claim_token");
+	assertOk(step, !JSON.stringify(claim).includes("clt_"), "claim response leaked a token-like string");
 	markTool("claim_research_job");
 	const context = domainPayload(
 		step,
@@ -458,7 +470,7 @@ async function step3ClaimContextSubmitLoop() {
 		"submit_research_result_proposal",
 		await mainClient.callTool("submit_research_result_proposal", {
 			job_id: jobId,
-			claim_token: claim.claim_token,
+			expected_generation: claim.lease_generation,
 			idempotency_key: idempotencyKey,
 			// origin deliberately omitted: the engineering principal is not the
 			// production identity, so the server must downgrade to SYNTHETIC.
@@ -556,7 +568,7 @@ async function step5Idempotency(jobId, idempotencyKey) {
 	};
 	const submitArgs = {
 		job_id: jobId,
-		claim_token: claim.claim_token,
+		expected_generation: claim.lease_generation,
 		idempotency_key: `${idempotencyKey}-idem`,
 		origin: "SYNTHETIC",
 		proposal: proposalBase,

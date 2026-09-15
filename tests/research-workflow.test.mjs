@@ -109,8 +109,10 @@ test("G07 concurrent and duplicate claims keep one current owner and a stable sa
 		now: NOW,
 	});
 	assert.equal(replay.status, "CLAIMED");
-	assert.equal(replay.claim_token, claimed[0].claim_token);
+	assert.equal(replay.lease_expires_at, claimed[0].lease_expires_at);
 	assert.equal(replay.claim_count, 1);
+	// #19: the claim outcome never carries a credential-like token.
+	assert.equal(Object.keys(replay).includes("claim_token"), false);
 	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_leases WHERE job_id=?", "job-concurrent"), 1);
 	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_events WHERE job_id=? AND event_type='CLAIMED'", "job-concurrent"), 1);
 });
@@ -123,20 +125,69 @@ test("G08 expiry, Automation interruption, and fencing reject the superseded own
 	});
 	assert.equal(oldLease.status, "CLAIMED");
 	// No submit simulates an interrupted Automation.  The next claimant takes
-	// over only at server-side expiry, and the former token is fenced off.
+	// over only at server-side expiry, and the superseded principal is fenced
+	// off by owner mismatch (the capability is the principal, not a token).
 	const renewed = await workflow.claimResearchJob(db, {
 		jobId: "job-expiry", leaseOwner: "synthetic-recovery", requestId: "req-new", now: EXPIRED,
 	});
 	assert.equal(renewed.status, "CLAIMED");
 	assert.equal(renewed.claim_count, 2);
 	const stale = await workflow.submitResearchResultProposal(db, {
-		jobId: "job-expiry", claimToken: oldLease.claim_token, expectedGeneration: oldLease.lease_generation, idempotencyKey: "retry-old-result", origin: "SYNTHETIC",
+		jobId: "job-expiry", expectedGeneration: oldLease.lease_generation, idempotencyKey: "retry-old-result", origin: "SYNTHETIC",
 		proposal: proposal("job-expiry"), callerPrincipal: "synthetic-interrupted", requestId: "req-stale", now: EXPIRED,
 	});
 	assert.deepEqual(stale.status, "REJECTED");
 	assert.deepEqual(stale.reason, "LEASE_INVALID");
-	assert.equal(stale.detail.sub_reason, "TOKEN_MISMATCH");
+	assert.equal(stale.detail.sub_reason, "OWNER_MISMATCH");
 	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_events WHERE job_id=? AND event_type='LEASE_EXPIRED'", "job-expiry"), 1);
+});
+
+test("same-principal stale generation is fenced with GENERATION_STALE; current generation completes", async () => {
+	const db = new SqliteD1();
+	db.seedJob("job-stale-gen");
+	const first = await workflow.claimResearchJob(db, {
+		jobId: "job-stale-gen", leaseOwner: FORMAL_OWNER_A, requestId: "req-gen-old", now: NOW,
+	});
+	assert.equal(first.status, "CLAIMED");
+	// The same principal re-acquires after server-side expiry: the lease
+	// generation moves forward, and a submit still carrying the old
+	// generation must be fenced even though the principal matches.
+	const renewed = await workflow.claimResearchJob(db, {
+		jobId: "job-stale-gen", leaseOwner: FORMAL_OWNER_A, requestId: "req-gen-new", now: EXPIRED,
+	});
+	assert.equal(renewed.status, "CLAIMED");
+	assert.equal(renewed.lease_generation, 2);
+	const staleGen = await workflow.submitResearchResultProposal(db, {
+		jobId: "job-stale-gen", expectedGeneration: 1, idempotencyKey: "stale-gen-submit", origin: "CHATGPT",
+		proposal: proposal("job-stale-gen"), callerPrincipal: FORMAL_OWNER_A, requestId: "req-gen-stale", now: EXPIRED,
+	});
+	assert.equal(staleGen.status, "REJECTED");
+	assert.equal(staleGen.reason, "LEASE_INVALID");
+	assert.equal(staleGen.detail.sub_reason, "GENERATION_STALE");
+	// The lease survives the fenced submit; the current generation completes.
+	const current = await workflow.submitResearchResultProposal(db, {
+		jobId: "job-stale-gen", expectedGeneration: renewed.lease_generation, idempotencyKey: "current-gen-submit", origin: "CHATGPT",
+		proposal: proposal("job-stale-gen"), callerPrincipal: FORMAL_OWNER_A, requestId: "req-gen-current", now: EXPIRED,
+	});
+	assert.equal(current.status, "ACCEPTED");
+	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_terminal WHERE job_id=?", "job-stale-gen"), 1);
+});
+
+test("submit after lease expiry (without re-acquisition) is rejected with EXPIRED", async () => {
+	const db = new SqliteD1();
+	db.seedJob("job-expired-submit");
+	const lease = await workflow.claimResearchJob(db, {
+		jobId: "job-expired-submit", leaseOwner: FORMAL_OWNER_A, requestId: "req-exp-claim", now: NOW,
+	});
+	assert.equal(lease.status, "CLAIMED");
+	const expired = await workflow.submitResearchResultProposal(db, {
+		jobId: "job-expired-submit", expectedGeneration: lease.lease_generation, idempotencyKey: "expired-submit-key", origin: "CHATGPT",
+		proposal: proposal("job-expired-submit"), callerPrincipal: FORMAL_OWNER_A, requestId: "req-exp-submit", now: EXPIRED,
+	});
+	assert.equal(expired.status, "REJECTED");
+	assert.equal(expired.reason, "LEASE_INVALID");
+	assert.equal(expired.detail.sub_reason, "EXPIRED");
+	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_terminal WHERE job_id=?", "job-expired-submit"), 0);
 });
 
 test("G09 repeated submit/network retry has exactly one formal accepted owner and result", async () => {
@@ -147,7 +198,7 @@ test("G09 repeated submit/network retry has exactly one formal accepted owner an
 	});
 	assert.equal(lease.status, "CLAIMED");
 	const input = {
-		jobId: "job-formal", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation, idempotencyKey: "formal-submit-key", origin: "CHATGPT",
+		jobId: "job-formal", expectedGeneration: lease.lease_generation, idempotencyKey: "formal-submit-key", origin: "CHATGPT",
 		proposal: proposal("job-formal"), callerPrincipal: FORMAL_OWNER_A, requestId: "req-formal-submit", now: NOW,
 	};
 	const accepted = await workflow.submitResearchResultProposal(db, input);
@@ -180,7 +231,7 @@ test("G09 test principals are downgraded: a synthetic shadow proposal cannot com
 	});
 	assert.equal(lease.status, "CLAIMED");
 	const result = await workflow.submitResearchResultProposal(db, {
-		jobId: "job-shadow", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation, idempotencyKey: "shadow-submit-key", origin: "CHATGPT",
+		jobId: "job-shadow", expectedGeneration: lease.lease_generation, idempotencyKey: "shadow-submit-key", origin: "CHATGPT",
 		proposal: proposal("job-shadow"), callerPrincipal: "synthetic-shadow", requestId: "req-shadow-submit", now: NOW,
 	});
 	assert.equal(result.status, "ACCEPTED_SYNTHETIC");
@@ -200,7 +251,7 @@ test("G07 authenticated formal owners are client-specific and a second client ca
 	});
 	assert.equal(second.status, "ALREADY_CLAIMED");
 	const stolen = await workflow.submitResearchResultProposal(db, {
-		jobId: "job-owner-isolation", claimToken: first.claim_token, expectedGeneration: first.lease_generation,
+		jobId: "job-owner-isolation", expectedGeneration: first.lease_generation,
 		idempotencyKey: "owner-isolation-submit", origin: "CHATGPT", proposal: proposal("job-owner-isolation"),
 		callerPrincipal: FORMAL_OWNER_B, requestId: "req-owner-stolen", now: NOW,
 	});
@@ -410,7 +461,7 @@ test("G07/G08 trigger-sensitive D1 change counts do not turn committed claim or 
 	});
 	assert.equal(lease.status, "CLAIMED");
 	const submitted = await workflow.submitResearchResultProposal(db, {
-		jobId: "job-trigger-count", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		jobId: "job-trigger-count", expectedGeneration: lease.lease_generation,
 		idempotencyKey: "trigger-count-submit", origin: "CHATGPT", proposal: proposal("job-trigger-count"),
 		callerPrincipal: FORMAL_OWNER_A, requestId: "req-trigger-submit", now: NOW,
 	});
@@ -425,7 +476,7 @@ test("G08 defer is a fenced remote release, retries idempotently, and recheck ga
 	});
 	assert.equal(lease.status, "CLAIMED");
 	const input = {
-		jobId: "job-defer", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation, idempotencyKey: "defer-key-0001",
+		jobId: "job-defer", expectedGeneration: lease.lease_generation, idempotencyKey: "defer-key-0001",
 		reason: "RECHECK_REQUIRED", recheckAt: "2026-09-15T00:30:00.000Z",
 		callerPrincipal: "synthetic-defer", requestId: "req-defer", now: NOW,
 	};
@@ -484,12 +535,12 @@ test("G09 submit-versus-defer has one winner and never leaves terminal plus leas
 	assert.equal(lease.status, "CLAIMED");
 	const [submitted, deferred] = await Promise.all([
 		workflow.submitResearchResultProposal(db, {
-			jobId: "job-submit-defer", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation, idempotencyKey: "submit-defer-submit",
+			jobId: "job-submit-defer", expectedGeneration: lease.lease_generation, idempotencyKey: "submit-defer-submit",
 			origin: "CHATGPT", proposal: proposal("job-submit-defer"), callerPrincipal: FORMAL_OWNER_A,
 			requestId: "req-race-submit", now: NOW,
 		}),
 		workflow.deferResearchJob(db, {
-			jobId: "job-submit-defer", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation, idempotencyKey: "submit-defer-defer",
+			jobId: "job-submit-defer", expectedGeneration: lease.lease_generation, idempotencyKey: "submit-defer-defer",
 			reason: "RECHECK_REQUIRED", recheckAt: "2026-09-15T00:30:00.000Z",
 			callerPrincipal: FORMAL_OWNER_A, requestId: "req-race-defer", now: NOW,
 		}),
@@ -544,7 +595,7 @@ test("job_<hash> ids claim and complete end-to-end; PRIVATE and missing ids stay
 	});
 	assert.equal(lease.status, "CLAIMED");
 	const accepted = await workflow.submitResearchResultProposal(db, {
-		jobId: jobHash, claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		jobId: jobHash, expectedGeneration: lease.lease_generation,
 		idempotencyKey: "issue19-submit-key", origin: "CHATGPT", proposal: proposal(jobHash),
 		callerPrincipal: owner, requestId: "req-issue19-submit", now: NOW,
 	});
@@ -566,7 +617,7 @@ test("structural rejection keeps the outward envelope safe while recording the i
 
 	// One extra top-level key -> rule tag "keys".
 	const rejected = await workflow.submitResearchResultProposal(db, {
-		jobId: "job-val-tag", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		jobId: "job-val-tag", expectedGeneration: lease.lease_generation,
 		idempotencyKey: "val-tag-submit", origin: "CHATGPT",
 		proposal: { ...proposal("job-val-tag"), confidence: "HIGH" },
 		callerPrincipal: FORMAL_OWNER_A, requestId: "req-val-submit", now: NOW,
@@ -584,7 +635,7 @@ test("structural rejection keeps the outward envelope safe while recording the i
 
 	// Idempotent replay of the rejected submit (same payload) stays rejected.
 	const replay = await workflow.submitResearchResultProposal(db, {
-		jobId: "job-val-tag", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		jobId: "job-val-tag", expectedGeneration: lease.lease_generation,
 		idempotencyKey: "val-tag-submit", origin: "CHATGPT",
 		proposal: { ...proposal("job-val-tag"), confidence: "HIGH" },
 		callerPrincipal: FORMAL_OWNER_A, requestId: "req-val-replay", now: NOW,
@@ -601,7 +652,7 @@ test("structural rejection keeps the outward envelope safe while recording the i
 	});
 	assert.equal(lease2.status, "CLAIMED");
 	const originViolation = await workflow.submitResearchResultProposal(db2, {
-		jobId: "job-val-origin", claimToken: lease2.claim_token, expectedGeneration: lease2.lease_generation,
+		jobId: "job-val-origin", expectedGeneration: lease2.lease_generation,
 		idempotencyKey: "val-tag-submit-origin", origin: "SYNTHETIC", proposal: proposal("job-val-origin"),
 		callerPrincipal: FORMAL_OWNER_A, requestId: "req-val-submit-origin", now: NOW,
 	});

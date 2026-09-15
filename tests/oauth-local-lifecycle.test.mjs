@@ -535,7 +535,10 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 			"CLAIMED",
 			"real job_<hash> must be claimable without any namespace gate",
 		);
-		assert.match(claimA.payload.claim_token, /^clt_[a-f0-9]{32}$/);
+		// #19 safety-gate compatibility: the model never sees or ferries a
+		// credential-like token.  The claim response must not carry one.
+		assert.equal(Object.keys(claimA.payload).includes("claim_token"), false);
+		assert.equal(JSON.stringify(claimA.payload).includes("clt_"), false);
 		assert.equal(claimA.payload.lease_generation, 1);
 		const submittedA = await mcpTool(
 			worker.origin,
@@ -545,7 +548,6 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 			"submit_research_result_proposal",
 			{
 				job_id: jobA,
-				claim_token: claimA.payload.claim_token,
 				expected_generation: claimA.payload.lease_generation,
 				idempotency_key: "issue19-formal-submit-a",
 				origin: "CHATGPT",
@@ -565,6 +567,26 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 			"formal submit must complete the job under the stable principal",
 		);
 		assert.equal(submittedA.payload.terminal_status, "COMPLETED");
+		assert.equal(JSON.stringify(submittedA.payload).includes("clt_"), false);
+
+		// #19: no model-facing tool schema may advertise a claim_token input.
+		const toolsList = await mcpRpc(
+			worker.origin,
+			accessTokenA,
+			claimA.sessionId,
+			10,
+			"tools/list",
+			{},
+		);
+		const advertised = toolsList.payload.result.tools;
+		assert.ok(Array.isArray(advertised) && advertised.length > 0);
+		for (const tool of advertised) {
+			assert.equal(
+				JSON.stringify(tool.inputSchema).includes("claim_token"),
+				false,
+				`${tool.name} inputSchema must not advertise claim_token`,
+			);
+		}
 
 		// Client B: a *different* DCR client_id, same stable principal.  The
 		// formal gate must treat it identically — DCR rotation is invisible.
@@ -647,7 +669,6 @@ test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs
 				name: "submit_research_result_proposal",
 				arguments: {
 					job_id: jobA,
-					claim_token: `clt_${"0".repeat(32)}`,
 					expected_generation: 1,
 					idempotency_key: "issue19-denied-submit",
 					proposal: {},

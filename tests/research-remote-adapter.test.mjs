@@ -743,7 +743,6 @@ test("B15 job server_state derivation: terminal over unexpired lease over record
 	// 3. Formal completion wins over everything -> COMPLETED, not claimable.
 	const formal = await workflowModule.submitResearchResultProposal(storage.db, {
 		jobId: "job-b15",
-		claimToken: lease.claim_token,
 		expectedGeneration: lease.lease_generation,
 		origin: "CHATGPT",
 		idempotencyKey: "key-b15-formal",
@@ -775,9 +774,18 @@ test("B15 context exposes proposals but never the claim token", async () => {
 		requestId: "req-b15c",
 		now: nowIsoPlus(0),
 	});
+	// #19: the claim outcome itself must not carry a credential-like token.
+	assert.equal(Object.keys(lease).includes("claim_token"), false);
+	// The internal row token (still stored server-side) is captured from the
+	// database BEFORE the submit releases the lease, to prove it never
+	// crosses the read plane.
+	const leaseRow = await storage.db
+		.prepare("SELECT claim_token FROM research_job_leases WHERE job_id=?")
+		.bind("job-b15c")
+		.first();
+	assert.match(leaseRow.claim_token, /^clt_[a-f0-9]{32}$/);
 	await workflowModule.submitResearchResultProposal(storage.db, {
 		jobId: "job-b15c",
-		claimToken: lease.claim_token,
 		expectedGeneration: lease.lease_generation,
 		idempotencyKey: "key-b15c-synth",
 		origin: "SYNTHETIC",
@@ -805,6 +813,6 @@ test("B15 context exposes proposals but never the claim token", async () => {
 	]);
 	assert.equal(context.proposals[0].payload.summary, "shadow summary");
 	// The capability never crosses the read plane.
-	assert.equal(JSON.stringify(context).includes(lease.claim_token), false);
+	assert.equal(JSON.stringify(context).includes(leaseRow.claim_token), false);
 	assert.equal(JSON.stringify(context).includes("clt_"), false);
 });

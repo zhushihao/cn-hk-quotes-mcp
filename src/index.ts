@@ -1040,7 +1040,7 @@ export function createServer(
 		"claim_research_job",
 		{
 			description:
-				"认领一个 PUBLIC QUEUED Research Job（服务端固定租约 3600 秒，原子抢占；同主体重复认领幂等返回原租约）。需要 research:claim scope。",
+				"认领一个 PUBLIC QUEUED Research Job（服务端固定租约 3600 秒，原子抢占；同主体重复认领幂等返回原租约）。返回的 lease_generation 即后续 submit/defer 的 expected_generation。需要 research:claim scope。",
 			inputSchema: z.object({ job_id: z.string().min(1) }),
 		},
 		async ({ job_id }) => {
@@ -1072,17 +1072,17 @@ export function createServer(
 				" findings（数组 ≤50 项，每项恰为 {claim: 字符串 ≤2000, evidence_ids: 字符串数组且元素非空, confidence: \"HIGH\"|\"MEDIUM\"|\"LOW\", counter_evidence: null 或字符串 ≤2000}）；" +
 				" recommendation_hint（枚举 \"NONE\"|\"THESIS_REVIEW\"|\"COUNTER_EVIDENCE_FOUND\"|\"NO_SECOND_SOURCE\"|\"INSUFFICIENT_DATA\"）；" +
 				" sources_consulted（字符串数组 ≤100 项，每项 ≤500 字符，可为空数组）；completed_at（可解析的 ISO 时间字符串）；" +
-				" 可选 tokens_used（非负整数）。禁止任何其他键；整体负载 ≤64KiB。",
+				" 可选 tokens_used（非负整数）。禁止任何其他键；整体负载 ≤64KiB。" +
+				" 写权限由服务端裁决：当前 OAuth 稳定主体必须是该 Job 现行租约的持有者，expected_generation 取 claim_research_job 返回的 lease_generation；不需要也不接受任何提交凭据。",
 			inputSchema: z.object({
 				job_id: z.string().min(1),
-				claim_token: z.string().min(1),
 				expected_generation: z.number().int().min(1),
 				idempotency_key: z.string().min(1),
 				origin: z.enum(["CHATGPT", "SYNTHETIC", "REPLAY"]).optional(),
 				proposal: z.record(z.string(), z.unknown()),
 			}),
 		},
-		async ({ job_id, claim_token, expected_generation, idempotency_key, origin, proposal }) => {
+		async ({ job_id, expected_generation, idempotency_key, origin, proposal }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "submit_research_result_proposal");
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE);
@@ -1094,7 +1094,6 @@ export function createServer(
 			return researchRead(async () =>
 				submitResearchResultProposal(researchWorkflowDb(), {
 					jobId: job_id,
-					claimToken: claim_token,
 					expectedGeneration: expected_generation,
 					idempotencyKey: idempotency_key,
 					origin,
@@ -1110,17 +1109,16 @@ export function createServer(
 		"defer_research_job",
 		{
 			description:
-				"远端延期当前正式租约到指定 recheck 时刻并原子释放租约；defer 不产生完成终态，正式终态仅由提交 result proposal 产生。需要 research:submit scope。",
+				"远端延期当前正式租约到指定 recheck 时刻并原子释放租约；defer 不产生完成终态，正式终态仅由提交 result proposal 产生。写权限与 submit 相同（服务端主体+generation 裁决，无需凭据）。需要 research:submit scope。",
 			inputSchema: z.object({
 				job_id: z.string().min(1),
-				claim_token: z.string().min(1),
 				expected_generation: z.number().int().min(1),
 				idempotency_key: z.string().min(1),
 				reason: z.enum(["RECHECK_REQUIRED", "UPSTREAM_UNAVAILABLE", "NEEDS_OWNER_INPUT"]),
 				recheck_at: z.string().datetime(),
 			}),
 		},
-		async ({ job_id, claim_token, expected_generation, idempotency_key, reason, recheck_at }) => {
+		async ({ job_id, expected_generation, idempotency_key, reason, recheck_at }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "defer_research_job");
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE);
@@ -1132,7 +1130,6 @@ export function createServer(
 			return researchRead(async () =>
 				deferResearchJob(researchWorkflowDb(), {
 					jobId: job_id,
-					claimToken: claim_token,
 					expectedGeneration: expected_generation,
 					idempotencyKey: idempotency_key,
 					reason,

@@ -15,9 +15,16 @@
  *     history lives exclusively in the append-only events table);
  *   - events are append-only at the application level (no UPDATE/DELETE
  *     path exists in this module or anywhere else in the repo);
- *   - `claim_token` is a server-issued capability stored only in the private
- *     lease row.  It never appears in events, receipts, read-plane responses,
- *     logs, or error envelopes.
+ *   - `claim_token` is a server-issued row-transition marker used only inside
+ *     the claim batch, stored only in the private lease row.  It never crosses
+ *     any tool surface: claim responses, submit/defer inputs, events,
+ *     receipts, read-plane responses, logs, or error envelopes (#19
+ *     safety-gate compatibility: the model must never read or ferry a
+ *     credential-like token).  Write authorization for submit/defer is the
+ *     authenticated stable principal plus the fenced lease generation —
+ *     every preemption increments `claim_count` and rotates `lease_owner`, so
+ *     (owner, generation) discriminates the current lease exactly as the
+ *     former (owner, token) pair did.
  */
 
 import { ResearchBoundaryError, assertOutboundV2PayloadSafe } from "./research-outbound-v2.ts";
@@ -61,8 +68,8 @@ export const SUBMIT_REASONS = [
 export const LEASE_SUB_REASONS = [
 	"NO_LEASE",
 	"EXPIRED",
-	"TOKEN_MISMATCH",
 	"OWNER_MISMATCH",
+	"GENERATION_STALE",
 ] as const;
 
 export type ClaimReason = (typeof CLAIM_REASONS)[number];
@@ -84,7 +91,6 @@ export type ClaimClaimed = {
 	status: "CLAIMED";
 	job_id: string;
 	lease_owner: string;
-	claim_token: string;
 	claimed_at: string;
 	lease_expires_at: string;
 	claim_count: number;
@@ -503,7 +509,6 @@ export async function claimResearchJob(
 				status: "CLAIMED",
 				job_id: jobId,
 				lease_owner: lease.lease_owner,
-				claim_token: lease.claim_token,
 				claimed_at: lease.claimed_at,
 				lease_expires_at: lease.lease_expires_at,
 				claim_count: Number(lease.claim_count),
@@ -530,7 +535,6 @@ export async function claimResearchJob(
 				status: "CLAIMED",
 				job_id: jobId,
 				lease_owner: current.lease_owner,
-				claim_token: current.claim_token,
 				claimed_at: current.claimed_at,
 				lease_expires_at: current.lease_expires_at,
 				claim_count: Number(current.claim_count),
@@ -806,7 +810,6 @@ export async function submitResearchResultProposal(
 	db: ResearchWorkflowDatabase,
 	input: {
 		jobId: string;
-		claimToken: string;
 		expectedGeneration: number;
 		idempotencyKey: string;
 		origin?: string;
@@ -931,14 +934,15 @@ export async function submitResearchResultProposal(
 		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
 	}
 
-	// 4) Lease validation (existence -> expiry -> token -> owner).
+	// 4) Lease validation (existence -> expiry -> owner -> generation).
+	//    The lease capability is the authenticated stable principal plus the
+	//    fenced generation; no token travels through the model (#19).
 	const lease = await selectLease(db, jobId);
 	let subReason: LeaseSubReason | null = null;
 	if (!lease) subReason = "NO_LEASE";
 	else if (lease.lease_expires_at <= now) subReason = "EXPIRED";
-	else if (lease.claim_token !== input.claimToken) subReason = "TOKEN_MISMATCH";
 	else if (lease.lease_owner !== callerPrincipal) subReason = "OWNER_MISMATCH";
-	else if (Number(lease.claim_count) !== input.expectedGeneration) subReason = "TOKEN_MISMATCH";
+	else if (Number(lease.claim_count) !== input.expectedGeneration) subReason = "GENERATION_STALE";
 	if (subReason !== null) {
 		const proposalId = `prp_${randomHex32()}`;
 		const outcome = await runProposalBatch(
@@ -1059,27 +1063,29 @@ export async function submitResearchResultProposal(
 		createdAt: now,
 	});
 	if (effectiveOrigin === "CHATGPT") {
-		// Every formal write repeats the exact lease predicate.  This fences an
-		// old client that was pre-empted after the earlier read but before this
-		// batch began; neither a proposal nor terminal/event can then be left by
-		// a stale generation.
+		// Every formal write repeats the exact lease predicate — the current
+		// owner plus the fenced generation plus liveness.  This fences an old
+		// client that was pre-empted after the earlier read but before this
+		// batch began (a preemption rotates the owner and increments
+		// claim_count); neither a proposal nor terminal/event can then be
+		// left by a stale generation.
 		const leasePredicate =
-			"EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?) AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?)";
+			"EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_count=? AND lease_expires_at > ?) AND NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?)";
 		try {
 			await db.batch([
 				db
 					.prepare(
 						`INSERT INTO research_proposals (proposal_id, job_id, idempotency_key, caller_principal, origin, status, reject_reason, payload_json, payload_sha256, created_at, request_id) SELECT ?, ?, ?, ?, 'CHATGPT', 'RECEIVED', NULL, ?, ?, ?, ? WHERE ${leasePredicate}`,
 					)
-					.bind(proposalId, jobId, idempotencyKey, callerPrincipal, prepared.payloadJson, prepared.payloadSha256, now, requestId, jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now, jobId),
+					.bind(proposalId, jobId, idempotencyKey, callerPrincipal, prepared.payloadJson, prepared.payloadSha256, now, requestId, jobId, callerPrincipal, input.expectedGeneration, now, jobId),
 				db
 					.prepare(
 						`INSERT INTO research_job_terminal (job_id, terminal_status, proposal_id, completed_at) SELECT ?, 'COMPLETED', ?, ? WHERE ${leasePredicate}`,
 					)
-					.bind(jobId, proposalId, now, jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now, jobId),
+					.bind(jobId, proposalId, now, jobId, callerPrincipal, input.expectedGeneration, now, jobId),
 				db
-					.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?")
-					.bind(jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now),
+					.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_count=? AND lease_expires_at > ?")
+					.bind(jobId, callerPrincipal, input.expectedGeneration, now),
 				db
 					.prepare("INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) SELECT ?, ?, 'SUBMIT_RECEIVED', ?, ?, 'CHATGPT', '{}', ?, ? WHERE EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=? AND proposal_id=?)")
 					.bind(`evt_${randomHex32()}`, jobId, callerPrincipal, proposalId, requestId, now, jobId, proposalId),
@@ -1145,7 +1151,6 @@ export async function deferResearchJob(
 	db: ResearchWorkflowDatabase,
 	input: {
 		jobId: string;
-		claimToken: string;
 		expectedGeneration: number;
 		idempotencyKey: string;
 		reason: DeferReason;
@@ -1172,7 +1177,6 @@ export async function deferResearchJob(
 	const payloadSha256 = await sha256Hex(canonicalJson({
 		job_id: jobId,
 		lease_owner: callerPrincipal,
-		claim_token: input.claimToken,
 		expected_generation: input.expectedGeneration,
 		reason: input.reason,
 		recheck_at: recheckAt,
@@ -1206,12 +1210,12 @@ export async function deferResearchJob(
 		result = await db.batch([
 			db
 				.prepare(
-					"INSERT INTO research_job_deferrals (job_id, idempotency_key, lease_owner, reason, recheck_at, deferred_at, request_id, payload_sha256, expected_generation) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) AND EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?)",
+					"INSERT INTO research_job_deferrals (job_id, idempotency_key, lease_owner, reason, recheck_at, deferred_at, request_id, payload_sha256, expected_generation) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM research_job_terminal WHERE job_id=?) AND EXISTS (SELECT 1 FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_count=? AND lease_expires_at > ?)",
 				)
-				.bind(jobId, input.idempotencyKey, callerPrincipal, input.reason, recheckAt, now, requestId, payloadSha256, input.expectedGeneration, jobId, jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now),
+				.bind(jobId, input.idempotencyKey, callerPrincipal, input.reason, recheckAt, now, requestId, payloadSha256, input.expectedGeneration, jobId, jobId, callerPrincipal, input.expectedGeneration, now),
 			db
-				.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_token=? AND claim_count=? AND lease_expires_at > ?")
-				.bind(jobId, callerPrincipal, input.claimToken, input.expectedGeneration, now),
+				.prepare("DELETE FROM research_job_leases WHERE job_id=? AND lease_owner=? AND claim_count=? AND lease_expires_at > ?")
+				.bind(jobId, callerPrincipal, input.expectedGeneration, now),
 		] as never) as Array<{ meta?: { changes?: number } }>;
 	} catch {
 		const concurrent = await selectDeferralByIdempotencyKey(db, input.idempotencyKey).catch(() => null);
@@ -1229,9 +1233,8 @@ export async function deferResearchJob(
 	const lease = await selectLease(db, jobId);
 	let subReason: LeaseSubReason = "NO_LEASE";
 	if (lease && lease.lease_expires_at <= now) subReason = "EXPIRED";
-	else if (lease && lease.claim_token !== input.claimToken) subReason = "TOKEN_MISMATCH";
 	else if (lease && lease.lease_owner !== callerPrincipal) subReason = "OWNER_MISMATCH";
-	else if (lease && Number(lease.claim_count) !== input.expectedGeneration) subReason = "TOKEN_MISMATCH";
+	else if (lease && Number(lease.claim_count) !== input.expectedGeneration) subReason = "GENERATION_STALE";
 	return { status: "REJECTED", job_id: jobId, reason: "LEASE_INVALID", detail: { sub_reason: subReason }, request_id: requestId };
 }
 
