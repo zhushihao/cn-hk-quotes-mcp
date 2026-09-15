@@ -8,6 +8,7 @@ import { createD1Kv, createD1OAuthKv } from "./d1-oauth-kv";
 import coreWorker from "./index";
 import {
 	FORWARDED_SCOPES_HEADER,
+	FORWARDED_CLIENT_ID_HEADER,
 	RESEARCH_CLAIM_SCOPE,
 	RESEARCH_SUBMIT_SCOPE,
 } from "./research-scopes";
@@ -423,7 +424,13 @@ async function handleMcp(
 	// 当上限，伪造或残留的头部都无法越过配置集合。
 	const headers = new Headers(request.headers);
 	headers.delete(FORWARDED_SCOPES_HEADER);
+	headers.delete(FORWARDED_CLIENT_ID_HEADER);
 	headers.set(FORWARDED_SCOPES_HEADER, summary.scope.join(" "));
+	const authenticatedClientId = (summary as unknown as { clientId?: unknown }).clientId
+		?? (summary.grant as unknown as { clientId?: unknown }).clientId;
+	if (typeof authenticatedClientId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(authenticatedClientId)) {
+		headers.set(FORWARDED_CLIENT_ID_HEADER, authenticatedClientId);
+	}
 	const scopeStamped = new Request(request, { headers });
 
 	const bridgeSecret = env.COLLECTOR_MCP_CLIENT_TOKEN;

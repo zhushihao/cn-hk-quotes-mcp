@@ -173,3 +173,28 @@ test("G09 test principals are downgraded: a synthetic shadow proposal cannot com
 	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_terminal WHERE job_id=?", "job-shadow"), 0);
 	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_proposals WHERE job_id=? AND origin='CHATGPT'", "job-shadow"), 0);
 });
+
+test("G09 opaque receipt cursor reaches all 501 same-timestamp events without replay looping", async () => {
+	const db = new SqliteD1();
+	for (let index = 0; index < 501; index += 1) {
+		db.sqlite.prepare(
+			"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES (?, 'job-cursor', 'CLAIMED', 'synthetic', NULL, NULL, '{}', ?, ?)",
+		).run(`evt-${String(index).padStart(4, "0")}`, `req-${index}`, NOW);
+	}
+	const first = await workflow.listResearchJobReceipts(db, { limit: 500, now: NOW });
+	assert.equal(first.receipts.length, 500);
+	assert.match(first.next_since, /^rcpt1\./);
+	const second = await workflow.listResearchJobReceipts(db, { since: first.next_since, limit: 500, now: NOW });
+	assert.equal(second.receipts.length, 1);
+	assert.notEqual(second.receipts[0].receipt_id, first.receipts[0].receipt_id);
+	const empty = await workflow.listResearchJobReceipts(db, { since: second.next_since, limit: 500, now: NOW });
+	assert.deepEqual(empty.receipts, []);
+	assert.equal(empty.next_since, second.next_since);
+	const legacy = await workflow.listResearchJobReceipts(db, { since: NOW, limit: 500, now: NOW });
+	assert.equal(legacy.receipts.length, 500);
+	assert.match(legacy.next_since, /^rcpt1\./);
+	await assert.rejects(
+		() => workflow.listResearchJobReceipts(db, { since: "rcpt1.not-base64", limit: 1, now: NOW }),
+		(error) => error?.error_code === "INTEGRITY_FAILED",
+	);
+});
