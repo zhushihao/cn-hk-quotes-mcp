@@ -1066,7 +1066,13 @@ export function createServer(
 		"submit_research_result_proposal",
 		{
 			description:
-				"提交研究结果 proposal。正式（CHATGPT）提交被接受即 Job 终态 COMPLETED；非生产主体的 CHATGPT 声明一律降级为 SYNTHETIC 隔离存储（不完成 Job）。需要 research:submit scope。",
+				"提交研究结果 proposal。正式（CHATGPT）提交被接受即 Job 终态 COMPLETED；非生产主体的 CHATGPT 声明一律降级为 SYNTHETIC 隔离存储（不完成 Job）。需要 research:submit scope。" +
+				" proposal 是 exact-keys 对象——键集合必须与下面完全一致，多余/缺失/改名任一都会被拒（REJECTED=VALIDATION_FAILED）：" +
+				" job_id（必须等于本工具的 job_id 参数）；summary（非空字符串，≤4000 字符）；" +
+				" findings（数组 ≤50 项，每项恰为 {claim: 字符串 ≤2000, evidence_ids: 字符串数组且元素非空, confidence: \"HIGH\"|\"MEDIUM\"|\"LOW\", counter_evidence: null 或字符串 ≤2000}）；" +
+				" recommendation_hint（枚举 \"NONE\"|\"THESIS_REVIEW\"|\"COUNTER_EVIDENCE_FOUND\"|\"NO_SECOND_SOURCE\"|\"INSUFFICIENT_DATA\"）；" +
+				" sources_consulted（字符串数组 ≤100 项，每项 ≤500 字符，可为空数组）；completed_at（可解析的 ISO 时间字符串）；" +
+				" 可选 tokens_used（非负整数）。禁止任何其他键；整体负载 ≤64KiB。",
 			inputSchema: z.object({
 				job_id: z.string().min(1),
 				claim_token: z.string().min(1),

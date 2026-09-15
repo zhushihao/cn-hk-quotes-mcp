@@ -551,3 +551,65 @@ test("job_<hash> ids claim and complete end-to-end; PRIVATE and missing ids stay
 	assert.equal(accepted.status, "ACCEPTED");
 	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_terminal WHERE job_id=?", jobHash), 1);
 });
+
+// Issue #19-followup: a structurally invalid proposal is rejected with the
+// SAME safe outward envelope (REJECTED/VALIDATION_FAILED, empty detail), but
+// the internal audit event now records WHICH rule fired (sub_reason), and an
+// idempotent replay of the rejected submit reports the same rejection.
+test("structural rejection keeps the outward envelope safe while recording the internal rule tag", async () => {
+	const db = new SqliteD1();
+	db.seedJob("job-val-tag");
+	const lease = await workflow.claimResearchJob(db, {
+		jobId: "job-val-tag", leaseOwner: FORMAL_OWNER_A, requestId: "req-val-claim", now: NOW,
+	});
+	assert.equal(lease.status, "CLAIMED");
+
+	// One extra top-level key -> rule tag "keys".
+	const rejected = await workflow.submitResearchResultProposal(db, {
+		jobId: "job-val-tag", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		idempotencyKey: "val-tag-submit", origin: "CHATGPT",
+		proposal: { ...proposal("job-val-tag"), confidence: "HIGH" },
+		callerPrincipal: FORMAL_OWNER_A, requestId: "req-val-submit", now: NOW,
+	});
+	assert.equal(rejected.status, "REJECTED");
+	assert.equal(rejected.reason, "VALIDATION_FAILED");
+	assert.deepEqual(rejected.detail, {}, "outward detail must stay empty (safe error)");
+
+	const event = db.sqlite
+		.prepare("SELECT detail_json FROM research_job_events WHERE job_id=? AND event_type='SUBMIT_REJECTED'")
+		.get("job-val-tag");
+	const detail = JSON.parse(event.detail_json);
+	assert.equal(detail.reason, "VALIDATION_FAILED");
+	assert.equal(detail.sub_reason, "keys");
+
+	// Idempotent replay of the rejected submit (same payload) stays rejected.
+	const replay = await workflow.submitResearchResultProposal(db, {
+		jobId: "job-val-tag", claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		idempotencyKey: "val-tag-submit", origin: "CHATGPT",
+		proposal: { ...proposal("job-val-tag"), confidence: "HIGH" },
+		callerPrincipal: FORMAL_OWNER_A, requestId: "req-val-replay", now: NOW,
+	});
+	assert.equal(replay.status, "REJECTED");
+	assert.equal(replay.reason, "VALIDATION_FAILED");
+
+	// A formal owner declaring a non-CHATGPT origin is also a structural
+	// rejection, tagged internally as origin_not_chatgpt.
+	const db2 = new SqliteD1();
+	db2.seedJob("job-val-origin");
+	const lease2 = await workflow.claimResearchJob(db2, {
+		jobId: "job-val-origin", leaseOwner: FORMAL_OWNER_A, requestId: "req-val-claim-2", now: NOW,
+	});
+	assert.equal(lease2.status, "CLAIMED");
+	const originViolation = await workflow.submitResearchResultProposal(db2, {
+		jobId: "job-val-origin", claimToken: lease2.claim_token, expectedGeneration: lease2.lease_generation,
+		idempotencyKey: "val-tag-submit-origin", origin: "SYNTHETIC", proposal: proposal("job-val-origin"),
+		callerPrincipal: FORMAL_OWNER_A, requestId: "req-val-submit-origin", now: NOW,
+	});
+	assert.equal(originViolation.status, "REJECTED");
+	assert.equal(originViolation.reason, "VALIDATION_FAILED");
+	assert.deepEqual(originViolation.detail, {});
+	const originEvent = db2.sqlite
+		.prepare("SELECT detail_json FROM research_job_events WHERE job_id=? AND event_type='SUBMIT_REJECTED'")
+		.get("job-val-origin");
+	assert.equal(JSON.parse(originEvent.detail_json).sub_reason, "origin_not_chatgpt");
+});

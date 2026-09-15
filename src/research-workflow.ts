@@ -316,7 +316,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 function eventDetail(
 	reason: SubmitReason | ClaimReason | null,
-	subReason?: LeaseSubReason,
+	subReason?: LeaseSubReason | string,
 ): Record<string, unknown> {
 	if (reason === null) return {};
 	return subReason === undefined ? { reason } : { reason, sub_reason: subReason };
@@ -878,6 +878,17 @@ export async function submitResearchResultProposal(
 		prepared.structureError !== null;
 	if (structureFailed) {
 		const proposalId = `prp_${randomHex32()}`;
+		// Issue #19-followup observability: record WHICH structural rule fired
+		// (keys / job_binding / recommendation_hint / oversize / ...) in the
+		// internal audit event only.  The outward outcome stays
+		// REJECTED/VALIDATION_FAILED with an empty detail, and the rcpt3
+		// receipt projection whitelists `reason` alone, so the tag never
+		// leaves the trust boundary.
+		const structureTag = productionOriginViolation
+			? `origin_not_chatgpt`
+			: prepared.oversize
+				? (prepared.structureError ?? `oversize`)
+				: (prepared.structureError ?? `structure_invalid`);
 		const outcome = await runProposalBatch(
 			db,
 			[
@@ -902,7 +913,7 @@ export async function submitResearchResultProposal(
 					actor: callerPrincipal,
 					proposalId,
 					origin: effectiveOrigin,
-					detail: eventDetail("VALIDATION_FAILED"),
+					detail: eventDetail("VALIDATION_FAILED", structureTag),
 					requestId,
 					createdAt: now,
 				}),
@@ -910,6 +921,13 @@ export async function submitResearchResultProposal(
 			race,
 		);
 		if (outcome) return outcome;
+		console.log(JSON.stringify({
+			event: "research_proposal_validation_failed",
+			proposal_id: proposalId,
+			job_id: jobId,
+			rule: structureTag,
+			request_id: requestId,
+		}));
 		return { status: "REJECTED", job_id: jobId, reason: "VALIDATION_FAILED", detail: {}, request_id: requestId };
 	}
 
