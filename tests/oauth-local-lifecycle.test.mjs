@@ -452,77 +452,88 @@ test("missing local D1 OAuth persistence fails closed before authorization", asy
 	assert.equal(response.headers.has("location"), false);
 });
 
-test("local migrated D1 trigger preserves the first formal OAuth claim and submit outcomes", async () => {
-	const temp = await mkdtemp(path.join(tmpdir(), "quantpro-formal-workflow-"));
+// Issue #19: the formal write gate binds to the stable business principal —
+// never to the dynamic (DCR) OAuth client_id — and job eligibility is purely
+// server-side state over real RESEARCH `job_<hash>` ids.
+test("formal claim/submit survive DCR client_id rotation on real job_<hash> jobs; missing scope and PRIVATE stay closed", async () => {
+	const temp = await mkdtemp(path.join(tmpdir(), "quantpro-formal-principal-"));
 	let worker = null;
 	try {
-		// Register first, then restart against the same local D1 state with this
-		// exact DCR client in the formal allowlist. This exercises the actual
-		// OAuth issuer/client identity path rather than a forged header.
 		worker = await startWorker({ temp, removeTemp: false });
-		const client = await registerClient(worker.origin);
+		// Two independent dynamic registrations -> two different DCR
+		// client_ids backing the same stable principal
+		// (COLLECTOR_MCP_CLIENT_ID=chatgpt-production).
+		const clientA = await registerClient(worker.origin);
+		const clientB = await registerClient(worker.origin);
+		assert.notEqual(clientA.client_id, clientB.client_id);
 		const stateDir = worker.stateDir;
 		await worker.stop();
 		await runLocalD1(stateDir, null, ["migrations", "apply", "RESEARCH_REPLICA"]);
-		await runLocalD1(
-			stateDir,
-			"INSERT INTO research_records (record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at) VALUES ('job', 'research-formal:trigger-count', 'outbound_formal_trigger_count', 'PUBLIC', 'collector-outbound-v4', '{}', '2026-09-15T00:00:00.000Z', '2026-09-15T00:00:00.000Z')",
-			["execute", "RESEARCH_REPLICA"],
-		);
+		// Seed real RESEARCH WorkQueue-shaped ids: stable `job_<hash>` (never
+		// a `job:` / `research-formal:` namespace) plus one PRIVATE job.
+		const jobA = `job_${createHash("sha256").update("issue19-job-a").digest("hex").slice(0, 40)}`;
+		const jobB = `job_${createHash("sha256").update("issue19-job-b").digest("hex").slice(0, 40)}`;
+		const jobPrivate = `job_${createHash("sha256").update("issue19-job-private").digest("hex").slice(0, 40)}`;
+		for (const [recordKey, visibility] of [
+			[jobA, "PUBLIC"],
+			[jobB, "PUBLIC"],
+			[jobPrivate, "PRIVATE"],
+		]) {
+			await runLocalD1(
+				stateDir,
+				`INSERT INTO research_records (record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at) VALUES ('job', '${recordKey}', 'outbound_issue19_${visibility.toLowerCase()}', '${visibility}', 'collector-outbound-v4', '{}', '2026-09-15T00:00:00.000Z', '2026-09-15T00:00:00.000Z')`,
+				["execute", "RESEARCH_REPLICA"],
+			);
+		}
+		// No COLLECTOR_MCP_FORMAL_* env exists anymore: the configured scope
+		// ceiling is the only server-side grant surface.
 		worker = await startWorker({
 			temp,
 			removeTemp: false,
 			extraEnv: {
 				COLLECTOR_MCP_CLIENT_SCOPES: "market:read research:claim research:submit",
-				COLLECTOR_MCP_FORMAL_CLIENT_IDS: client.client_id,
-				COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES: "research-formal",
 				RESEARCH_REPLICA_INGEST_TOKEN: "synthetic-replica-ingest-token",
 			},
 		});
 
-		const code = await issueAuthorizationCode(worker.origin, client.client_id, {
-			scope: "market:read research:claim research:submit",
-		});
-		const tokenResponse = await exchangeCode(worker.origin, client.client_id, code);
-		assert.equal(tokenResponse.status, 200, "formal OAuth token exchange must succeed");
-		const { access_token: accessToken } = await tokenResponse.json();
-		assert.equal(typeof accessToken, "string");
+		const fullScopes = "market:read research:claim research:submit";
 
-		const jobId = "research-formal:trigger-count";
-
-		const initialized = await mcpRpc(worker.origin, accessToken, null, 1, "initialize", {
+		// Client A: full formal round on a real job_<hash> id.
+		const codeA = await issueAuthorizationCode(worker.origin, clientA.client_id, { scope: fullScopes });
+		const tokenAResponse = await exchangeCode(worker.origin, clientA.client_id, codeA);
+		assert.equal(tokenAResponse.status, 200, "formal OAuth token exchange must succeed");
+		const { access_token: accessTokenA } = await tokenAResponse.json();
+		const initializedA = await mcpRpc(worker.origin, accessTokenA, null, 1, "initialize", {
 			protocolVersion: "2025-03-26",
 			capabilities: {},
-			clientInfo: { name: "formal-d1-trigger-regression", version: "1" },
+			clientInfo: { name: "issue19-principal-a", version: "1" },
 		});
-		assert.ok(initialized.payload.result, "MCP initialize must succeed");
-		const claim = await mcpTool(
+		const claimA = await mcpTool(
 			worker.origin,
-			accessToken,
-			initialized.sessionId,
+			accessTokenA,
+			initializedA.sessionId,
 			2,
 			"claim_research_job",
-			{ job_id: jobId },
+			{ job_id: jobA },
 		);
-		assert.equal(claim.payload.status, "CLAIMED", "first migrated-D1 claim must not report a false store error");
-		assert.match(claim.payload.claim_token, /^clt_[a-f0-9]{32}$/);
-		assert.equal(claim.payload.lease_generation, 1);
-
-		const submitted = await mcpTool(
+		assert.equal(claimA.payload.status, "CLAIMED", "real job_<hash> must be claimable without any namespace gate");
+		assert.match(claimA.payload.claim_token, /^clt_[a-f0-9]{32}$/);
+		assert.equal(claimA.payload.lease_generation, 1);
+		const submittedA = await mcpTool(
 			worker.origin,
-			accessToken,
-			claim.sessionId,
+			accessTokenA,
+			claimA.sessionId,
 			3,
 			"submit_research_result_proposal",
 			{
-				job_id: jobId,
-				claim_token: claim.payload.claim_token,
-				expected_generation: claim.payload.lease_generation,
-				idempotency_key: "formal-trigger-count-submit",
+				job_id: jobA,
+				claim_token: claimA.payload.claim_token,
+				expected_generation: claimA.payload.lease_generation,
+				idempotency_key: "issue19-formal-submit-a",
 				origin: "CHATGPT",
 				proposal: {
-					job_id: jobId,
-					summary: "Synthetic formal D1 trigger regression result",
+					job_id: jobA,
+					summary: "Issue #19 stable-principal formal result",
 					findings: [],
 					recommendation_hint: "NONE",
 					sources_consulted: [],
@@ -530,16 +541,92 @@ test("local migrated D1 trigger preserves the first formal OAuth claim and submi
 				},
 			},
 		);
-		assert.equal(submitted.payload.status, "ACCEPTED", "first migrated-D1 submit must not become an idempotent replay");
-		assert.equal(submitted.payload.terminal_status, "COMPLETED");
+		assert.equal(submittedA.payload.status, "ACCEPTED", "formal submit must complete the job under the stable principal");
+		assert.equal(submittedA.payload.terminal_status, "COMPLETED");
+
+		// Client B: a *different* DCR client_id, same stable principal.  The
+		// formal gate must treat it identically — DCR rotation is invisible.
+		const codeB = await issueAuthorizationCode(worker.origin, clientB.client_id, { scope: fullScopes });
+		const tokenBResponse = await exchangeCode(worker.origin, clientB.client_id, codeB);
+		assert.equal(tokenBResponse.status, 200, "rotated DCR client token exchange must succeed");
+		const { access_token: accessTokenB } = await tokenBResponse.json();
+		const initializedB = await mcpRpc(worker.origin, accessTokenB, null, 4, "initialize", {
+			protocolVersion: "2025-03-26",
+			capabilities: {},
+			clientInfo: { name: "issue19-principal-b", version: "1" },
+		});
+		const claimB = await mcpTool(
+			worker.origin,
+			accessTokenB,
+			initializedB.sessionId,
+			5,
+			"claim_research_job",
+			{ job_id: jobB },
+		);
+		assert.equal(claimB.payload.status, "CLAIMED", "rotated DCR client_id must keep the stable principal claimable");
+
+		// PRIVATE job: eligibility is server-side record state -> NOT_FOUND
+		// (no existence oracle) even with a valid principal and full scopes.
+		const claimPrivate = await mcpTool(
+			worker.origin,
+			accessTokenB,
+			initializedB.sessionId,
+			6,
+			"claim_research_job",
+			{ job_id: jobPrivate },
+		);
+		assert.equal(claimPrivate.payload.status, "NOT_CLAIMABLE");
+		assert.equal(claimPrivate.payload.reason, "NOT_FOUND");
+
+		// market:read alone can never claim or submit: a token whose grant
+		// lacks the research scopes hits the scope gate (FILTERED) first.
+		const clientC = await registerClient(worker.origin);
+		const codeC = await issueAuthorizationCode(worker.origin, clientC.client_id, { scope: "market:read" });
+		const tokenCResponse = await exchangeCode(worker.origin, clientC.client_id, codeC);
+		assert.equal(tokenCResponse.status, 200, "market:read-only token exchange must succeed");
+		const { access_token: accessTokenC } = await tokenCResponse.json();
+		const initializedC = await mcpRpc(worker.origin, accessTokenC, null, 7, "initialize", {
+			protocolVersion: "2025-03-26",
+			capabilities: {},
+			clientInfo: { name: "issue19-market-read-only", version: "1" },
+		});
+		const deniedClaim = await mcpRpc(worker.origin, accessTokenC, initializedC.sessionId, 8, "tools/call", {
+			name: "claim_research_job",
+			arguments: { job_id: jobB },
+		});
+		assert.equal(deniedClaim.payload.result?.isError, true, "claim without research:claim must fail closed");
+		assert.match(deniedClaim.payload.result?.content?.[0]?.text ?? "", /FILTERED/u);
+		const deniedSubmit = await mcpRpc(worker.origin, accessTokenC, initializedC.sessionId, 9, "tools/call", {
+			name: "submit_research_result_proposal",
+			arguments: {
+				job_id: jobA,
+				claim_token: `clt_${"0".repeat(32)}`,
+				expected_generation: 1,
+				idempotency_key: "issue19-denied-submit",
+				proposal: {},
+			},
+		});
+		assert.equal(deniedSubmit.payload.result?.isError, true, "submit without research:submit must fail closed");
+		assert.match(deniedSubmit.payload.result?.content?.[0]?.text ?? "", /FILTERED/u);
+
+		// Formal lifecycle events from the real principal are receipt-readable.
 		const receiptsResponse = await fetch(`${worker.origin}/internal/research-replica/v2/receipts`, {
 			headers: { authorization: "Bearer synthetic-replica-ingest-token" },
 		});
-		assert.equal(receiptsResponse.status, 200, "new D1 event mappings must be readable atomically");
+		assert.equal(receiptsResponse.status, 200);
 		const receipts = await receiptsResponse.json();
-		assert.match(receipts.next_since, /^rcpt3\./);
-		assert.ok(receipts.receipts.some((receipt) => receipt.event_type === "CLAIMED"));
-		assert.ok(receipts.receipts.some((receipt) => receipt.event_type === "COMPLETED"));
+		assert.ok(
+			receipts.receipts.some((receipt) => receipt.job_id === jobA && receipt.event_type === "CLAIMED"),
+			"claimed job_<hash> must surface as a receipt",
+		);
+		assert.ok(
+			receipts.receipts.some((receipt) => receipt.job_id === jobA && receipt.event_type === "COMPLETED"),
+			"completed job_<hash> must surface as a receipt",
+		);
+		assert.ok(
+			receipts.receipts.some((receipt) => receipt.job_id === jobB && receipt.event_type === "CLAIMED"),
+			"rotated-client claim must surface under the same stable principal",
+		);
 	} finally {
 		if (worker) await worker.stop();
 		await rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });

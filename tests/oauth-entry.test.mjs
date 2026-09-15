@@ -199,3 +199,40 @@ test("OAuth authorization stays market-read only", async () => {
 	assert.match(oauth, /userId: OWNER_USER_ID/);
 	assert.match(oauth, /不会授予交易、撤单、账户、成本或订单权限/);
 });
+
+// Issue #19 源码锁：formal 授权的信任根是桥接层盖章的 stable principal 头。
+// 剥客户端同名头必须先于任何 set（防残留/伪造），principal 必须来自已验证的
+// grant props，绝不允许 DCR client_id 重新进入授权路径。
+test("bridge strips client forwarded headers before stamping and binds principal to verified grant props (issue #19)", async () => {
+	const oauth = await source("../src/oauth-entry.ts");
+	const scopes = await source("../src/research-scopes.ts");
+	const handleStart = oauth.indexOf("async function handleMcp");
+	const handleEnd = oauth.indexOf("const defaultHandler", handleStart);
+	const handleMcp = oauth.slice(handleStart, handleEnd);
+
+	// Delete-before-set：四个转发头全部先剥后盖，顺序不得回退。
+	const lastDelete = Math.max(
+		handleMcp.indexOf("headers.delete(FORWARDED_SCOPES_HEADER)"),
+		handleMcp.indexOf("headers.delete(FORWARDED_PRINCIPAL_HEADER)"),
+		handleMcp.indexOf("headers.delete(FORWARDED_CLIENT_ID_HEADER)"),
+		handleMcp.indexOf("headers.delete(FORWARDED_ISSUER_HEADER)"),
+	);
+	const firstSet = handleMcp.indexOf("headers.set(");
+	assert.ok(lastDelete >= 0 && firstSet > lastDelete, "all forwarded headers must be deleted before any set");
+
+	// principal 只能来自已验证 grant props；DCR client_id 不得再被盖章。
+	assert.match(handleMcp, /const principal = summary\.grant\.props\?\.principal;/);
+	assert.match(handleMcp, /headers\.set\(FORWARDED_PRINCIPAL_HEADER, principal\)/);
+	assert.doesNotMatch(handleMcp, /headers\.set\(FORWARDED_CLIENT_ID_HEADER/);
+	assert.doesNotMatch(oauth, /authenticatedClientId/);
+
+	// core 侧只在 bridge credential 逐字节匹配后才接受 principal/scope/issuer。
+	assert.match(scopes, /function resolveResearchPrincipal\(/);
+	const resolver = scopes.slice(
+		scopes.indexOf("export function resolveResearchPrincipal"),
+		scopes.indexOf("export function resolveResearchIssuer"),
+	);
+	assert.match(resolver, /authorizationHeader !== `Bearer \$\{configuredToken\}`/);
+	// DCR client_id 解析器必须已被 stable principal 解析器替代。
+	assert.doesNotMatch(scopes, /function resolveResearchClientId\(/);
+});

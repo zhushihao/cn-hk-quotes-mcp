@@ -3,8 +3,10 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { createHash } from "node:crypto";
 
 const workflow = await import("../src/research-workflow.ts");
+const { formalResearchOwner } = await import("../src/research-scopes.ts");
 
 const WORKFLOW_MIGRATIONS = [
 	"0001_research_replica.sql",
@@ -501,4 +503,51 @@ test("G09 submit-versus-defer has one winner and never leaves terminal plus leas
 			db.count("SELECT COUNT(*) AS count FROM research_job_leases WHERE job_id=?", "job-submit-defer"),
 		0,
 	);
+});
+
+// Issue #19: job eligibility is server-side record/lease state only.  Real
+// RESEARCH WorkQueue ids are opaque stable `job_<hash>` strings — the id
+// format must never gate claiming, and PRIVATE/nonexistent ids stay NOT_FOUND
+// without an existence oracle.
+test("job_<hash> ids claim and complete end-to-end; PRIVATE and missing ids stay NOT_FOUND (issue #19)", async () => {
+	const db = new SqliteD1();
+	const hash = (label) =>
+		createHash("sha256").update(label).digest("hex").slice(0, 40);
+	const jobHash = `job_${hash("issue19-workflow-job")}`;
+	const jobPrivate = `job_${hash("issue19-workflow-private")}`;
+	db.seedJob(jobHash);
+	db.sqlite
+		.prepare(
+			"INSERT INTO research_records (record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at) VALUES ('job', ?, ?, 'PRIVATE', 'collector-outbound-v4', '{}', ?, ?)",
+		)
+		.run(jobPrivate, `outbound_${jobPrivate}`, NOW, NOW);
+
+	// The production owner derivation binds issuer + stable principal; its
+	// opaque output is a valid formal lease owner.
+	const owner = await formalResearchOwner("https://collector.example.test", "chatgpt-production");
+	assert.match(owner, /^oauth-client:[a-f0-9]{64}$/);
+
+	const missing = await workflow.claimResearchJob(db, {
+		jobId: `job_${hash("issue19-never-seeded")}`, leaseOwner: owner, requestId: "req-issue19-missing", now: NOW,
+	});
+	assert.equal(missing.status, "NOT_CLAIMABLE");
+	assert.equal(missing.reason, "NOT_FOUND");
+
+	const priv = await workflow.claimResearchJob(db, {
+		jobId: jobPrivate, leaseOwner: owner, requestId: "req-issue19-private", now: NOW,
+	});
+	assert.equal(priv.status, "NOT_CLAIMABLE");
+	assert.equal(priv.reason, "NOT_FOUND");
+
+	const lease = await workflow.claimResearchJob(db, {
+		jobId: jobHash, leaseOwner: owner, requestId: "req-issue19-claim", now: NOW,
+	});
+	assert.equal(lease.status, "CLAIMED");
+	const accepted = await workflow.submitResearchResultProposal(db, {
+		jobId: jobHash, claimToken: lease.claim_token, expectedGeneration: lease.lease_generation,
+		idempotencyKey: "issue19-submit-key", origin: "CHATGPT", proposal: proposal(jobHash),
+		callerPrincipal: owner, requestId: "req-issue19-submit", now: NOW,
+	});
+	assert.equal(accepted.status, "ACCEPTED");
+	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_terminal WHERE job_id=?", jobHash), 1);
 });

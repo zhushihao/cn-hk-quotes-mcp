@@ -34,12 +34,37 @@ export const RESEARCH_SUBMIT_SCOPE = "research:submit";
  * copy before setting its own value.
  */
 export const FORWARDED_SCOPES_HEADER = "X-QuantPro-Client-Scopes";
-/** Authenticated OAuth client identity, stamped only by the OAuth bridge. */
+/**
+ * Stable business principal, stamped only by the OAuth bridge from the
+ * validated OAuth grant props (`COLLECTOR_MCP_CLIENT_ID`, frozen to
+ * `chatgpt-production` in production).  Issue #19: formal authorization binds
+ * to this durable principal — never to the dynamically registered (DCR)
+ * OAuth client_id, which rotates whenever ChatGPT re-registers.
+ */
+export const FORWARDED_PRINCIPAL_HEADER = "X-QuantPro-Principal";
+/**
+ * Legacy DCR client_id header: no longer consumed for authorization.  The
+ * bridge still deletes any client-supplied copy so stale headers can never
+ * re-enter the trust boundary.
+ */
 export const FORWARDED_CLIENT_ID_HEADER = "X-QuantPro-Client-Id";
-/** OAuth issuer stamped by the bridge together with the authenticated client id. */
+/** OAuth issuer stamped by the bridge together with the authenticated principal. */
 export const FORWARDED_ISSUER_HEADER = "X-QuantPro-OAuth-Issuer";
 
 const FORMAL_OWNER_PREFIX = "oauth-client:";
+
+/**
+ * Engineering / transport / receipt roles.  Server configuration cannot
+ * accidentally promote any of them into a formal ChatGPT result owner merely
+ * by granting a scope (defense in depth on top of the scope gate).
+ */
+const NON_FORMAL_PRINCIPALS = new Set([
+	"codex",
+	"engineering",
+	"producer",
+	"receipt-reader",
+	"receipt_reader",
+]);
 
 /** Parse a space/comma separated scope list into a set (order-insensitive). */
 function parseScopeList(value: string | null | undefined): Set<string> {
@@ -76,15 +101,21 @@ export function resolveResearchScopes(
 	return effective;
 }
 
-/** A client identity is trusted only on the authenticated bridge path. */
-export function resolveResearchClientId(
+/**
+ * The stable principal is trusted only on the authenticated bridge path: the
+ * bridge replaces the Authorization header with the internal credential and
+ * stamps this header from the *validated* OAuth grant props — never from a
+ * client-controlled value.  A static-credential holder gets `null` here (no
+ * principal, no formal write).
+ */
+export function resolveResearchPrincipal(
 	authorizationHeader: string | null | undefined,
-	forwardedClientId: string | null | undefined,
+	forwardedPrincipal: string | null | undefined,
 	configuredToken: string | null | undefined,
 ): string | null {
 	if (!configuredToken || authorizationHeader !== `Bearer ${configuredToken}`) return null;
-	if (typeof forwardedClientId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(forwardedClientId)) return null;
-	return forwardedClientId;
+	if (typeof forwardedPrincipal !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(forwardedPrincipal)) return null;
+	return forwardedPrincipal;
 }
 
 /**
@@ -110,16 +141,17 @@ export function resolveResearchIssuer(
 }
 
 /**
- * Opaque, stable queue owner identity.  It binds the authenticated issuer and
- * client id without exposing either identifier in the receipt actor field.
- * Job and lease generation are fenced by the workflow's job row/token.
+ * Opaque, stable queue owner identity.  Issue #19: it binds the authenticated
+ * issuer and the stable business principal (not the DCR client_id), so
+ * ChatGPT/OAuth re-registration does not strand leases, resume state, or
+ * idempotency records.  Neither identifier is exposed in the receipt actor.
  */
 export async function formalResearchOwner(
 	issuer: string | null,
-	clientId: string | null,
+	principal: string | null,
 ): Promise<string | null> {
-	if (!issuer || !clientId) return null;
-	const bytes = new TextEncoder().encode(`${issuer}\u0000${clientId}`);
+	if (!issuer || !principal) return null;
+	const bytes = new TextEncoder().encode(`${issuer}\u0000${principal}`);
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
 	const hex = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 	return `${FORMAL_OWNER_PREFIX}${hex}`;
@@ -129,25 +161,21 @@ export function isFormalResearchOwner(value: string): boolean {
 	return new RegExp(`^${FORMAL_OWNER_PREFIX}[a-f0-9]{64}$`).test(value);
 }
 
-/** All three grants are required: client allowlist, scope, and job namespace. */
+/**
+ * Formal write gate (issue #19): a verified stable principal on the trusted
+ * bridge path plus the required research scope.  Job eligibility is decided
+ * solely by server-side record/lease state (PUBLIC + QUEUED + non-terminal,
+ * enforced in research-workflow.ts) — the job_id string format never
+ * participates in authorization, and the dynamic OAuth client_id is not an
+ * authorization input at all.
+ */
 export function permitsFormalResearchOperation(input: {
-	clientId: string | null;
+	principal: string | null;
 	issuer: string | null;
 	scopes: ReadonlySet<string>;
 	requiredScope: string;
-	configuredClientIds: string | null | undefined;
-	configuredNamespaces: string | null | undefined;
-	jobId: string;
 }): boolean {
-	if (!input.clientId || !input.issuer || !input.scopes.has(input.requiredScope)) return false;
-	// These identities belong to engineering, RESEARCH transport, or receipt
-	// consumption roles.  Configuration cannot accidentally promote any of
-	// them into a formal ChatGPT result owner merely by adding a scope.
-	if (new Set(["codex", "engineering", "producer", "receipt-reader", "receipt_reader"]).has(input.clientId.toLowerCase())) {
-		return false;
-	}
-	const clients = parseScopeList(input.configuredClientIds);
-	const namespaces = parseScopeList(input.configuredNamespaces);
-	if (!clients.has(input.clientId) || namespaces.size === 0) return false;
-	return [...namespaces].some((namespace) => input.jobId.startsWith(`${namespace}:`));
+	if (!input.principal || !input.issuer) return false;
+	if (!input.scopes.has(input.requiredScope)) return false;
+	return !NON_FORMAL_PRINCIPALS.has(input.principal.toLowerCase());
 }

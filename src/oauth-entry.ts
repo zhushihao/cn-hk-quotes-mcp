@@ -8,6 +8,7 @@ import { createD1Kv, createD1OAuthKv } from "./d1-oauth-kv";
 import coreWorker from "./index";
 import {
 	FORWARDED_SCOPES_HEADER,
+	FORWARDED_PRINCIPAL_HEADER,
 	FORWARDED_CLIENT_ID_HEADER,
 	FORWARDED_ISSUER_HEADER,
 	RESEARCH_CLAIM_SCOPE,
@@ -404,6 +405,10 @@ async function handleMcp(
 ): Promise<Response> {
 	const token = bearerToken(request);
 	if (token === null) {
+		// No bearer at all: forwarded straight through with the Authorization
+		// header stripped.  No forwarded principal/scope headers are stamped
+		// on this path, and the core's resolvers require the bridge credential
+		// byte-for-byte — research formal writes stay fail-closed here.
 		return coreWorker.fetch(withAuthorization(request, null), env, ctx);
 	}
 	if (!token) return oauthChallenge(request);
@@ -425,13 +430,18 @@ async function handleMcp(
 	// 当上限，伪造或残留的头部都无法越过配置集合。
 	const headers = new Headers(request.headers);
 	headers.delete(FORWARDED_SCOPES_HEADER);
+	headers.delete(FORWARDED_PRINCIPAL_HEADER);
 	headers.delete(FORWARDED_CLIENT_ID_HEADER);
 	headers.delete(FORWARDED_ISSUER_HEADER);
 	headers.set(FORWARDED_SCOPES_HEADER, summary.scope.join(" "));
-	const authenticatedClientId = (summary as unknown as { clientId?: unknown }).clientId
-		?? (summary.grant as unknown as { clientId?: unknown }).clientId;
-	if (typeof authenticatedClientId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(authenticatedClientId)) {
-		headers.set(FORWARDED_CLIENT_ID_HEADER, authenticatedClientId);
+	// Issue #19: forward the *stable business principal* taken from the
+	// validated grant props — never the dynamically registered (DCR)
+	// client_id, which rotates on every ChatGPT re-registration.  The core
+	// worker accepts these headers only behind its internal bridge credential,
+	// and any client-supplied copies were deleted above.
+	const principal = summary.grant.props?.principal;
+	if (typeof principal === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(principal)) {
+		headers.set(FORWARDED_PRINCIPAL_HEADER, principal);
 		headers.set(FORWARDED_ISSUER_HEADER, new URL(request.url).origin);
 	}
 	const scopeStamped = new Request(request, { headers });
@@ -481,6 +491,11 @@ const oauthProvider = new OAuthProvider<OAuthEnv>({
 		resource_name: "QuantPro Collector",
 	},
 	tokenExchangeCallback({ requestedScope, props, clientId }) {
+		// #19: this callback pins the access-token principal to the single
+		// production business identity regardless of what the authorize stage
+		// derived — `COLLECTOR_MCP_CLIENT_ID` must therefore stay
+		// `chatgpt-production` in production.  Fail-safe direction: a
+		// misconfigured value is overwritten here, never the reverse.
 		const principal = "chatgpt-production";
 		return {
 			accessTokenProps: {

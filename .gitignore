@@ -171,3 +171,6 @@ dist
 .dev.vars
 .wrangler/
 oauth-browser-preflight.json
+
+# Local E2E evidence artifacts (never commit; may contain production data)
+e2e-evidence/

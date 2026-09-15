@@ -38,12 +38,12 @@ import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portf
 import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
 import {
 	FORWARDED_SCOPES_HEADER,
-	FORWARDED_CLIENT_ID_HEADER,
+	FORWARDED_PRINCIPAL_HEADER,
 	FORWARDED_ISSUER_HEADER,
 	RESEARCH_CLAIM_SCOPE,
 	RESEARCH_SUBMIT_SCOPE,
 	resolveResearchScopes,
-	resolveResearchClientId,
+	resolveResearchPrincipal,
 	resolveResearchIssuer,
 	formalResearchOwner,
 	permitsFormalResearchOperation,
@@ -77,10 +77,6 @@ interface Env {
 	COLLECTOR_MCP_CLIENT_ID?: string;
 	/** 空格或逗号分隔的批准 scopes；LIVE overlay 至少要求 market:read。 */
 	COLLECTOR_MCP_CLIENT_SCOPES?: string;
-	/** Exact OAuth client-id allowlist for formal Research queue operations. */
-	COLLECTOR_MCP_FORMAL_CLIENT_IDS?: string;
-	/** Prefix allowlist for formal Research jobs, e.g. `research-formal`. */
-	COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES?: string;
 	/** 旧行情 origin（cn-hk-quotes-proxy / chatgpt.site）启用 Cloudflare Access 后注入。 */
 	CF_ACCESS_CLIENT_ID?: string;
 	CF_ACCESS_CLIENT_SECRET?: string;
@@ -666,13 +662,15 @@ export async function updateQuoteBridge(
  * `liveOverlayStatus` 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：
  * 只有 `fetch()` 路由把请求头判定结果显式传进来时才可能应用 LIVE 叠加。
  * `researchScopes` 由 `fetch()` 按 §A4 解析（凭据逐字节匹配 + 转发头 ∩ 配置
- * 上限），写工具各查各的 scope，无任何蕴含关系。
+ * 上限），写工具各查各的 scope，无任何蕴含关系。`researchPrincipal` 是 OAuth
+ * 桥从已验证 grant props 盖章的稳定业务主体（#19：不是动态 DCR client_id），
+ * 仅在内部 bridge credential 匹配时被接受。
  */
 export function createServer(
 	env?: Env,
 	liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED",
 	researchScopes: ReadonlySet<string> = new Set(),
-	researchClientId: string | null = null,
+	researchPrincipal: string | null = null,
 	researchIssuer: string | null = null,
 ) {
 	const server = new McpServer({
@@ -897,7 +895,7 @@ export function createServer(
 		}
 	};
 	const researchRead = researchDomain;
-	const callerPrincipal = (): Promise<string | null> => formalResearchOwner(researchIssuer, researchClientId);
+	const callerPrincipal = (): Promise<string | null> => formalResearchOwner(researchIssuer, researchPrincipal);
 	const requireResearchScope = (scope: string, tool: string) => {
 		if (researchScopes.has(scope)) return null;
 		const safe = new ResearchBoundaryError("FILTERED").asError();
@@ -909,7 +907,7 @@ export function createServer(
 				tool,
 				required_scope: scope,
 				granted_scopes: [...researchScopes].sort(),
-				principal: researchClientId ?? "unverified-client",
+				principal: researchPrincipal ?? "unverified-principal",
 				request_id: safe.request_id,
 			}),
 		);
@@ -918,18 +916,17 @@ export function createServer(
 			content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }],
 		};
 	};
-	const requireFormalResearchClient = (tool: string, requiredScope: string, jobId: string) => {
+	const requireFormalResearchClient = (tool: string, requiredScope: string) => {
+		// #19：正式身份 = 已验证 stable principal + issuer + 必需 scope；
+		// Job eligibility 完全由服务端记录/租约状态裁决，job_id 格式不参与授权。
 		if (permitsFormalResearchOperation({
-			clientId: researchClientId,
+			principal: researchPrincipal,
 			issuer: researchIssuer,
 			scopes: researchScopes,
 			requiredScope,
-			configuredClientIds: env?.COLLECTOR_MCP_FORMAL_CLIENT_IDS,
-			configuredNamespaces: env?.COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES,
-			jobId,
 		})) return null;
 		const safe = new ResearchBoundaryError("FILTERED").asError();
-		console.log(JSON.stringify({ event: "research_tool_client_denied", tool, client_id: researchClientId ?? null, request_id: safe.request_id }));
+		console.log(JSON.stringify({ event: "research_tool_client_denied", tool, principal: researchPrincipal ?? null, request_id: safe.request_id }));
 		return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
 	};
 
@@ -1049,10 +1046,12 @@ export function createServer(
 		async ({ job_id }) => {
 			const denied = requireResearchScope(RESEARCH_CLAIM_SCOPE, "claim_research_job");
 			if (denied) return denied;
-			const clientDenied = requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE, job_id);
+			const clientDenied = requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE);
 			if (clientDenied) return clientDenied;
-			const owner = await callerPrincipal();
-			if (!owner) return requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE, job_id)!;
+			// Belt-and-suspenders: the formal gate above already implies a non-null
+			// principal and issuer, so callerPrincipal cannot return null here.
+		const owner = await callerPrincipal();
+			if (!owner) return requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE)!;
 			return researchRead(async () =>
 				claimResearchJob(researchWorkflowDb(), {
 					jobId: job_id,
@@ -1080,10 +1079,12 @@ export function createServer(
 		async ({ job_id, claim_token, expected_generation, idempotency_key, origin, proposal }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "submit_research_result_proposal");
 			if (denied) return denied;
-			const clientDenied = requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE, job_id);
+			const clientDenied = requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE);
 			if (clientDenied) return clientDenied;
-			const owner = await callerPrincipal();
-			if (!owner) return requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE, job_id)!;
+			// Belt-and-suspenders: the formal gate above already implies a non-null
+			// principal and issuer, so callerPrincipal cannot return null here.
+		const owner = await callerPrincipal();
+			if (!owner) return requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE)!;
 			return researchRead(async () =>
 				submitResearchResultProposal(researchWorkflowDb(), {
 					jobId: job_id,
@@ -1116,10 +1117,12 @@ export function createServer(
 		async ({ job_id, claim_token, expected_generation, idempotency_key, reason, recheck_at }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "defer_research_job");
 			if (denied) return denied;
-			const clientDenied = requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE, job_id);
+			const clientDenied = requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE);
 			if (clientDenied) return clientDenied;
-			const owner = await callerPrincipal();
-			if (!owner) return requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE, job_id)!;
+			// Belt-and-suspenders: the formal gate above already implies a non-null
+			// principal and issuer, so callerPrincipal cannot return null here.
+		const owner = await callerPrincipal();
+			if (!owner) return requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE)!;
 			return researchRead(async () =>
 				deferResearchJob(researchWorkflowDb(), {
 					jobId: job_id,
@@ -1677,9 +1680,12 @@ export default {
 				env.COLLECTOR_MCP_CLIENT_TOKEN,
 				env.COLLECTOR_MCP_CLIENT_SCOPES,
 			);
-			const researchClientId = resolveResearchClientId(
+			// #19：桥接层从已验证 grant props 盖章的稳定业务主体（chatgpt-production）。
+			// 动态 DCR client_id 不再进入授权路径；该头只在内部 bridge credential
+			// 逐字节匹配时被接受，客户端自带的同名头已在桥内剥除。
+			const researchPrincipal = resolveResearchPrincipal(
 				ctx.requestInfo?.headers.get("Authorization") ?? null,
-				ctx.requestInfo?.headers.get(FORWARDED_CLIENT_ID_HEADER) ?? null,
+				ctx.requestInfo?.headers.get(FORWARDED_PRINCIPAL_HEADER) ?? null,
 				env.COLLECTOR_MCP_CLIENT_TOKEN,
 			);
 			const researchIssuer = resolveResearchIssuer(
@@ -1687,7 +1693,7 @@ export default {
 				ctx.requestInfo?.headers.get(FORWARDED_ISSUER_HEADER) ?? null,
 				env.COLLECTOR_MCP_CLIENT_TOKEN,
 			);
-			return createServer(env, liveOverlayStatus, researchScopes, researchClientId, researchIssuer);
+			return createServer(env, liveOverlayStatus, researchScopes, researchPrincipal, researchIssuer);
 		});
 		return handler(request, env, ctx);
 	},

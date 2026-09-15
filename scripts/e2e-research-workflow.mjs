@@ -420,12 +420,10 @@ async function step3ClaimContextSubmitLoop() {
 		await mainClient.callTool("list_research_jobs", { claimable_only: true }),
 	);
 	const jobList = Array.isArray(jobs) ? jobs : jobs?.results ?? [];
-	// Prefer the formal-namespace job (`job:` prefix) so the formal-client gate
-	// (COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES) matches; the hashed `job_` ids
-	// are RESEARCH-local and not formal-namespace claimable.
-	const queued = jobList.find(
-		(job) => job.server_state?.effective_status === "QUEUED" && String(job.record_key).startsWith("job:"),
-	) ?? jobList.find((job) => job.server_state?.effective_status === "QUEUED");
+	// #19: job eligibility is purely server-side state (PUBLIC + QUEUED +
+	// lease acquirable); the job_id format never participates in
+	// authorization, so any QUEUED PUBLIC job is claimable.
+	const queued = jobList.find((job) => job.server_state?.effective_status === "QUEUED");
 	assertOk(step, queued, "no PUBLIC QUEUED job available", { jobs });
 	markTool("list_research_jobs");
 	const jobId = queued.record_key;
