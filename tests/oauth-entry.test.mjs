@@ -123,6 +123,8 @@ test("anonymous MCP remains quote-only compatible while OAuth bearer is validate
 	const tokenGate = oauth.slice(tokenGateStart, tokenGateEnd);
 	assert.match(tokenGate, /audienceMatches\(summary\.audience\)/);
 	assert.match(body, /bridgeSecret \? `Bearer \$\{bridgeSecret\}` : null/);
+	assert.match(body, /headers\.delete\(FORWARDED_ISSUER_HEADER\)/);
+	assert.match(body, /headers\.set\(FORWARDED_ISSUER_HEADER, new URL\(request\.url\)\.origin\)/);
 });
 
 test("legacy static bearer cannot bypass OAuth at the public MCP route", async () => {

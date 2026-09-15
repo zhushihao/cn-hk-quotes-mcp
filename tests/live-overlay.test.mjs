@@ -557,13 +557,14 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 		/const liveOverlayStatus = requestMcpMarketReadStatus\(ctx\.requestInfo, env\);/,
 	);
 	// #5 §A4：researchScopes 由 resolveResearchScopes 解析（凭据逐字节
-	// 匹配 + 转发头 ∩ 配置上限），并把经 bridge 验证的 client id 作为
-	// 第四参传给研究写面；二者均不触碰 market:read 门。
+	// 匹配 + 转发头 ∩ 配置上限），并把经 bridge 验证的 issuer + client id
+	// 一起传给研究写面；二者均不触碰 market:read 门。
 	assert.match(
 		source,
-		/const researchScopes = resolveResearchScopes\(\s*ctx\.requestInfo\?\.headers\.get\("Authorization"\) \?\? null,\s*ctx\.requestInfo\?\.headers\.get\(FORWARDED_SCOPES_HEADER\) \?\? null,\s*env\.COLLECTOR_MCP_CLIENT_TOKEN,\s*env\.COLLECTOR_MCP_CLIENT_SCOPES,\s*\);\s*const researchClientId = resolveResearchClientId\(\s*ctx\.requestInfo\?\.headers\.get\("Authorization"\) \?\? null,\s*ctx\.requestInfo\?\.headers\.get\(FORWARDED_CLIENT_ID_HEADER\) \?\? null,\s*env\.COLLECTOR_MCP_CLIENT_TOKEN,\s*\);\s*return createServer\(env, liveOverlayStatus, researchScopes, researchClientId\);/,
+		/const researchScopes = resolveResearchScopes\([\s\S]*?\);\s*const researchClientId = resolveResearchClientId\([\s\S]*?\);\s*const researchIssuer = resolveResearchIssuer\([\s\S]*?FORWARDED_ISSUER_HEADER[\s\S]*?\);\s*return createServer\(env, liveOverlayStatus, researchScopes, researchClientId, researchIssuer\);/,
 	);
 	assert.match(source, /FORWARDED_CLIENT_ID_HEADER/);
+	assert.match(source, /FORWARDED_ISSUER_HEADER/);
 	assert.match(source, /request\?\.headers\.get\("Authorization"\)/);
 	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_TOKEN/);
 	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_SCOPES/);

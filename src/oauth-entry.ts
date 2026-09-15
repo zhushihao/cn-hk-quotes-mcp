@@ -9,6 +9,7 @@ import coreWorker from "./index";
 import {
 	FORWARDED_SCOPES_HEADER,
 	FORWARDED_CLIENT_ID_HEADER,
+	FORWARDED_ISSUER_HEADER,
 	RESEARCH_CLAIM_SCOPE,
 	RESEARCH_SUBMIT_SCOPE,
 } from "./research-scopes";
@@ -425,11 +426,13 @@ async function handleMcp(
 	const headers = new Headers(request.headers);
 	headers.delete(FORWARDED_SCOPES_HEADER);
 	headers.delete(FORWARDED_CLIENT_ID_HEADER);
+	headers.delete(FORWARDED_ISSUER_HEADER);
 	headers.set(FORWARDED_SCOPES_HEADER, summary.scope.join(" "));
 	const authenticatedClientId = (summary as unknown as { clientId?: unknown }).clientId
 		?? (summary.grant as unknown as { clientId?: unknown }).clientId;
 	if (typeof authenticatedClientId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(authenticatedClientId)) {
 		headers.set(FORWARDED_CLIENT_ID_HEADER, authenticatedClientId);
+		headers.set(FORWARDED_ISSUER_HEADER, new URL(request.url).origin);
 	}
 	const scopeStamped = new Request(request, { headers });
 
