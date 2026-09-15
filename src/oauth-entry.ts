@@ -4,7 +4,7 @@ import OAuthProvider, {
 	type TokenSummary,
 } from "@cloudflare/workers-oauth-provider";
 
-import { createD1OAuthKv } from "./d1-oauth-kv";
+import { createD1Kv, createD1OAuthKv } from "./d1-oauth-kv";
 import coreWorker from "./index";
 import {
 	FORWARDED_SCOPES_HEADER,
@@ -43,17 +43,32 @@ type OAuthEnv = CoreEnv & {
 	OAUTH_PROVIDER: OAuthHelpers;
 };
 
+/** 隔离于 OAuth 表之外的 LIVE 控制面持久化表（issue #17）。 */
+const PORTFOLIO_KV_TABLE = "portfolio_kv_v1";
+
 /**
  * OAuth state is intentionally kept out of Workers KV. The account-wide free-tier KV write
  * allowance is shared with the LIVE control plane and can be exhausted independently of OAuth.
  * A KV-compatible adapter backed by the Collector's private D1 database gives OAuth its own
- * table and quota while leaving PORTFOLIO_UNIVERSE and PORTFOLIO_UNIVERSE_TOKEN untouched.
+ * table and quota.
+ *
+ * Issue #17 extends the same isolation to the LIVE control plane itself: the account-wide
+ * free-tier KV quota (1,000 writes/day) cannot absorb the per-round universe/status/delta
+ * writes of a full trading-day publish window, so `PORTFOLIO_UNIVERSE` reads and writes are
+ * served from `portfolio_kv_v1` in the already-private Collector D1 database instead. The
+ * binding name, key-space (`live-portfolio/*`), payload contracts, and the
+ * PORTFOLIO_UNIVERSE_TOKEN auth secret all stay untouched; only the storage engine changes.
+ * OAuth persistence never reads or writes the portfolio table.
  */
 function oauthRuntimeEnv(env: CoreEnv): OAuthEnv {
 	if (!env.RESEARCH_REPLICA) {
 		throw new Error("RESEARCH_REPLICA D1 binding is required for OAuth storage");
 	}
-	return { ...env, OAUTH_KV: createD1OAuthKv(env.RESEARCH_REPLICA) } as OAuthEnv;
+	return {
+		...env,
+		OAUTH_KV: createD1OAuthKv(env.RESEARCH_REPLICA),
+		PORTFOLIO_UNIVERSE: createD1Kv(env.RESEARCH_REPLICA, PORTFOLIO_KV_TABLE),
+	} as OAuthEnv;
 }
 
 function escapeHtml(value: string): string {
@@ -412,7 +427,10 @@ async function handleMcp(
 	const scopeStamped = new Request(request, { headers });
 
 	const bridgeSecret = env.COLLECTOR_MCP_CLIENT_TOKEN;
-	const forwarded = withAuthorization(scopeStamped, bridgeSecret ? `Bearer ${bridgeSecret}` : null);
+	const forwarded = withAuthorization(
+		scopeStamped,
+		bridgeSecret ? `Bearer ${bridgeSecret}` : null,
+	);
 	return coreWorker.fetch(forwarded, env, ctx);
 }
 
