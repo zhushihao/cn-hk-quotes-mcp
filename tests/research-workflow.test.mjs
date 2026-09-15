@@ -6,24 +6,29 @@ import test from "node:test";
 
 const workflow = await import("../src/research-workflow.ts");
 
+const WORKFLOW_MIGRATIONS = [
+	"0001_research_replica.sql",
+	"0003_research_workflow.sql",
+	"0004_research_replica_v4.sql",
+	"0005_research_workflow_deferrals.sql",
+	"0006_research_workflow_ingress_sequence.sql",
+	"0007_research_receipt_order_v3.sql",
+];
+
 /**
  * Isolated SQLite execution of the Collector's actual D1 workflow SQL.  The
  * identities and records below are synthetic test-namespace values only; no
  * credential, deployed Worker, or ChatGPT Automation is involved.
  */
 class SqliteD1 {
-	constructor({ triggerInflatedChanges = false } = {}) {
+	constructor({ triggerInflatedChanges = false, migrations = WORKFLOW_MIGRATIONS } = {}) {
 		this.sqlite = new DatabaseSync(":memory:");
 		this.triggerInflatedChanges = triggerInflatedChanges;
-		for (const migration of [
-			"0001_research_replica.sql",
-			"0003_research_workflow.sql",
-			"0004_research_replica_v4.sql",
-			"0005_research_workflow_deferrals.sql",
-			"0006_research_workflow_ingress_sequence.sql",
-		]) {
-			this.sqlite.exec(readFileSync(path.join("migrations", migration), "utf8"));
-		}
+		for (const migration of migrations) this.applyMigration(migration);
+	}
+
+	applyMigration(migration) {
+		this.sqlite.exec(readFileSync(path.join("migrations", migration), "utf8"));
 	}
 
 	prepare(sql) {
@@ -207,7 +212,7 @@ test("G07 authenticated formal owners are client-specific and a second client ca
 	assert.equal(takeover.lease_generation, 2);
 });
 
-test("G09 opaque receipt cursor reaches all 501 same-timestamp events without replay looping", async () => {
+test("G09 rcpt3 reaches all 501 same-timestamp events without replay looping", async () => {
 	const db = new SqliteD1();
 	for (let index = 0; index < 501; index += 1) {
 		db.sqlite.prepare(
@@ -216,7 +221,7 @@ test("G09 opaque receipt cursor reaches all 501 same-timestamp events without re
 	}
 	const first = await workflow.listResearchJobReceipts(db, { limit: 500, now: NOW });
 	assert.equal(first.receipts.length, 500);
-	assert.match(first.next_since, /^rcpt2\./);
+	assert.match(first.next_since, /^rcpt3\./);
 	const second = await workflow.listResearchJobReceipts(db, { since: first.next_since, limit: 500, now: NOW });
 	assert.equal(second.receipts.length, 1);
 	assert.notEqual(second.receipts[0].receipt_id, first.receipts[0].receipt_id);
@@ -225,14 +230,14 @@ test("G09 opaque receipt cursor reaches all 501 same-timestamp events without re
 	assert.equal(empty.next_since, second.next_since);
 	const legacy = await workflow.listResearchJobReceipts(db, { since: NOW, limit: 500, now: NOW });
 	assert.equal(legacy.receipts.length, 500);
-	assert.match(legacy.next_since, /^rcpt2\./);
+	assert.match(legacy.next_since, /^rcpt3\./);
 	await assert.rejects(
-		() => workflow.listResearchJobReceipts(db, { since: "rcpt2.not-base64", limit: 1, now: NOW }),
+		() => workflow.listResearchJobReceipts(db, { since: "rcpt3.not-base64", limit: 1, now: NOW }),
 		(error) => error?.error_code === "INTEGRITY_FAILED",
 	);
 });
 
-test("G09 rcpt2 ingress sequence reaches an event written between pages even when its timestamp and id sort backward", async () => {
+test("G09 rcpt3 reaches a page-boundary event with a backward business timestamp and id", async () => {
 	const db = new SqliteD1();
 	for (const eventId of ["evt-b", "evt-c"]) {
 		db.sqlite.prepare(
@@ -248,7 +253,115 @@ test("G09 rcpt2 ingress sequence reaches an event written between pages even whe
 	assert.deepEqual(second.receipts.map((receipt) => receipt.request_id), ["req-evt-a"]);
 });
 
-test("G09 rcpt2 keeps a 64-bit decimal sequence lossless and legacy cursors replay from zero", async () => {
+test("G01/G09 migration preserves ingress values, sorts historical events, and appends new events", async () => {
+	const db = new SqliteD1({ migrations: WORKFLOW_MIGRATIONS.slice(0, -1) });
+	db.sqlite.prepare(
+		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-z', 'job-migration', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-z', '2026-09-15T02:00:00.000Z')",
+	).run();
+	db.sqlite.prepare(
+		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-a', 'job-migration', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-a', '2026-09-15T01:00:00.000Z')",
+	).run();
+	const ingressBefore = db.sqlite.prepare(
+		"SELECT event_id, ingress_sequence FROM research_job_events ORDER BY event_id ASC",
+	).all();
+	db.applyMigration("0007_research_receipt_order_v3.sql");
+	assert.deepEqual(
+		db.sqlite.prepare("SELECT event_id, receipt_sequence FROM research_receipt_event_order ORDER BY receipt_sequence ASC").all().map((row) => ({ ...row })),
+		[{ event_id: "evt-a", receipt_sequence: 1 }, { event_id: "evt-z", receipt_sequence: 2 }],
+	);
+	assert.deepEqual(
+		db.sqlite.prepare("SELECT event_id, ingress_sequence FROM research_job_events ORDER BY event_id ASC").all(),
+		ingressBefore,
+		"0007 must retain 0006 ingress_sequence verbatim",
+	);
+	db.sqlite.prepare(
+		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-new', 'job-migration', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-new', '2020-01-01T00:00:00.000Z')",
+	).run();
+	assert.equal(
+		db.sqlite.prepare("SELECT receipt_sequence FROM research_receipt_event_order WHERE event_id='evt-new'").get().receipt_sequence,
+		3,
+		"a later ingress appends after the migration snapshot even when business time regresses",
+	);
+	const page = await workflow.listResearchJobReceipts(db, { limit: 10, now: NOW });
+	assert.deepEqual(page.receipts.map((receipt) => receipt.request_id), ["req-a", "req-z", "req-new"]);
+	assert.equal(
+		db.count("SELECT COUNT(*) AS count FROM research_job_events"),
+		db.count("SELECT COUNT(*) AS count FROM research_receipt_event_order"),
+		"every event has exactly one mapped sequence",
+	);
+});
+
+test("G09 every rcpt2 position upgrades through sequence zero and catches a page-boundary ingress", async () => {
+	const db = new SqliteD1({ migrations: WORKFLOW_MIGRATIONS.slice(0, -1) });
+	for (const [eventId, createdAt] of [
+		["evt-z", "2026-09-15T03:00:00.000Z"],
+		["evt-c", "2026-09-15T02:00:00.000Z"],
+		["evt-a", "2026-09-15T01:00:00.000Z"],
+		["evt-b", "2026-09-15T01:00:00.000Z"],
+	]) {
+		db.sqlite.prepare(
+			"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES (?, 'job-rcpt2-upgrade', 'CLAIMED', 'synthetic', NULL, NULL, '{}', ?, ?)",
+		).run(eventId, `req-${eventId}`, createdAt);
+	}
+	db.applyMigration("0007_research_receipt_order_v3.sql");
+
+	async function drain(since, onFirstPage = null) {
+		const received = [];
+		let cursor = since;
+		for (let page = 0; page < 10; page += 1) {
+			const result = await workflow.listResearchJobReceipts(db, { since: cursor, limit: 2, now: NOW });
+			received.push(...result.receipts.map((receipt) => receipt.request_id));
+			if (page === 0 && onFirstPage) onFirstPage();
+			if (result.receipts.length === 0) return received;
+			assert.match(result.next_since, /^rcpt3\./);
+			cursor = result.next_since;
+		}
+		throw new Error("receipt paging did not finish");
+	}
+
+	for (const oldPosition of ["1", "2", "4"]) {
+		const oldRcpt2 = `rcpt2.${btoa(JSON.stringify({ v: 2, s: oldPosition }))}`;
+		assert.deepEqual(
+			await drain(oldRcpt2),
+			["req-evt-a", "req-evt-b", "req-evt-c", "req-evt-z"],
+			`old rcpt2 position ${oldPosition} must not skip the new epoch prefix`,
+		);
+	}
+	const oldRcpt2 = `rcpt2.${btoa(JSON.stringify({ v: 2, s: "4" }))}`;
+	const withNewIngress = await drain(oldRcpt2, () => {
+		db.sqlite.prepare(
+			"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-0', 'job-rcpt2-upgrade', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-evt-0', '2020-01-01T00:00:00.000Z')",
+		).run();
+	});
+	assert.deepEqual(withNewIngress, ["req-evt-a", "req-evt-b", "req-evt-c", "req-evt-z", "req-evt-0"]);
+});
+
+test("G01/G09 receipt mapping fails closed when incomplete and event mapping rolls back atomically", async () => {
+	const db = new SqliteD1();
+	db.sqlite.prepare(
+		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-safe', 'job-mapping-recovery', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-safe', ?)",
+	).run(NOW);
+	db.sqlite.exec("BEGIN IMMEDIATE");
+	db.sqlite.prepare(
+		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-rollback', 'job-mapping-recovery', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-rollback', ?)",
+	).run(NOW);
+	db.sqlite.exec("ROLLBACK");
+	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_job_events WHERE event_id='evt-rollback'"), 0);
+	assert.equal(db.count("SELECT COUNT(*) AS count FROM research_receipt_event_order WHERE event_id='evt-rollback'"), 0);
+	db.sqlite.prepare("DELETE FROM research_receipt_event_order WHERE event_id='evt-safe'").run();
+	await assert.rejects(
+		() => workflow.listResearchJobReceipts(db, { limit: 1, now: NOW }),
+		(error) => error?.error_code === "STORE_UNAVAILABLE",
+		"an incomplete recovered mapping must never silently omit an event",
+	);
+	db.sqlite.prepare(
+		"INSERT INTO research_receipt_event_order (event_id, epoch, receipt_sequence) VALUES ('evt-safe', 'receipt-order-v3-2026-09-15', 1)",
+	).run();
+	const recovered = await workflow.listResearchJobReceipts(db, { limit: 1, now: NOW });
+	assert.deepEqual(recovered.receipts.map((receipt) => receipt.request_id), ["req-safe"]);
+});
+
+test("G09 rcpt3 keeps a 64-bit decimal sequence lossless and all legacy cursors replay from zero", async () => {
 	const db = new SqliteD1();
 	db.sqlite.prepare(
 		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at) VALUES ('evt-early', 'job-legacy', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-early', '2020-01-01T00:00:00.000Z')",
@@ -256,16 +369,35 @@ test("G09 rcpt2 keeps a 64-bit decimal sequence lossless and legacy cursors repl
 	db.sqlite.prepare(
 		"INSERT INTO research_job_events (event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, ingress_sequence) VALUES ('evt-u64', 'job-legacy', 'CLAIMED', 'synthetic', NULL, NULL, '{}', 'req-u64', ?, '9007199254740993')",
 	).run(NOW);
+	db.sqlite.prepare(
+		"UPDATE research_receipt_event_order SET receipt_sequence='9007199254740993' WHERE event_id='evt-u64'",
+	).run();
+	db.sqlite.prepare(
+		"UPDATE research_receipt_order_state SET next_sequence='9007199254740994' WHERE epoch='receipt-order-v3-2026-09-15'",
+	).run();
 	const timestampUpgrade = await workflow.listResearchJobReceipts(db, { since: NOW, limit: 10, now: NOW });
 	assert.deepEqual(timestampUpgrade.receipts.map((receipt) => receipt.request_id), ["req-early", "req-u64"]);
 	const v1 = `rcpt1.${btoa(JSON.stringify({ v: 1, t: NOW, e: "evt-u64" }))}`;
 	const v1Upgrade = await workflow.listResearchJobReceipts(db, { since: v1, limit: 10, now: NOW });
 	assert.deepEqual(v1Upgrade.receipts.map((receipt) => receipt.request_id), ["req-early", "req-u64"]);
-	const cursor = JSON.parse(atob(timestampUpgrade.next_since.slice("rcpt2.".length)));
+	const oldRcpt2 = `rcpt2.${btoa(JSON.stringify({ v: 2, s: "9007199254740993" }))}`;
+	const v2Upgrade = await workflow.listResearchJobReceipts(db, { since: oldRcpt2, limit: 10, now: NOW });
+	assert.deepEqual(v2Upgrade.receipts.map((receipt) => receipt.request_id), ["req-early", "req-u64"]);
+	const cursor = JSON.parse(atob(timestampUpgrade.next_since.slice("rcpt3.".length)));
+	assert.equal(cursor.v, 3);
+	assert.equal(cursor.e, "receipt-order-v3-2026-09-15");
 	assert.equal(typeof cursor.s, "string");
 	assert.equal(cursor.s, "9007199254740993");
 	const empty = await workflow.listResearchJobReceipts(db, { since: timestampUpgrade.next_since, limit: 10, now: NOW });
 	assert.deepEqual(empty.receipts, []);
+	const epochZero = `rcpt3.${btoa(JSON.stringify({ v: 3, e: "receipt-order-v3-2026-09-15", s: "0" }))}`;
+	const zeroPage = await workflow.listResearchJobReceipts(db, { since: epochZero, limit: 10, now: NOW });
+	assert.deepEqual(zeroPage.receipts.map((receipt) => receipt.request_id), ["req-early", "req-u64"]);
+	const unknownEpoch = `rcpt3.${btoa(JSON.stringify({ v: 3, e: "forged", s: "1" }))}`;
+	await assert.rejects(
+		() => workflow.listResearchJobReceipts(db, { since: unknownEpoch, limit: 1, now: NOW }),
+		(error) => error?.error_code === "INTEGRITY_FAILED",
+	);
 });
 
 test("G07/G08 trigger-sensitive D1 change counts do not turn committed claim or submit into errors", async () => {

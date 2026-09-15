@@ -44,7 +44,11 @@ export const RESEARCH_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9:_-]{8,128}$/;
 /** §5.4 receipts page ceiling. */
 export const RECEIPTS_MAX_LIMIT = 500;
 export const RECEIPTS_SCHEMA_VERSION = "collector-receipts-v1";
-const RECEIPT_CURSOR_VERSION = "rcpt1";
+const RECEIPT_CURSOR_V1 = "rcpt1";
+const RECEIPT_CURSOR_V2 = "rcpt2";
+const RECEIPT_CURSOR_V3 = "rcpt3";
+/** Persistent migration epoch from 0007; never derive this at request time. */
+const RECEIPT_ORDER_EPOCH = "receipt-order-v3-2026-09-15";
 
 /** §5.6 domain reason closed sets. */
 export const CLAIM_REASONS = ["NOT_FOUND", "TERMINAL", "DEFERRED"] as const;
@@ -181,7 +185,7 @@ export type ResearchReceiptsPage = {
 	receipts: ResearchReceiptItem[];
 };
 
-type ReceiptCursor = { ingressSequence: string };
+type ReceiptCursor = { receiptSequence: string };
 
 type DeferralRow = {
 	job_id: string;
@@ -190,13 +194,16 @@ type DeferralRow = {
 	payload_sha256: string | null;
 };
 
-const MAX_D1_INGRESS_SEQUENCE = 9_223_372_036_854_775_807n;
+const MAX_D1_RECEIPT_SEQUENCE = 9_223_372_036_854_775_807n;
 
-/** Lossless decimal encoding for D1's signed 64-bit ingress sequence. */
-function ingressSequenceText(value: unknown): string {
-	if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value)) fail("INTEGRITY_FAILED");
+/** Lossless canonical decimal encoding for a D1 signed 64-bit sequence. */
+function receiptSequenceText(value: unknown, allowZero = false): string {
+	if (
+		typeof value !== "string" ||
+		!(allowZero ? /^(?:0|[1-9][0-9]{0,18})$/ : /^[1-9][0-9]{0,18}$/).test(value)
+	) fail("INTEGRITY_FAILED");
 	try {
-		if (BigInt(value) > MAX_D1_INGRESS_SEQUENCE) fail("INTEGRITY_FAILED");
+		if (BigInt(value) > MAX_D1_RECEIPT_SEQUENCE) fail("INTEGRITY_FAILED");
 		return value;
 	} catch (error) {
 		if (error instanceof ResearchBoundaryError) throw error;
@@ -204,44 +211,63 @@ function ingressSequenceText(value: unknown): string {
 	}
 }
 
-/** Versioned opaque cursor for D1's strictly increasing ingress sequence. */
-function encodeReceiptCursor(ingressSequence: string): string {
-	return `rcpt2.${btoa(JSON.stringify({ v: 2, s: ingressSequence }))}`;
+/** Versioned opaque cursor for 0007's durable receipt ordering epoch. */
+function encodeReceiptCursor(receiptSequence: string): string {
+	return `${RECEIPT_CURSOR_V3}.${btoa(JSON.stringify({ v: 3, e: RECEIPT_ORDER_EPOCH, s: receiptSequence }))}`;
 }
 
 function decodeReceiptCursor(value: string | null | undefined): ReceiptCursor | null {
 	if (value === undefined || value === null || value === "") return null;
-	if (value.startsWith("rcpt2.")) {
+	if (value.startsWith(`${RECEIPT_CURSOR_V3}.`)) {
 		try {
-			const parsed = JSON.parse(atob(value.slice("rcpt2.".length)));
+			const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_V3.length + 1)));
 			const sequence = isRecord(parsed) ? parsed.s : null;
-			if (parsed === null || !isRecord(parsed) || parsed.v !== 2) {
+			if (
+				parsed === null ||
+				!isRecord(parsed) ||
+				parsed.v !== 3 ||
+				parsed.e !== RECEIPT_ORDER_EPOCH
+			) {
 				fail("INTEGRITY_FAILED");
 			}
-			return { ingressSequence: ingressSequenceText(sequence) };
+			return { receiptSequence: receiptSequenceText(sequence, true) };
 		} catch (error) {
 			if (error instanceof ResearchBoundaryError) throw error;
 			fail("INTEGRITY_FAILED");
 		}
 	}
-	if (value.startsWith(`${RECEIPT_CURSOR_VERSION}.`)) {
-		// v1 used (created_at,event_id). It cannot safely order later writes,
-		// so validate its timestamp but replay the complete event log from zero.
+	if (value.startsWith(`${RECEIPT_CURSOR_V2}.`)) {
+		// rcpt2 belongs to 0006's old mapping. Never translate its position:
+		// every issued rcpt2 replays the new epoch once from sequence zero.
 		try {
-			const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_VERSION.length + 1)));
+			const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_V2.length + 1)));
+			const sequence = isRecord(parsed) ? parsed.s : null;
+			if (parsed === null || !isRecord(parsed) || parsed.v !== 2) fail("INTEGRITY_FAILED");
+			receiptSequenceText(sequence);
+			return { receiptSequence: "0" };
+		} catch (error) {
+			if (error instanceof ResearchBoundaryError) throw error;
+			fail("INTEGRITY_FAILED");
+		}
+	}
+	if (value.startsWith(`${RECEIPT_CURSOR_V1}.`)) {
+		// v1 used (created_at,event_id). Validate it but replay the new epoch
+		// from zero so no prior omission becomes permanent.
+		try {
+			const parsed = JSON.parse(atob(value.slice(RECEIPT_CURSOR_V1.length + 1)));
 			if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.t !== "string") fail("INTEGRITY_FAILED");
 			normalizedIso(parsed.t, "cursor");
-			return { ingressSequence: "0" };
+			return { receiptSequence: "0" };
 		} catch (error) {
 			if (error instanceof ResearchBoundaryError) throw error;
 			fail("INTEGRITY_FAILED");
 		}
 	}
 	if (!value.startsWith("rcpt")) {
-		// Timestamp-only callers must also recover from sequence zero; retaining
-		// a timestamp predicate can preserve a prior silent omission forever.
+		// Timestamp-only callers also begin at sequence zero; receipt_id is the
+		// stable consumer-side dedupe key for this bounded compatibility replay.
 		normalizedIso(value, "since");
-		return { ingressSequence: "0" };
+		return { receiptSequence: "0" };
 	}
 	fail("INTEGRITY_FAILED");
 }
@@ -1193,10 +1219,10 @@ export async function deferResearchJob(
 
 /**
  * §5.4 receipts: append-only event stream projected into the fixed
- * collector-receipts-v1 whitelist.  New rcpt2 cursors advance over the D1
- * ingress sequence, never client time or random event ids.  v1/timestamp
- * callers replay a closed timestamp window once and receive rcpt2; the
- * RESEARCH mirror's stable receipt dedupe absorbs that overlap.
+ * collector-receipts-v1 whitelist. rcpt3 pages advance only over migration
+ * 0007's persisted event mapping, never client time, random event ids, or
+ * 0006's pre-correction ingress sequence. Legacy cursors replay this epoch
+ * once from zero; RESEARCH deduplicates that bounded overlap by receipt id.
  */
 export async function listResearchJobReceipts(
 	db: ResearchWorkflowDatabase,
@@ -1206,17 +1232,33 @@ export async function listResearchJobReceipts(
 	const limit = input.limit ?? RECEIPTS_MAX_LIMIT;
 	if (!Number.isInteger(limit) || limit < 1 || limit > RECEIPTS_MAX_LIMIT) fail("INTEGRITY_FAILED");
 	const cursor = decodeReceiptCursor(input.since);
+	try {
+		const mappingIntegrity = await db
+			.prepare(
+				"SELECT (SELECT COUNT(*) FROM research_job_events AS event LEFT JOIN research_receipt_event_order AS receipt_order ON receipt_order.event_id=event.event_id AND receipt_order.epoch=? WHERE receipt_order.event_id IS NULL) AS missing, (SELECT COUNT(*) FROM research_receipt_event_order AS receipt_order LEFT JOIN research_job_events AS event ON event.event_id=receipt_order.event_id WHERE receipt_order.epoch=? AND event.event_id IS NULL) AS orphaned",
+			)
+			.bind(RECEIPT_ORDER_EPOCH, RECEIPT_ORDER_EPOCH)
+			.first<{ missing: number; orphaned: number }>();
+		if (
+			!mappingIntegrity ||
+			Number(mappingIntegrity.missing) !== 0 ||
+			Number(mappingIntegrity.orphaned) !== 0
+		) fail("STORE_UNAVAILABLE");
+	} catch (error) {
+		if (error instanceof ResearchBoundaryError) throw error;
+		fail("STORE_UNAVAILABLE");
+	}
 	const statement = cursor
 		? db
 				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, CAST(ingress_sequence AS TEXT) AS ingress_sequence FROM research_job_events WHERE research_job_events.ingress_sequence > CAST(? AS INTEGER) ORDER BY research_job_events.ingress_sequence ASC LIMIT ?",
+					"SELECT event.event_id, event.job_id, event.event_type, event.actor, event.proposal_id, event.origin, event.detail_json, event.request_id, event.created_at, CAST(receipt_order.receipt_sequence AS TEXT) AS receipt_sequence FROM research_receipt_event_order AS receipt_order JOIN research_job_events AS event ON event.event_id=receipt_order.event_id WHERE receipt_order.epoch=? AND receipt_order.receipt_sequence > CAST(? AS INTEGER) ORDER BY receipt_order.receipt_sequence ASC LIMIT ?",
 				)
-				.bind(cursor.ingressSequence, limit)
+				.bind(RECEIPT_ORDER_EPOCH, cursor.receiptSequence, limit)
 		: db
 				.prepare(
-					"SELECT event_id, job_id, event_type, actor, proposal_id, origin, detail_json, request_id, created_at, CAST(ingress_sequence AS TEXT) AS ingress_sequence FROM research_job_events ORDER BY research_job_events.ingress_sequence ASC LIMIT ?",
+					"SELECT event.event_id, event.job_id, event.event_type, event.actor, event.proposal_id, event.origin, event.detail_json, event.request_id, event.created_at, CAST(receipt_order.receipt_sequence AS TEXT) AS receipt_sequence FROM research_receipt_event_order AS receipt_order JOIN research_job_events AS event ON event.event_id=receipt_order.event_id WHERE receipt_order.epoch=? ORDER BY receipt_order.receipt_sequence ASC LIMIT ?",
 				)
-				.bind(limit);
+				.bind(RECEIPT_ORDER_EPOCH, limit);
 	let rows: Array<{
 		event_id: string;
 		job_id: string;
@@ -1227,7 +1269,7 @@ export async function listResearchJobReceipts(
 		detail_json: string;
 		request_id: string;
 		created_at: string;
-		ingress_sequence: string;
+		receipt_sequence: string;
 	}>;
 	try {
 		rows = (await statement.all<{
@@ -1240,7 +1282,7 @@ export async function listResearchJobReceipts(
 			detail_json: string;
 			request_id: string;
 			created_at: string;
-			ingress_sequence: string;
+			receipt_sequence: string;
 		}>()).results ?? [];
 	} catch {
 		fail("STORE_UNAVAILABLE");
@@ -1267,7 +1309,7 @@ export async function listResearchJobReceipts(
 		});
 	}
 	const nextSince = rows.length > 0
-		? encodeReceiptCursor(ingressSequenceText(rows[rows.length - 1].ingress_sequence))
+		? encodeReceiptCursor(receiptSequenceText(rows[rows.length - 1].receipt_sequence))
 		: input.since ?? null;
 	return {
 		schema_version: RECEIPTS_SCHEMA_VERSION,
