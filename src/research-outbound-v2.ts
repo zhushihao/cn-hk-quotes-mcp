@@ -1,10 +1,32 @@
 /**
- * Consumer-side contract for the immutable RIWS `collector-outbound-v2`
- * stream.  This module intentionally owns validation only: it has no access
- * to Research SQLite, local paths, LIVE, QMT, or any write-plane operation.
+ * Consumer-side contract for the immutable RIWS `collector-outbound-v2` and
+ * `collector-outbound-v3` streams.  This module intentionally owns validation
+ * only: it has no access to Research SQLite, local paths, LIVE, QMT, or any
+ * write-plane operation.
+ *
+ * v3 = v2 + two frozen increments (2026-09-15 research-backend design §5.1):
+ *   1. record_type "source_health" (ten-field exact whitelist, record key =
+ *      source_id, latest-state projection, no float fields);
+ *   2. job payload gains "trigger_evidence_ids" (string array).
+ * v2 keeps its original byte-frozen semantics inside the compatibility
+ * window; a v2 envelope carrying source_health is UNSUPPORTED_OPERATION, and
+ * the v2 job key set rejects trigger_evidence_ids via exact-keys.
+ * The module file name is kept for history; the version is a constant.
  */
 
 export const OUTBOUND_V2_SCHEMA_VERSION = "collector-outbound-v2";
+export const OUTBOUND_V3_SCHEMA_VERSION = "collector-outbound-v3";
+export const OUTBOUND_V4_SCHEMA_VERSION = "collector-outbound-v4";
+
+/** Ingest compatibility window: both generations are accepted (§5.1). */
+export const ACCEPTED_OUTBOUND_SCHEMA_VERSIONS = new Set([
+	OUTBOUND_V2_SCHEMA_VERSION,
+	OUTBOUND_V3_SCHEMA_VERSION,
+	OUTBOUND_V4_SCHEMA_VERSION,
+]);
+
+/** Producer-side current schema version (RESEARCH outbound.py mirrors this). */
+export const OUTBOUND_SCHEMA_VERSION = OUTBOUND_V4_SCHEMA_VERSION;
 
 const RECORD_TYPES = new Set([
 	"source",
@@ -14,6 +36,37 @@ const RECORD_TYPES = new Set([
 	"accumulator",
 	"job",
 	"object",
+]);
+
+/** v3-only record type (§A6). Bucketed per schema version in validate. */
+const V3_RECORD_TYPES = new Set(["source_health"]);
+
+const SOURCE_HEALTH_OUTCOMES = new Set([
+	"OK",
+	"NO_NEW_CONTENT",
+	"PARTIAL",
+	"BLOCKED",
+	"AUTH_REQUIRED",
+	"RATE_LIMITED",
+	"UNAVAILABLE",
+	"UNSUPPORTED",
+]);
+
+const SOURCE_HEALTH_FAILURE_CLASSES = new Set([
+	"HTTP_401",
+	"HTTP_403",
+	"HTTP_429",
+	"CAPTCHA",
+	"LOGIN_EXPIRED",
+	"ROBOTS_TOS",
+	"TLS",
+	"TIMEOUT",
+	"DNS",
+	"CONNECT",
+	"HTTP_5XX",
+	"HTTP_404_ROUTE_MISSING",
+	"UNSUPPORTED_MEDIA",
+	"TRUNCATED",
 ]);
 const VISIBILITIES = new Set(["PUBLIC", "PRIVATE"]);
 const ERROR_CODES = new Set([
@@ -62,6 +115,49 @@ const ENVELOPE_KEYS = [
 	"generated_at",
 ];
 
+const SOURCE_HEALTH_KEYS = [
+	// §A6 ten-field whitelist (review-passed): transport-level provider health
+	// only. No detail/metadata_json opaque strings, no float fields, record
+	// key = source_id (latest-state projection; re-send overwrites).
+	"source_id",
+	"provider",
+	"checked_at",
+	"reachable",
+	"outcome",
+	"failure_class",
+	"consecutive_failures",
+	"last_success_at",
+	"last_error_code",
+	"visibility",
+];
+
+/** v2 job payload (frozen; exact-keys rejects trigger_evidence_ids here). */
+const JOB_V2_KEYS = [
+	"job_id",
+	"dedupe_key",
+	"status",
+	"priority",
+	"theme",
+	"company",
+	"question",
+	"missing_dimensions_json",
+	"counter_evidence_request",
+	"accumulator_snapshot_id",
+	"coverage_gap_json",
+	"priority_reason",
+	"deadline",
+	"recheck_at",
+	"budget_hint",
+	"historical_backfill",
+	"created_at",
+	"updated_at",
+	"policy_version",
+	"visibility",
+];
+
+/** v3 job payload adds structured trigger evidence ids (§5.1 increment 2). */
+const JOB_V3_KEYS = [...JOB_V2_KEYS, "trigger_evidence_ids"];
+
 const PAYLOAD_KEYS: Record<string, readonly string[]> = {
 	source: [
 		"source_id",
@@ -102,28 +198,7 @@ const PAYLOAD_KEYS: Record<string, readonly string[]> = {
 		"created_at",
 		"visibility",
 	],
-	job: [
-		"job_id",
-		"dedupe_key",
-		"status",
-		"priority",
-		"theme",
-		"company",
-		"question",
-		"missing_dimensions_json",
-		"counter_evidence_request",
-		"accumulator_snapshot_id",
-		"coverage_gap_json",
-		"priority_reason",
-		"deadline",
-		"recheck_at",
-		"budget_hint",
-		"historical_backfill",
-		"created_at",
-		"updated_at",
-		"policy_version",
-		"visibility",
-	],
+	job: JOB_V3_KEYS,
 	object: [
 		"object_id",
 		"content_sha256",
@@ -209,6 +284,23 @@ const EVIDENCE_KEYS = [
 	"independence_status",
 	"historical_backfill",
 	"claim",
+];
+const EVIDENCE_V4_KEYS = [
+	...EVIDENCE_KEYS,
+	"source_reference",
+	"event_time",
+	"published_at",
+	"first_seen_at",
+	"ingested_at",
+];
+const SOURCE_REFERENCE_KEYS = [
+	"document_id",
+	"document_version_id",
+	"attachment_id",
+	"content_sha256",
+	"byte_start",
+	"byte_end",
+	"span_sha256",
 ];
 const CLAIM_KEYS = [
 	"subject",
@@ -300,6 +392,11 @@ function hexField(value: unknown): string {
 	return text;
 }
 
+function nullableIsoField(value: unknown): void {
+	if (value === null) return;
+	if (typeof value !== "string" || Number.isNaN(Date.parse(value))) fail("INTEGRITY_FAILED");
+}
+
 /** Reject a payload that would expose hidden body, credentials, or local paths. */
 export function assertOutboundV2PayloadSafe(value: unknown): void {
 	if (Array.isArray(value)) {
@@ -381,6 +478,8 @@ export function outboundV2RecordKey(record: OutboundV2Record): string {
 			return stringField(payload.snapshot_id);
 		case "job":
 			return stringField(payload.job_id);
+		case "source_health":
+			return stringField(payload.source_id);
 		default:
 			return fail("UNSUPPORTED_OPERATION");
 	}
@@ -400,6 +499,45 @@ export async function computeOutboundV2MessageId(record: OutboundV2Record): Prom
 		canonicalJson(material),
 	].join("\x1f");
 	return `outbound_${(await sha256Hex(input)).slice(0, 40)}`;
+}
+
+/**
+ * §A6 source_health payload: ten-field exact whitelist, closed-set enums,
+ * and a hard no-float rule (canonical JSON `.0` path-table maintenance stays
+ * out of scope for this record type by design).
+ */
+function validateSourceHealthPayload(payload: Record<string, unknown>): void {
+	exactKeys(payload, SOURCE_HEALTH_KEYS);
+	stringField(payload.source_id);
+	stringField(payload.provider);
+	stringField(payload.checked_at);
+	if (typeof payload.reachable !== "boolean") fail("INTEGRITY_FAILED");
+	if (typeof payload.outcome !== "string" || !SOURCE_HEALTH_OUTCOMES.has(payload.outcome)) {
+		fail("INTEGRITY_FAILED");
+	}
+	if (
+		payload.failure_class !== null &&
+		(typeof payload.failure_class !== "string" ||
+			!SOURCE_HEALTH_FAILURE_CLASSES.has(payload.failure_class))
+	) {
+		fail("INTEGRITY_FAILED");
+	}
+	if (
+		typeof payload.consecutive_failures !== "number" ||
+		!Number.isInteger(payload.consecutive_failures) ||
+		payload.consecutive_failures < 0
+	) {
+		fail("INTEGRITY_FAILED");
+	}
+	if (payload.last_success_at !== null && typeof payload.last_success_at !== "string") {
+		fail("INTEGRITY_FAILED");
+	}
+	if (
+		payload.last_error_code !== null &&
+		(typeof payload.last_error_code !== "string" || !payload.last_error_code)
+	) {
+		fail("INTEGRITY_FAILED");
+	}
 }
 
 function validateNestedPayload(record: OutboundV2Record): void {
@@ -423,9 +561,34 @@ function validateNestedPayload(record: OutboundV2Record): void {
 		return;
 	}
 	if (record.record_type === "evidence") {
-		exactKeys(payload, EVIDENCE_KEYS);
+		const v4 = record.schema_version === OUTBOUND_V4_SCHEMA_VERSION;
+		exactKeys(payload, v4 ? EVIDENCE_V4_KEYS : EVIDENCE_KEYS);
 		if (!isRecord(payload.claim)) fail("INTEGRITY_FAILED");
 		exactKeys(payload.claim, CLAIM_KEYS);
+		if (v4) {
+			if (!isRecord(payload.source_reference)) fail("INTEGRITY_FAILED");
+			const reference = payload.source_reference;
+			exactKeys(reference, SOURCE_REFERENCE_KEYS);
+			stringField(reference.document_id);
+			stringField(reference.document_version_id);
+			if (reference.attachment_id !== null && typeof reference.attachment_id !== "string")
+				fail("INTEGRITY_FAILED");
+			hexField(reference.content_sha256);
+			if (
+				typeof reference.byte_start !== "number" ||
+				typeof reference.byte_end !== "number" ||
+				!Number.isInteger(reference.byte_start) ||
+				!Number.isInteger(reference.byte_end) ||
+				reference.byte_start < 0 ||
+				reference.byte_end <= reference.byte_start
+			)
+				fail("INTEGRITY_FAILED");
+			hexField(reference.span_sha256);
+			nullableIsoField(payload.event_time);
+			nullableIsoField(payload.published_at);
+			nullableIsoField(payload.first_seen_at);
+			nullableIsoField(payload.ingested_at);
+		}
 	}
 	if (record.record_type === "accumulator") {
 		exactKeys(payload, PAYLOAD_KEYS.accumulator);
@@ -433,8 +596,20 @@ function validateNestedPayload(record: OutboundV2Record): void {
 		exactKeys(payload.dimensions, ["D", "S", "M", "E", "P", "C"]);
 	}
 	if (record.record_type === "job") {
-		exactKeys(payload, PAYLOAD_KEYS.job);
+		// Version-bucketed exact-keys: v2 jobs stay byte-frozen without
+		// trigger_evidence_ids; only v3 jobs may carry it (§5.1).
+		exactKeys(payload, record.schema_version === OUTBOUND_V2_SCHEMA_VERSION ? JOB_V2_KEYS : JOB_V3_KEYS);
 		if (payload.status !== "QUEUED") fail("FILTERED");
+		if (record.schema_version !== OUTBOUND_V2_SCHEMA_VERSION) {
+			const triggerEvidenceIds = payload.trigger_evidence_ids;
+			if (!Array.isArray(triggerEvidenceIds)) fail("INTEGRITY_FAILED");
+			for (const id of triggerEvidenceIds) {
+				if (typeof id !== "string" || !id) fail("INTEGRITY_FAILED");
+			}
+		}
+	}
+	if (record.record_type === "source_health") {
+		validateSourceHealthPayload(payload);
 	}
 	if (record.record_type === "object") {
 		exactKeys(payload, PAYLOAD_KEYS.object);
@@ -467,10 +642,21 @@ function validateNestedPayload(record: OutboundV2Record): void {
 export function validateOutboundV2Record(value: unknown): OutboundV2Record {
 	if (!isRecord(value)) fail("INTEGRITY_FAILED");
 	exactKeys(value, ENVELOPE_KEYS);
-	if (value.schema_version !== OUTBOUND_V2_SCHEMA_VERSION) fail("UNSUPPORTED_OPERATION");
-	if (typeof value.record_type !== "string" || !RECORD_TYPES.has(value.record_type)) {
+	// Compatibility window (§5.1): accept both frozen generations.
+	if (
+		typeof value.schema_version !== "string" ||
+		!ACCEPTED_OUTBOUND_SCHEMA_VERSIONS.has(value.schema_version)
+	) {
 		fail("UNSUPPORTED_OPERATION");
 	}
+	const schemaVersion = value.schema_version;
+	// Record types are bucketed per schema version: source_health is v3-only,
+	// so a v2 envelope carrying it is rejected as UNSUPPORTED_OPERATION.
+	const recordTypeAllowed =
+		typeof value.record_type === "string" &&
+		(RECORD_TYPES.has(value.record_type) ||
+			(schemaVersion !== OUTBOUND_V2_SCHEMA_VERSION && V3_RECORD_TYPES.has(value.record_type)));
+	if (!recordTypeAllowed) fail("UNSUPPORTED_OPERATION");
 	if (!/^outbound_[0-9a-f]{40}$/.test(stringField(value.message_id))) fail("INTEGRITY_FAILED");
 	stringField(value.policy_version);
 	if (value.generated_at !== null && typeof value.generated_at !== "string")
@@ -479,7 +665,7 @@ export function validateOutboundV2Record(value: unknown): OutboundV2Record {
 	const record: OutboundV2Record = {
 		record_type: stringField(value.record_type),
 		message_id: stringField(value.message_id),
-		schema_version: value.schema_version,
+		schema_version: schemaVersion,
 		policy_version: stringField(value.policy_version),
 		visibility: visibilityField(value.visibility),
 		payload: value.payload,

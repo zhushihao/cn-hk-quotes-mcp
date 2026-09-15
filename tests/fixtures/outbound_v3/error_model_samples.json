@@ -1,0 +1,42 @@
+{
+  "expectation": "each sample carries exactly the four frozen fields; safe_message is static and free of paths, stacks and provider detail",
+  "sample_kind": "error_model_samples",
+  "samples": [
+    {
+      "error_code": "NOT_FOUND",
+      "request_id": "5f1a2b3c4d5e6f708192a3b4c5d6e7f8",
+      "retryable": false,
+      "safe_message": "requested record was not found"
+    },
+    {
+      "error_code": "FILTERED",
+      "request_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "retryable": false,
+      "safe_message": "request filtered by visibility or validation policy"
+    },
+    {
+      "error_code": "STORE_UNAVAILABLE",
+      "request_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "retryable": true,
+      "safe_message": "local store is temporarily unavailable"
+    },
+    {
+      "error_code": "INTEGRITY_FAILED",
+      "request_id": "b2c3d4e5f60718293a4b5c6d7e8f90a1",
+      "retryable": false,
+      "safe_message": "integrity verification failed"
+    },
+    {
+      "error_code": "UNSUPPORTED_OPERATION",
+      "request_id": "c3d4e5f60718293a4b5c6d7e8f90a1b2",
+      "retryable": false,
+      "safe_message": "operation is not supported by this boundary"
+    },
+    {
+      "error_code": "RATE_LIMITED",
+      "request_id": "d4e5f60718293a4b5c6d7e8f90a1b2c3",
+      "retryable": true,
+      "safe_message": "rate limited; retry later"
+    }
+  ]
+}

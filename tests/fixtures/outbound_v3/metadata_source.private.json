@@ -1,0 +1,22 @@
+[
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_5adf390df0d57d8be623ddf2e2730ab1bb951bf5",
+    "payload": {
+      "canonical_base": "private://fixture/private-feed",
+      "check_frequency_seconds": 3600,
+      "last_health_at": "2026-09-13T02:00:00+00:00",
+      "lifecycle": "ACTIVE",
+      "name": "Fixture Source Private",
+      "policy_version": "collector-policy-v1",
+      "provider": "authorized-import",
+      "source_id": "fixture-source-private",
+      "source_kind": "AUTHORIZED_IMPORT",
+      "visibility": "PRIVATE"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "source",
+    "schema_version": "collector-outbound-v3",
+    "visibility": "PRIVATE"
+  }
+]

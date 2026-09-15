@@ -1,0 +1,30 @@
+[
+  {
+    "generated_at": null,
+    "message_id": "outbound_abce176026b69ea4abcf8867ee744ac61f5b74df",
+    "payload": {
+      "byte_size": 64,
+      "chunking": {
+        "chunk_sha256": [
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f",
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f",
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f",
+          "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f"
+        ],
+        "chunk_size": 16,
+        "chunked": true,
+        "total_chunks": 4
+      },
+      "content_sha256": "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e",
+      "encoding": "identity",
+      "manifest_message_id": "outbound_abce176026b69ea4abcf8867ee744ac61f5b74df",
+      "media_type": "text/plain",
+      "object_id": "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e",
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "object",
+    "schema_version": "collector-outbound-v3",
+    "visibility": "PUBLIC"
+  }
+]

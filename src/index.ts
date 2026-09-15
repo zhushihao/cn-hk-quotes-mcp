@@ -36,6 +36,18 @@ import {
 } from "./portfolio-status";
 import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
 import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
+import {
+	FORWARDED_SCOPES_HEADER,
+	RESEARCH_CLAIM_SCOPE,
+	RESEARCH_SUBMIT_SCOPE,
+	resolveResearchScopes,
+} from "./research-scopes.ts";
+import {
+	RESEARCH_PRODUCTION_PRINCIPAL,
+	claimResearchJob,
+	listResearchJobReceipts,
+	submitResearchResultProposal,
+} from "./research-workflow.ts";
 import { ingestResearchReplicaRecord, type ResearchReplicaStorage } from "./research-replica.ts";
 import { CollectorResearchRemoteAdapter } from "./research-remote-adapter.ts";
 import { ResearchBoundaryError } from "./research-outbound-v2.ts";
@@ -65,7 +77,16 @@ interface Env {
 	RESEARCH_REPLICA?: D1Database;
 	RESEARCH_OBJECTS?: R2Bucket;
 	RESEARCH_REPLICA_INGEST_TOKEN?: string;
+	/** receipts 只读端点独立 token；与 ingest token 刻意分离（独立轮转/爆炸半径）。 */
+	RESEARCH_REPLICA_RECEIPTS_TOKEN?: string;
 }
+
+/**
+ * §A8 ingest 请求体尺寸门（2 MiB）：覆盖 1 MiB chunk 的 base64 形态
+ * （≈1.4 MB）+ record 开销。Content-Length 预检 + 读体后 byteLength
+ * 实测双道；超限 → 413 + RATE_LIMITED 信封。
+ */
+export const RESEARCH_INGEST_MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 type BridgePayload = {
 	schema_version: "1.0";
@@ -635,8 +656,14 @@ export async function updateQuoteBridge(
  *
  * `liveOverlayStatus` 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：
  * 只有 `fetch()` 路由把请求头判定结果显式传进来时才可能应用 LIVE 叠加。
+ * `researchScopes` 由 `fetch()` 按 §A4 解析（凭据逐字节匹配 + 转发头 ∩ 配置
+ * 上限），写工具各查各的 scope，无任何蕴含关系。
  */
-function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED") {
+export function createServer(
+	env?: Env,
+	liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED",
+	researchScopes: ReadonlySet<string> = new Set(),
+) {
 	const server = new McpServer({
 		name: "QuantPro Collector",
 		version: "1.1.0",
@@ -828,12 +855,19 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 	// They do not share market/LIVE authorization, and the default research
 	// scope is PUBLIC.  PRIVATE remains unavailable until a separate future
 	// research-read scope is wired; it never falls through from this surface.
+	// 写面（claim/submit）各由独立 research scope 门控（§A4）；scope 缺失 →
+	// isError + FILTERED 信封 + 服务端结构化日志（request_id + 主体）。
 	const researchAdapter = () => {
 		const storage = env ? researchReplicaStorage(env) : null;
 		if (!storage) throw new ResearchBoundaryError("STORE_UNAVAILABLE");
 		return new CollectorResearchRemoteAdapter(storage, { visibility: "PUBLIC" });
 	};
-	const researchRead = async (operation: () => Promise<unknown>) => {
+	const researchWorkflowDb = () => {
+		const storage = env ? researchReplicaStorage(env) : null;
+		if (!storage) throw new ResearchBoundaryError("STORE_UNAVAILABLE");
+		return storage.db;
+	};
+	const researchDomain = async (operation: () => Promise<unknown>) => {
 		try {
 			return {
 				content: [
@@ -851,22 +885,29 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 			};
 		}
 	};
-	const unsupportedResearchRead = () => ({
-		isError: true,
-		content: [
-			{
-				type: "text" as const,
-				text: JSON.stringify(
-					{
-						status: "UNSUPPORTED",
-						...new ResearchBoundaryError("UNSUPPORTED_OPERATION").asError(),
-					},
-					null,
-					2,
-				),
-			},
-		],
-	});
+	const researchRead = researchDomain;
+	const callerPrincipal = (environment: Env | undefined): string =>
+		environment?.COLLECTOR_MCP_CLIENT_ID?.trim() || RESEARCH_PRODUCTION_PRINCIPAL;
+	const requireResearchScope = (scope: string, tool: string) => {
+		if (researchScopes.has(scope)) return null;
+		const safe = new ResearchBoundaryError("FILTERED").asError();
+		// 结构化审计日志：仅 request_id 与主体名，绝无 token / claim_token。
+		console.log(
+			JSON.stringify({
+				event: "research_tool_scope_denied",
+				timestamp: new Date().toISOString(),
+				tool,
+				required_scope: scope,
+				granted_scopes: [...researchScopes].sort(),
+				principal: callerPrincipal(env),
+				request_id: safe.request_id,
+			}),
+		);
+		return {
+			isError: true as const,
+			content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }],
+		};
+	};
 
 	server.registerTool(
 		"search_documents",
@@ -933,27 +974,96 @@ function createServer(env?: Env, liveOverlayStatus: LiveOverlayStatus = "SKIPPED
 	server.registerTool(
 		"get_source_health",
 		{
-			description:
-				"读取 Research source health；当前 replica 未复制该能力时明确返回 UNSUPPORTED。",
-			inputSchema: z.object({}),
+			description: "读取 Research source health（outbound-v3 source_health 记录投影，实读 replica）。",
+			inputSchema: z.object({
+				limit: z.number().int().min(1).max(100).optional(),
+			}),
 		},
-		async () => unsupportedResearchRead(),
+		async ({ limit }) => researchRead(() => researchAdapter().getSourceHealth(limit)),
+	);
+	server.registerTool(
+		"get_market_signal_state",
+		{
+			description:
+				"读取市场信号状态（market: 命名空间 accumulator 投影）。无生产者时如实返回 NO_DATA（MARKET_DETECTOR_NOT_DEPLOYED），不报错也不伪造数据。",
+			inputSchema: z.object({ subject_key: z.string().min(1).max(128) }),
+		},
+		async ({ subject_key }) =>
+			researchRead(() => researchAdapter().getMarketSignalState(subject_key)),
 	);
 	server.registerTool(
 		"list_research_jobs",
 		{
-			description: "列出 Collector replica 中的 PUBLIC QUEUED Research Job。",
-			inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+			description:
+				"列出 Collector replica 中的 PUBLIC Research Job，附服务端状态推导 server_state（terminal > 未过期 lease > record）。claimable_only=true 时仅返回 effective_status=QUEUED 的任务。",
+			inputSchema: z.object({
+				limit: z.number().int().min(1).max(100).optional(),
+				claimable_only: z.boolean().optional(),
+			}),
 		},
-		async ({ limit }) => researchRead(() => researchAdapter().listResearchJobs(limit)),
+		async ({ limit, claimable_only }) =>
+			researchRead(() =>
+				researchAdapter().listResearchJobs(limit, { claimableOnly: claimable_only }),
+			),
 	);
 	server.registerTool(
 		"get_research_job_context",
 		{
-			description: "读取 Collector replica 中指定 PUBLIC QUEUED Research Job 的上下文。",
+			description:
+				"读取 Collector replica 中指定 PUBLIC Research Job 的上下文：job record（含触发证据）+ server_state + 提交历史 proposals。claim_token 永不出现在本面。",
 			inputSchema: z.object({ job_id: z.string().min(1) }),
 		},
 		async ({ job_id }) => researchRead(() => researchAdapter().getResearchJobContext(job_id)),
+	);
+	server.registerTool(
+		"claim_research_job",
+		{
+			description:
+				"认领一个 PUBLIC QUEUED Research Job（服务端固定租约 3600 秒，原子抢占；同主体重复认领幂等返回原租约）。需要 research:claim scope。",
+			inputSchema: z.object({ job_id: z.string().min(1) }),
+		},
+		async ({ job_id }) => {
+			const denied = requireResearchScope(RESEARCH_CLAIM_SCOPE, "claim_research_job");
+			if (denied) return denied;
+			return researchRead(async () =>
+				claimResearchJob(researchWorkflowDb(), {
+					jobId: job_id,
+					leaseOwner: callerPrincipal(env),
+					requestId: crypto.randomUUID().replaceAll("-", ""),
+					now: new Date().toISOString(),
+				}),
+			);
+		},
+	);
+	server.registerTool(
+		"submit_research_result_proposal",
+		{
+			description:
+				"提交研究结果 proposal。正式（CHATGPT）提交被接受即 Job 终态 COMPLETED；非生产主体的 CHATGPT 声明一律降级为 SYNTHETIC 隔离存储（不完成 Job）。需要 research:submit scope。",
+			inputSchema: z.object({
+				job_id: z.string().min(1),
+				claim_token: z.string().min(1),
+				idempotency_key: z.string().min(1),
+				origin: z.enum(["CHATGPT", "SYNTHETIC", "REPLAY"]).optional(),
+				proposal: z.record(z.string(), z.unknown()),
+			}),
+		},
+		async ({ job_id, claim_token, idempotency_key, origin, proposal }) => {
+			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "submit_research_result_proposal");
+			if (denied) return denied;
+			return researchRead(async () =>
+				submitResearchResultProposal(researchWorkflowDb(), {
+					jobId: job_id,
+					claimToken: claim_token,
+					idempotencyKey: idempotency_key,
+					origin,
+					proposal,
+					callerPrincipal: callerPrincipal(env),
+					requestId: crypto.randomUUID().replaceAll("-", ""),
+					now: new Date().toISOString(),
+				}),
+			);
+		},
 	);
 
 	return server;
@@ -1020,9 +1130,23 @@ async function handleResearchReplicaIngest(request: Request, env: Env): Promise<
 	if (!researchReplicaAuthorized(request, env)) {
 		return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
 	}
+	// §A8 双道尺寸门：Content-Length 预检（缺失/非数值跳过）+ 读体后实测。
+	const contentLength = Number(request.headers.get("Content-Length"));
+	if (Number.isFinite(contentLength) && contentLength > RESEARCH_INGEST_MAX_BODY_BYTES) {
+		return researchBoundaryResponse(new ResearchBoundaryError("RATE_LIMITED"), 413);
+	}
+	let raw: string;
+	try {
+		raw = await request.text();
+	} catch {
+		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > RESEARCH_INGEST_MAX_BODY_BYTES) {
+		return researchBoundaryResponse(new ResearchBoundaryError("RATE_LIMITED"), 413);
+	}
 	let body: unknown;
 	try {
-		body = await request.json();
+		body = JSON.parse(raw);
 	} catch {
 		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
 	}
@@ -1044,6 +1168,52 @@ async function handleResearchReplicaIngest(request: Request, env: Env): Promise<
 				: decodeBase64Chunks(transport.object_chunks_base64);
 		return jsonResponse(
 			await ingestResearchReplicaRecord(storage, transport.record, objectChunks),
+		);
+	} catch (error) {
+		return researchBoundaryResponse(
+			error,
+			error instanceof ResearchBoundaryError && error.retryable ? 503 : 400,
+		);
+	}
+}
+
+/**
+ * §A1 receipts 只读回流端点（内部通道，非 MCP 工具）。与 ingest 刻意使用
+ * 独立 secret（独立轮转、爆炸半径更小）；未配置 → 503 fail-closed，
+ * token 不匹配 → 401 FILTERED。响应为 §5.4 collector-receipts-v1 白名单，
+ * claim_token / proposal 正文 / 客户端原始输入结构上不可能出现。
+ */
+async function handleResearchReplicaReceipts(request: Request, env: Env): Promise<Response> {
+	if (request.method !== "GET") {
+		return researchBoundaryResponse(new ResearchBoundaryError("UNSUPPORTED_OPERATION"), 405);
+	}
+	const storage = researchReplicaStorage(env);
+	if (!storage || !env.RESEARCH_REPLICA_RECEIPTS_TOKEN) {
+		return researchBoundaryResponse(new ResearchBoundaryError("STORE_UNAVAILABLE"), 503);
+	}
+	if (request.headers.get("Authorization") !== `Bearer ${env.RESEARCH_REPLICA_RECEIPTS_TOKEN}`) {
+		return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
+	}
+	const url = new URL(request.url);
+	const since = url.searchParams.get("since");
+	if (since !== null && Number.isNaN(Date.parse(since))) {
+		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	}
+	const limitParam = url.searchParams.get("limit");
+	let limit: number | undefined;
+	if (limitParam !== null) {
+		limit = Number(limitParam);
+		if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+			return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+		}
+	}
+	try {
+		return jsonResponse(
+			await listResearchJobReceipts(storage.db, {
+				since,
+				limit,
+				now: new Date().toISOString(),
+			}),
 		);
 	} catch (error) {
 		return researchBoundaryResponse(
@@ -1414,6 +1584,9 @@ export default {
 		if (url.pathname === "/internal/research-replica/v2/ingest") {
 			return handleResearchReplicaIngest(request, env);
 		}
+		if (url.pathname === "/internal/research-replica/v2/receipts") {
+			return handleResearchReplicaReceipts(request, env);
+		}
 		if (url.pathname === "/api/control-plane-status" && request.method === "GET") {
 			return handleControlPlaneStatus(env);
 		}
@@ -1429,7 +1602,15 @@ export default {
 				...marketReadAuditFields(env, liveOverlayStatus),
 				live_overlay_status: liveOverlayStatus,
 			});
-			return createServer(env, liveOverlayStatus);
+			// §A4 研究写面 scope 解析：凭据逐字节匹配为前提，转发 scope 头 ∩
+			// server 配置上限（该头仅由 OAuth 桥在剥除客户端同名头后设置）。
+			const researchScopes = resolveResearchScopes(
+				ctx.requestInfo?.headers.get("Authorization") ?? null,
+				ctx.requestInfo?.headers.get(FORWARDED_SCOPES_HEADER) ?? null,
+				env.COLLECTOR_MCP_CLIENT_TOKEN,
+				env.COLLECTOR_MCP_CLIENT_SCOPES,
+			);
+			return createServer(env, liveOverlayStatus, researchScopes);
 		});
 		return handler(request, env, ctx);
 	},

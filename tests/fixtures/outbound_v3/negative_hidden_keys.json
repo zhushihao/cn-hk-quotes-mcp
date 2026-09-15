@@ -1,0 +1,55 @@
+{
+  "expectation": "strip_for_outbound(input) == expected; none of the planted keys/values survive",
+  "expected": {
+    "document_id": "doc-fixture-0009",
+    "kept": "KEEP-ME",
+    "nested": {
+      "deeper": [
+        {
+          "keep": "KEEP-DEEP"
+        }
+      ]
+    },
+    "response_headers": {
+      "content-type": "text/plain"
+    }
+  },
+  "input": {
+    "absolute_path": "/home/planted/absolute",
+    "access_token": "planted-access-token",
+    "authorization": "Bearer planted-token",
+    "chatgpt_identity": {
+      "account_id": "planted-account",
+      "display_name": "Planted Identity"
+    },
+    "content": "PLANTED CONTENT",
+    "cookie": "planted-cookie",
+    "document_id": "doc-fixture-0009",
+    "excerpt": "PLANTED EXCERPT",
+    "file_path": "/Users/planted/file",
+    "kept": "KEEP-ME",
+    "lease_owner_hash": "planted-lease-hash",
+    "local_path": "C:/Synthetic/planted.local",
+    "nested": {
+      "deeper": [
+        {
+          "keep": "KEEP-DEEP",
+          "token": "NESTED-TOKEN"
+        }
+      ],
+      "text": "NESTED PLANTED"
+    },
+    "object_key": "objects/sha256/ab/abababababababababababababababababababababababababababababababab",
+    "path": "D:\\Synthetic\\Fixture\\planted.path",
+    "raw_content": "PLANTED RAW",
+    "refresh_token": "planted-refresh-token",
+    "response_headers": {
+      "content-type": "text/plain",
+      "set-cookie": "PLANTED=1",
+      "x-internal-callback": "http://127.0.0.1:9999/callback"
+    },
+    "set-cookie": "planted-set-cookie",
+    "text": "PLANTED BODY TEXT"
+  },
+  "sample_kind": "negative_hidden_keys"
+}

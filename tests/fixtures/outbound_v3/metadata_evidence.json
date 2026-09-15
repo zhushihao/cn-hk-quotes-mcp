@@ -1,0 +1,42 @@
+[
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_ab9a0a3dc08ab5254eba52aff5e9a30dda5f007d",
+    "payload": {
+      "claim": {
+        "event_time": "2026-09-12T21:30:00+00:00",
+        "extraction_confidence": 1.0,
+        "extraction_method": "CONTROLLED_ENTRY",
+        "methodology": "synthetic methodology",
+        "predicate": "reported a capacity figure",
+        "scope": "fixture-scope",
+        "source_span_hash": "f26481d6429753fc88a4728aac056b6f005145bcef2de047ee4045d6e8a5632e",
+        "subject": "FixtureCo",
+        "unit": "GWh",
+        "value": "42"
+      },
+      "claim_id": "clm_bbdfcd04928f06de6921906b1a5cff8bcf389327",
+      "company": null,
+      "confidence": 0.8,
+      "created_at": "2026-09-13T02:00:00+00:00",
+      "decay_policy": "half-life-30d-v1",
+      "direction": "SUPPORTS",
+      "duplicate_of_evidence_id": null,
+      "evidence_id": "ev_3e41afeaba381ca8568b8a2b57040d599046afb0",
+      "evidence_type": "M",
+      "fact_root_id": "fact_3cc3c9c86daf00a3a67487b3d7d763a92a6c8538",
+      "historical_backfill": false,
+      "independence_cluster_id": "cluster_cad44f527ffea317ba7b2b894074641c844d4d6c",
+      "independence_status": "VERIFIED_INDEPENDENT",
+      "policy_version": "collector-policy-v1",
+      "source_id": "fixture-source-public",
+      "theme": "fixture-theme",
+      "validity": "VALID",
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "evidence",
+    "schema_version": "collector-outbound-v3",
+    "visibility": "PUBLIC"
+  }
+]

@@ -1,0 +1,27 @@
+[
+  {
+    "generated_at": null,
+    "message_id": "outbound_084b47b25eafb849f54dcc6921d02741e3461e64",
+    "payload": {
+      "byte_size": 32,
+      "chunking": {
+        "chunk_sha256": [
+          "3372973367744f1316a1f064b215a13eaec798ab465fce2bbb287316c4c4325f"
+        ],
+        "chunk_size": 32,
+        "chunked": false,
+        "total_chunks": 1
+      },
+      "content_sha256": "3372973367744f1316a1f064b215a13eaec798ab465fce2bbb287316c4c4325f",
+      "encoding": "identity",
+      "manifest_message_id": "outbound_084b47b25eafb849f54dcc6921d02741e3461e64",
+      "media_type": "text/plain",
+      "object_id": "3372973367744f1316a1f064b215a13eaec798ab465fce2bbb287316c4c4325f",
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "object",
+    "schema_version": "collector-outbound-v3",
+    "visibility": "PUBLIC"
+  }
+]

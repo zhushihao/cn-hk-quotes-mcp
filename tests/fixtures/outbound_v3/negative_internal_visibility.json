@@ -1,0 +1,15 @@
+{
+  "expectation": "make_outbound_record raises; Outbox.enqueue raises; the outbound_outbox CHECK rejects visibility='INTERNAL' at the SQL layer",
+  "key": "fixture-source-internal",
+  "payload": {
+    "name": "Internal Fixture",
+    "provider": "rss",
+    "source_id": "fixture-source-internal",
+    "source_kind": "RSS",
+    "visibility": "INTERNAL"
+  },
+  "policy_version": "collector-policy-v1",
+  "record_type": "source",
+  "sample_kind": "negative_internal_visibility",
+  "visibility": "INTERNAL"
+}

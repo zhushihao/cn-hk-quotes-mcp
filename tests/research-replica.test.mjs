@@ -34,6 +34,7 @@ async function fixture(name) {
 class FakeD1 {
 	messages = new Set();
 	batches = [];
+	records = new Map();
 	health = {
 		last_attempt_at: null,
 		last_success_at: null,
@@ -46,6 +47,7 @@ class FakeD1 {
 	prepare(sql) {
 		const db = this;
 		return {
+			sql,
 			params: [],
 			bind(...params) {
 				this.params = params;
@@ -92,6 +94,17 @@ class FakeD1 {
 		const messageId = statements[0].params[0];
 		const inserted = !this.messages.has(messageId);
 		if (inserted) this.messages.add(messageId);
+		const current = statements.find((statement) => statement.sql.includes("INSERT INTO research_records"));
+		if (current) {
+			const [recordType, recordKey, , , schemaVersion, payloadJson] = current.params;
+			const key = `${recordType}:${recordKey}`;
+			const previous = this.records.get(key);
+			// Mirrors migration 0004's forward-only evidence guard: a delayed
+			// v2/v3 envelope may journal, but must not replace a complete v4 row.
+			if (!(recordType === "evidence" && previous?.schemaVersion === "collector-outbound-v4" && schemaVersion !== "collector-outbound-v4")) {
+				this.records.set(key, { schemaVersion, payloadJson });
+			}
+		}
 		return statements.map((_, index) => ({
 			meta: { changes: index === 0 && inserted ? 1 : 0 },
 		}));
@@ -131,6 +144,35 @@ test("C5 stores path-free metadata, document links, and an immutable recovery jo
 	assert.ok(
 		[...store.objects.objects.keys()][0].startsWith("research-replica-journal/v2/outbound_"),
 	);
+});
+
+test("C5 v4 Evidence wins over a delayed legacy envelope with the same logical key", async () => {
+	const store = storage();
+	const legacy = structuredClone((await fixture("metadata_evidence.json"))[0]);
+	const document = (await fixture("metadata_document_version.public.json"))[0];
+	const v4 = structuredClone(legacy);
+	v4.schema_version = "collector-outbound-v4";
+	v4.payload.source_reference = {
+		document_id: document.payload.document.document_id,
+		document_version_id: document.payload.version.version_id,
+		attachment_id: null,
+		content_sha256: "a".repeat(64),
+		byte_start: 0,
+		byte_end: 1,
+		span_sha256: "b".repeat(64),
+	};
+	v4.payload.event_time = null;
+	v4.payload.published_at = "2026-09-13T00:00:00Z";
+	v4.payload.first_seen_at = "2026-09-13T00:01:00Z";
+	v4.payload.ingested_at = "2026-09-13T00:02:00Z";
+	v4.message_id = await outbound.computeOutboundV2MessageId(v4);
+	legacy.schema_version = "collector-outbound-v3";
+	legacy.message_id = await outbound.computeOutboundV2MessageId(legacy);
+	await replica.ingestResearchReplicaRecord(store, v4, null, "2026-09-15T00:00:00Z");
+	await replica.ingestResearchReplicaRecord(store, legacy, null, "2026-09-15T00:01:00Z");
+	const saved = store.db.records.get(`evidence:${v4.payload.evidence_id}`);
+	assert.equal(saved.schemaVersion, "collector-outbound-v4");
+	assert.ok(JSON.parse(saved.payloadJson).source_reference);
 });
 
 test("C5 validates object bytes before private R2 storage and replays without a new logical message", async () => {

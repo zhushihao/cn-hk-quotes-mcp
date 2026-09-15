@@ -221,15 +221,16 @@ export async function ingestResearchReplicaRecord(
 					record.generated_at,
 					now,
 				),
-			storage.db
-				.prepare(
-					"INSERT INTO research_records (record_type, record_key, message_id, visibility, payload_json, generated_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(record_type, record_key) DO UPDATE SET message_id=excluded.message_id, visibility=excluded.visibility, payload_json=excluded.payload_json, generated_at=excluded.generated_at, updated_at=excluded.updated_at",
+		storage.db
+			.prepare(
+				"INSERT INTO research_records (record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(record_type, record_key) DO UPDATE SET message_id=excluded.message_id, visibility=excluded.visibility, schema_version=excluded.schema_version, payload_json=excluded.payload_json, generated_at=excluded.generated_at, updated_at=excluded.updated_at WHERE NOT (research_records.record_type='evidence' AND research_records.schema_version='collector-outbound-v4' AND excluded.schema_version<>'collector-outbound-v4')",
 				)
 				.bind(
 					record.record_type,
 					key,
 					record.message_id,
 					record.visibility,
+					record.schema_version,
 					payloadJson,
 					record.generated_at,
 					now,

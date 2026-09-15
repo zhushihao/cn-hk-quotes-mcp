@@ -556,7 +556,12 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 		source,
 		/const liveOverlayStatus = requestMcpMarketReadStatus\(ctx\.requestInfo, env\);/,
 	);
-	assert.match(source, /return createServer\(env, liveOverlayStatus\);/);
+	// #5 §A4：第三参 researchScopes 由 resolveResearchScopes 解析（凭据逐字节
+	// 匹配 + 转发头 ∩ 配置上限），只扩研究写面，不触碰 market:read 门。
+	assert.match(
+		source,
+		/const researchScopes = resolveResearchScopes\(\s*ctx\.requestInfo\?\.headers\.get\("Authorization"\) \?\? null,\s*ctx\.requestInfo\?\.headers\.get\(FORWARDED_SCOPES_HEADER\) \?\? null,\s*env\.COLLECTOR_MCP_CLIENT_TOKEN,\s*env\.COLLECTOR_MCP_CLIENT_SCOPES,\s*\);\s*return createServer\(env, liveOverlayStatus, researchScopes\);/,
+	);
 	assert.match(source, /request\?\.headers\.get\("Authorization"\)/);
 	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_TOKEN/);
 	assert.match(source, /env\.COLLECTOR_MCP_CLIENT_SCOPES/);
@@ -597,7 +602,7 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 	assert.match(source, /scopes: authenticated \? \[MARKET_READ_SCOPE\] : \[\]/);
 	const authLog = source.slice(
 		source.indexOf('bridgeContext("mcp:market-read-auth")'),
-		source.indexOf("return createServer(env, liveOverlayStatus);"),
+		source.indexOf("const researchScopes = resolveResearchScopes("),
 	);
 	assert.doesNotMatch(
 		authLog,

@@ -1,0 +1,42 @@
+[
+  {
+    "generated_at": "2026-09-15T03:00:00+00:00",
+    "message_id": "outbound_f73398a4f1155fe210ee6c2522c99e7a97ab28ff",
+    "payload": {
+      "checked_at": "2026-09-15T01:30:00+00:00",
+      "consecutive_failures": 0,
+      "failure_class": null,
+      "last_error_code": null,
+      "last_success_at": "2026-09-15T01:30:00+00:00",
+      "outcome": "OK",
+      "provider": "rss",
+      "reachable": true,
+      "source_id": "fixture-source-public",
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "source_health",
+    "schema_version": "collector-outbound-v3",
+    "visibility": "PUBLIC"
+  },
+  {
+    "generated_at": "2026-09-15T03:00:00+00:00",
+    "message_id": "outbound_975ef4a0c841beb85e27b8c8a921fb5f26f4f801",
+    "payload": {
+      "checked_at": "2026-09-15T01:30:00+00:00",
+      "consecutive_failures": 2,
+      "failure_class": "TIMEOUT",
+      "last_error_code": "UNAVAILABLE",
+      "last_success_at": "2026-09-14T22:00:00+00:00",
+      "outcome": "UNAVAILABLE",
+      "provider": "http",
+      "reachable": false,
+      "source_id": "fixture-source-private",
+      "visibility": "PRIVATE"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "source_health",
+    "schema_version": "collector-outbound-v3",
+    "visibility": "PRIVATE"
+  }
+]

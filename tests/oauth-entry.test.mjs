@@ -45,10 +45,14 @@ test("temporary production storage diagnostic is removed after identifying the K
 	assert.doesNotMatch(oauth, /OAUTH_PROVIDER_DCR/);
 });
 
-test("OAuth discovery advertises market:read and offline refresh support with PKCE S256 only", async () => {
+test("OAuth discovery advertises market:read, research write scopes and offline refresh support with PKCE S256 only", async () => {
 	const oauth = await source("../src/oauth-entry.ts");
-	assert.match(oauth, /scopesSupported: \[MARKET_READ_SCOPE, OFFLINE_ACCESS_SCOPE\]/);
-	assert.match(oauth, /scopes_supported: \[MARKET_READ_SCOPE\]/);
+	// #5 §A4 pure increment: research:claim / research:submit join the
+	// supported list; market:read remains mandatory and offline_access stays.
+	assert.match(oauth, /scopesSupported: \[\.\.\.SUPPORTED_SCOPES\]/);
+	assert.match(oauth, /const SUPPORTED_SCOPES: readonly string\[\] = \[\n\tMARKET_READ_SCOPE,\n\tRESEARCH_CLAIM_SCOPE,\n\tRESEARCH_SUBMIT_SCOPE,\n\tOFFLINE_ACCESS_SCOPE,\n\]/);
+	assert.match(oauth, /scopes_supported: \[\.\.\.RESOURCE_SUPPORTED_SCOPES\]/);
+	assert.match(oauth, /const RESOURCE_SUPPORTED_SCOPES: readonly string\[\] = \[\n\tMARKET_READ_SCOPE,\n\tRESEARCH_CLAIM_SCOPE,\n\tRESEARCH_SUBMIT_SCOPE,\n\]/);
 	assert.match(oauth, /clientIdMetadataDocumentEnabled: true/);
 	assert.match(oauth, /allowImplicitFlow: false/);
 	assert.match(oauth, /allowPlainPKCE: false/);

@@ -1,0 +1,18 @@
+{
+  "expectation": "source_health payload must not contain float values (canonical JSON .0 surface stays closed, design section A6); construction raises ValueError",
+  "payload": {
+    "checked_at": "2026-09-15T01:30:00+00:00",
+    "consecutive_failures": 0,
+    "failure_class": null,
+    "last_error_code": null,
+    "last_success_at": "2026-09-15T01:30:00+00:00",
+    "outcome": 3.14,
+    "provider": "rss",
+    "reachable": true,
+    "source_id": "fixture-source-public",
+    "visibility": "PUBLIC"
+  },
+  "record_type": "source_health",
+  "sample_kind": "negative_health_float",
+  "visibility": "PUBLIC"
+}

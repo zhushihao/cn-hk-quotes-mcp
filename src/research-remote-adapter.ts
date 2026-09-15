@@ -50,6 +50,7 @@ type ReplicaRecordRow = {
 	record_key: string;
 	message_id: string;
 	visibility: ResearchReadVisibility;
+	schema_version: string;
 	payload_json: string;
 	generated_at: string | null;
 	updated_at: string;
@@ -70,7 +71,7 @@ function boundedLimit(value: number | undefined): number {
 	return value;
 }
 
-function parsePayload(row: ReplicaRecordRow): Record<string, unknown> {
+function parsePayload(row: { payload_json: string }): Record<string, unknown> {
 	try {
 		const payload = JSON.parse(row.payload_json);
 		if (!payload || typeof payload !== "object" || Array.isArray(payload)) fail("INTEGRITY_FAILED");
@@ -87,6 +88,7 @@ function recordView(row: ReplicaRecordRow): Record<string, unknown> {
 		record_key: row.record_key,
 		message_id: row.message_id,
 		visibility: row.visibility,
+		schema_version: row.schema_version,
 		payload: parsePayload(row),
 		generated_at: row.generated_at,
 		updated_at: row.updated_at,
@@ -199,7 +201,7 @@ export class CollectorResearchRemoteAdapter {
 		return this.guarded(async () => {
 			const result = await this.storage.db
 				.prepare(
-					"SELECT record_type, record_key, message_id, visibility, payload_json, generated_at, updated_at FROM research_records WHERE record_type=? AND visibility=? ORDER BY updated_at DESC LIMIT ?",
+					"SELECT record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at FROM research_records WHERE record_type=? AND visibility=? ORDER BY updated_at DESC LIMIT ?",
 				)
 				.bind(recordType, this.visibility, boundedLimit(limit))
 				.all<ReplicaRecordRow>();
@@ -212,7 +214,7 @@ export class CollectorResearchRemoteAdapter {
 		return this.guarded(async () => {
 			const row = await this.storage.db
 				.prepare(
-					"SELECT record_type, record_key, message_id, visibility, payload_json, generated_at, updated_at FROM research_records WHERE record_type=? AND record_key=? AND visibility=? LIMIT 1",
+					"SELECT record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at FROM research_records WHERE record_type=? AND record_key=? AND visibility=? LIMIT 1",
 				)
 				.bind(recordType, recordKey, this.visibility)
 				.first<ReplicaRecordRow>();
@@ -249,7 +251,7 @@ export class CollectorResearchRemoteAdapter {
 		const rows = await this.guarded(async () => {
 			const result = await this.storage.db
 				.prepare(
-					"SELECT record_type, record_key, message_id, visibility, payload_json, generated_at, updated_at FROM research_records WHERE record_type='document_version' AND visibility=? AND json_extract(payload_json, '$.document.document_id')=?",
+					"SELECT record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at FROM research_records WHERE record_type='document_version' AND visibility=? AND json_extract(payload_json, '$.document.document_id')=?",
 				)
 				.bind(this.visibility, documentId)
 				.all<ReplicaRecordRow>();
@@ -301,7 +303,53 @@ export class CollectorResearchRemoteAdapter {
 	}
 
 	async getEvidence(evidenceId: string): Promise<Record<string, unknown>> {
-		return recordView(await this.recordByKey("evidence", evidenceId));
+		const row = await this.recordByKey("evidence", evidenceId);
+		const view = recordView(row);
+		if (row.schema_version !== "collector-outbound-v4") {
+			// v2/v3 remain readable but cannot claim the v4 immutable-source
+			// guarantee.  This marker prevents a caller from treating legacy
+			// metadata as a complete Evidence provenance record.
+			return { ...view, source_reference_status: "UNAVAILABLE_LEGACY" };
+		}
+		const payload = view.payload as Record<string, unknown>;
+		const reference = payload.source_reference;
+		if (!reference || typeof reference !== "object" || Array.isArray(reference)) fail("INTEGRITY_FAILED");
+		const sourceReference = reference as Record<string, unknown>;
+		const documentId = String(sourceReference.document_id ?? "");
+		const versionId = String(sourceReference.document_version_id ?? "");
+		const contentSha256 = String(sourceReference.content_sha256 ?? "");
+		const start = sourceReference.byte_start;
+		const end = sourceReference.byte_end;
+		const spanSha256 = String(sourceReference.span_sha256 ?? "");
+		if (!documentId || !versionId || !isHexSha256(contentSha256) || !isHexSha256(spanSha256) ||
+			typeof start !== "number" || typeof end !== "number" || !Number.isInteger(start) ||
+			!Number.isInteger(end) || start < 0 || end <= start) fail("INTEGRITY_FAILED");
+		const versionRow = await this.recordByKey("document_version", versionId);
+		const versionPayload = parsePayload(versionRow);
+		const document = versionPayload.document as Record<string, unknown> | undefined;
+		const version = versionPayload.version as Record<string, unknown> | undefined;
+		if (!document || !version || document.document_id !== documentId ||
+			version.version_id !== versionId || version.document_id !== documentId) fail("INTEGRITY_FAILED");
+		let referencedHash = String(version.content_sha256 ?? "");
+		const attachmentId = sourceReference.attachment_id;
+		if (attachmentId !== null) {
+			if (typeof attachmentId !== "string") fail("INTEGRITY_FAILED");
+			const attachments = Array.isArray(versionPayload.attachments) ? versionPayload.attachments : [];
+			const attachment = attachments.find((item) =>
+				item && typeof item === "object" && !Array.isArray(item) &&
+				(item as Record<string, unknown>).attachment_id === attachmentId,
+			) as Record<string, unknown> | undefined;
+			if (!attachment) fail("INTEGRITY_FAILED");
+			referencedHash = String(attachment.content_sha256 ?? "");
+		}
+		if (referencedHash !== contentSha256) fail("INTEGRITY_FAILED");
+		const object = await this.guarded(() => this.storage.objects.get(objectKey(contentSha256)));
+		if (!object) fail("STORE_UNAVAILABLE");
+		const bytes = await this.guarded(() => object.arrayBuffer());
+		if ((await sha256Hex(bytes)) !== contentSha256) fail("INTEGRITY_FAILED");
+		const slice = new Uint8Array(bytes).slice(start, end);
+		if (slice.byteLength !== end - start || (await sha256Hex(slice.buffer)) !== spanSha256) fail("INTEGRITY_FAILED");
+		return { ...view, source_reference_status: "VERIFIED" };
 	}
 
 	async getThemeAccumulator(subjectKey: string): Promise<Record<string, unknown>> {
@@ -320,17 +368,114 @@ export class CollectorResearchRemoteAdapter {
 		return (await this.records("coverage", limit)).map(recordView);
 	}
 
-	async getSourceHealth(): Promise<never> {
-		// C5 does not replicate detailed source-health observations.  A caller
-		// must receive an explicit unsupported result, never an empty success.
-		fail("UNSUPPORTED_OPERATION");
+	/**
+	 * §A6: source health is a first-class outbound record type (v3), so the
+	 * adapter serves the real `source_health` row set instead of a stub.
+	 */
+	async getSourceHealth(limit?: number): Promise<Array<Record<string, unknown>>> {
+		return (await this.records("source_health", limit)).map(recordView);
 	}
 
-	async listResearchJobs(limit?: number): Promise<Array<Record<string, unknown>>> {
-		return (await this.records("job", limit)).map(recordView);
+	/**
+	 * §A5: market signal state reads the accumulator record projected into
+	 * the reserved `market:` subject namespace.  An absent record is the
+	 * honest NO_DATA domain result (the market detector is not deployed this
+	 * round), never an error and never fabricated data.
+	 */
+	async getMarketSignalState(subjectKey: string): Promise<Record<string, unknown>> {
+		if (typeof subjectKey !== "string" || subjectKey.trim().length === 0) fail("INTEGRITY_FAILED");
+		const normalized = subjectKey.startsWith("market:")
+			? subjectKey
+			: `market:${subjectKey.trim()}`;
+		for (const row of await this.records("accumulator", 100)) {
+			const payload = parsePayload(row);
+			if (payload.subject_key === normalized) {
+				return { ...recordView(row), subject_kind: "MARKET" };
+			}
+		}
+		return {
+			status: "NO_DATA",
+			subject_key: normalized,
+			source: "COLLECTOR_REPLICA",
+			note: "MARKET_DETECTOR_NOT_DEPLOYED",
+		};
+	}
+
+	/**
+	 * §A7/§5.3 server-side job state derived as terminal > unexpired lease >
+	 * record.  The lease query selects only owner/expiry columns; the claim
+	 * token never leaves the lease row.
+	 */
+	private async jobServerState(jobId: string): Promise<Record<string, unknown>> {
+		const terminal = await this.guarded(() =>
+			this.storage.db
+				.prepare(
+					"SELECT terminal_status FROM research_job_terminal WHERE job_id=? LIMIT 1",
+				)
+				.bind(jobId)
+				.first<{ terminal_status: string }>(),
+		);
+		if (terminal) {
+			return {
+				effective_status: terminal.terminal_status === "COMPLETED" ? "COMPLETED" : "QUEUED",
+				lease_owner: null,
+				lease_expires_at: null,
+			};
+		}
+		const lease = await this.guarded(() =>
+			this.storage.db
+				.prepare("SELECT lease_owner, lease_expires_at FROM research_job_leases WHERE job_id=? LIMIT 1")
+				.bind(jobId)
+				.first<{ lease_owner: string; lease_expires_at: string }>(),
+		);
+		const now = new Date().toISOString();
+		if (lease && lease.lease_expires_at > now) {
+			return {
+				effective_status: "CLAIMED",
+				lease_owner: lease.lease_owner,
+				lease_expires_at: lease.lease_expires_at,
+			};
+		}
+		return { effective_status: "QUEUED", lease_owner: null, lease_expires_at: null };
+	}
+
+	private async jobProposals(jobId: string): Promise<Array<Record<string, unknown>>> {
+		const result = await this.guarded(() =>
+			this.storage.db
+				.prepare(
+					"SELECT proposal_id, origin, status, created_at, payload_json FROM research_proposals WHERE job_id=? ORDER BY created_at ASC",
+				)
+				.bind(jobId)
+				.all<{ proposal_id: string; origin: string; status: string; created_at: string; payload_json: string }>(),
+		);
+		return (result.results ?? []).map((row) => ({
+			proposal_id: row.proposal_id,
+			origin: row.origin,
+			status: row.status,
+			created_at: row.created_at,
+			payload: parsePayload({ payload_json: row.payload_json }),
+		}));
+	}
+
+	async listResearchJobs(
+		limit?: number,
+		options: { claimableOnly?: boolean } = {},
+	): Promise<Array<Record<string, unknown>>> {
+		const jobs: Array<Record<string, unknown>> = [];
+		for (const row of await this.records("job", limit)) {
+			const view = { ...recordView(row), server_state: await this.jobServerState(row.record_key) };
+			if (options.claimableOnly && view.server_state.effective_status !== "QUEUED") continue;
+			jobs.push(view);
+		}
+		return jobs;
 	}
 
 	async getResearchJobContext(jobId: string): Promise<Record<string, unknown>> {
-		return recordView(await this.recordByKey("job", jobId));
+		const view = recordView(await this.recordByKey("job", jobId));
+		return {
+			...view,
+			server_state: await this.jobServerState(jobId),
+			proposals: await this.jobProposals(jobId),
+		};
 	}
 }

@@ -1,0 +1,46 @@
+{
+  "expectation": "both envelopes are byte-identical: enqueue twice yields one outbox row (INSERT OR IGNORE); sink sees one logical record plus a duplicate",
+  "records": [
+    {
+      "generated_at": "2026-09-13T03:00:00+00:00",
+      "message_id": "outbound_5bbb465cc61395e91c5405449dca4acf545a3aa7",
+      "payload": {
+        "canonical_base": "https://fixture.example.test/public",
+        "check_frequency_seconds": 900,
+        "last_health_at": "2026-09-13T02:00:00+00:00",
+        "lifecycle": "ACTIVE",
+        "name": "Fixture Source Public",
+        "policy_version": "collector-policy-v1",
+        "provider": "rss",
+        "source_id": "fixture-source-public",
+        "source_kind": "RSS",
+        "visibility": "PUBLIC"
+      },
+      "policy_version": "collector-policy-v1",
+      "record_type": "source",
+      "schema_version": "collector-outbound-v3",
+      "visibility": "PUBLIC"
+    },
+    {
+      "generated_at": "2026-09-13T03:00:00+00:00",
+      "message_id": "outbound_5bbb465cc61395e91c5405449dca4acf545a3aa7",
+      "payload": {
+        "canonical_base": "https://fixture.example.test/public",
+        "check_frequency_seconds": 900,
+        "last_health_at": "2026-09-13T02:00:00+00:00",
+        "lifecycle": "ACTIVE",
+        "name": "Fixture Source Public",
+        "policy_version": "collector-policy-v1",
+        "provider": "rss",
+        "source_id": "fixture-source-public",
+        "source_kind": "RSS",
+        "visibility": "PUBLIC"
+      },
+      "policy_version": "collector-policy-v1",
+      "record_type": "source",
+      "schema_version": "collector-outbound-v3",
+      "visibility": "PUBLIC"
+    }
+  ],
+  "sample_kind": "replay_duplicate"
+}

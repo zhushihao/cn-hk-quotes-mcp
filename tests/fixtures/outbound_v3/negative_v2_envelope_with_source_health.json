@@ -1,0 +1,24 @@
+{
+  "envelope": {
+    "generated_at": "2026-09-15T03:00:00+00:00",
+    "message_id": "outbound_b43bdbb25af188e6d2c97295fb055ca909ebe8c0",
+    "payload": {
+      "checked_at": "2026-09-15T01:30:00+00:00",
+      "consecutive_failures": 0,
+      "failure_class": null,
+      "last_error_code": null,
+      "last_success_at": "2026-09-15T01:30:00+00:00",
+      "outcome": "OK",
+      "provider": "rss",
+      "reachable": true,
+      "source_id": "fixture-source-public",
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "collector-policy-v1",
+    "record_type": "source_health",
+    "schema_version": "collector-outbound-v2",
+    "visibility": "PUBLIC"
+  },
+  "expectation": "record_type source_health is outside the frozen v2 bucket: a v2 envelope carrying it must be rejected (compat window rule, design section 5.1); the outbox schema gate refuses the row",
+  "sample_kind": "negative_v2_envelope_with_source_health"
+}

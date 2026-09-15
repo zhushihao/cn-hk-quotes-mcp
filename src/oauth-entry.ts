@@ -6,11 +6,28 @@ import OAuthProvider, {
 
 import { createD1OAuthKv } from "./d1-oauth-kv";
 import coreWorker from "./index";
+import {
+	FORWARDED_SCOPES_HEADER,
+	RESEARCH_CLAIM_SCOPE,
+	RESEARCH_SUBMIT_SCOPE,
+} from "./research-scopes";
 
 const ORIGIN = "https://cn-hk-quotes-mcp.zhushihao710.workers.dev";
 const MCP_RESOURCE = `${ORIGIN}/mcp`;
 const MARKET_READ_SCOPE = "market:read";
 const OFFLINE_ACCESS_SCOPE = "offline_access";
+/** §A4 纯增量：research 写面 scope 进入支持列表；market:read 仍为必含项。 */
+const SUPPORTED_SCOPES: readonly string[] = [
+	MARKET_READ_SCOPE,
+	RESEARCH_CLAIM_SCOPE,
+	RESEARCH_SUBMIT_SCOPE,
+	OFFLINE_ACCESS_SCOPE,
+];
+const RESOURCE_SUPPORTED_SCOPES: readonly string[] = [
+	MARKET_READ_SCOPE,
+	RESEARCH_CLAIM_SCOPE,
+	RESEARCH_SUBMIT_SCOPE,
+];
 const OWNER_USER_ID = "quantpro-owner";
 const MAX_OWNER_KEY_LENGTH = 512;
 const AUTH_FORM_MAX_AGE_SECONDS = 10 * 60;
@@ -172,7 +189,7 @@ function validRequestedScopes(authRequest: AuthRequest): string[] | null {
 	const requested = new Set(authRequest.scope);
 	if (!requested.has(MARKET_READ_SCOPE)) return null;
 	for (const scope of requested) {
-		if (scope !== MARKET_READ_SCOPE && scope !== OFFLINE_ACCESS_SCOPE) return null;
+		if (!SUPPORTED_SCOPES.includes(scope)) return null;
 	}
 	return [...requested];
 }
@@ -198,6 +215,13 @@ function authorizationPage(options: {
 		.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`)
 		.join("");
 	const error = options.error ? `<p class="error">${escapeHtml(options.error)}</p>` : "";
+	// §A4：请求含 research 写 scope 时如实增列研究工作流说明；
+	// 任何情况下都不宣称交易能力。
+	const researchNote = options.scopes.some(
+		(scope) => scope === RESEARCH_CLAIM_SCOPE || scope === RESEARCH_SUBMIT_SCOPE,
+	)
+		? `<p class="muted">研究工作流：认领/提交研究候选。</p>`
+		: "";
 	return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -216,7 +240,7 @@ code{background:#f1f2f4;padding:2px 5px;border-radius:4px}
 <h1>授权 QuantPro Collector</h1>
 <p>客户端：<strong>${escapeHtml(options.clientName)}</strong></p>
 <p class="muted">仅授权只读行情能力。不会授予交易、撤单、账户、成本或订单权限。</p>
-<ul>${scopeList}</ul>${error}
+${researchNote}<ul>${scopeList}</ul>${error}
 <form method="post" action="${escapeHtml(options.action)}" autocomplete="off">
 <input type="hidden" name="csrf" value="${escapeHtml(options.csrf)}">
 <label for="owner_key">QuantPro Collector 授权密钥</label>
@@ -379,8 +403,16 @@ async function handleMcp(
 	}
 	if (!tokenHasMarketRead(summary)) return oauthChallenge(request);
 
+	// §A4：替换 Authorization 前先剥除客户端自带的转发 scope 头，再写入
+	// 本令牌经校验的 scope 集合——核心 Worker 端把「转发头 ∩ server 配置」
+	// 当上限，伪造或残留的头部都无法越过配置集合。
+	const headers = new Headers(request.headers);
+	headers.delete(FORWARDED_SCOPES_HEADER);
+	headers.set(FORWARDED_SCOPES_HEADER, summary.scope.join(" "));
+	const scopeStamped = new Request(request, { headers });
+
 	const bridgeSecret = env.COLLECTOR_MCP_CLIENT_TOKEN;
-	const forwarded = withAuthorization(request, bridgeSecret ? `Bearer ${bridgeSecret}` : null);
+	const forwarded = withAuthorization(scopeStamped, bridgeSecret ? `Bearer ${bridgeSecret}` : null);
 	return coreWorker.fetch(forwarded, env, ctx);
 }
 
@@ -409,14 +441,14 @@ const oauthProvider = new OAuthProvider<OAuthEnv>({
 	accessTokenTTL: 60 * 60,
 	refreshTokenTTL: 90 * 24 * 60 * 60,
 	clientRegistrationTTL: 90 * 24 * 60 * 60,
-	scopesSupported: [MARKET_READ_SCOPE, OFFLINE_ACCESS_SCOPE],
+	scopesSupported: [...SUPPORTED_SCOPES],
 	allowImplicitFlow: false,
 	allowPlainPKCE: false,
 	clientIdMetadataDocumentEnabled: true,
 	resourceMetadata: {
 		resource: MCP_RESOURCE,
 		authorization_servers: [ORIGIN],
-		scopes_supported: [MARKET_READ_SCOPE],
+		scopes_supported: [...RESOURCE_SUPPORTED_SCOPES],
 		bearer_methods_supported: ["header"],
 		resource_name: "QuantPro Collector",
 	},

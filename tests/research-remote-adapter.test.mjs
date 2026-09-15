@@ -448,3 +448,80 @@ test("C8 fabricated document id is NOT_FOUND", async () => {
 		(error) => error?.error_code === "NOT_FOUND",
 	);
 });
+
+test("C9 v4 Evidence returns only verified immutable provenance and timestamps", async () => {
+	const content = encoder.encode("synthetic evidence span content");
+	const part = documentVersionRow({
+		documentId: "doc-evidence-v4",
+		versionId: "ver-evidence-v4",
+		ownMediaType: "text/plain",
+		ownContent: content,
+	});
+	part.row.schema_version = "collector-outbound-v4";
+	const start = 10;
+	const end = 18;
+	const spanSha256 = sha256HexOf(content.slice(start, end));
+	const evidenceRow = {
+		record_type: "evidence",
+		record_key: "evidence-v4",
+		message_id: `outbound_${"e".repeat(40)}`,
+		visibility: "PUBLIC",
+		schema_version: "collector-outbound-v4",
+		payload_json: JSON.stringify({
+			evidence_id: "evidence-v4",
+			source_reference: {
+				document_id: "doc-evidence-v4",
+				document_version_id: "ver-evidence-v4",
+				attachment_id: null,
+				content_sha256: part.payload.version.content_sha256,
+				byte_start: start,
+				byte_end: end,
+				span_sha256: spanSha256,
+			},
+			event_time: null,
+			published_at: "2026-09-15T00:00:00Z",
+			first_seen_at: "2026-09-15T00:01:00Z",
+			ingested_at: "2026-09-15T00:02:00Z",
+		}),
+		generated_at: "2026-09-15T00:03:00Z",
+		updated_at: "2026-09-15T00:03:00Z",
+	};
+	const adapter = new remote.CollectorResearchRemoteAdapter({
+		db: new FakeD1([evidenceRow, part.row]),
+		objects: new FakeR2(part.objects),
+	}, { visibility: "PUBLIC" });
+	const evidence = await adapter.getEvidence("evidence-v4");
+	assert.equal(evidence.source_reference_status, "VERIFIED");
+	assert.equal(evidence.payload.source_reference.span_sha256, spanSha256);
+	assert.equal(evidence.payload.event_time, null);
+	assert.equal(evidence.payload.published_at, "2026-09-15T00:00:00Z");
+	assert.equal("body_text" in evidence, false);
+	assert.equal("content" in evidence.payload, false);
+});
+
+test("C9 v4 Evidence refuses a tampered referenced object instead of serving unverifiable provenance", async () => {
+	const content = encoder.encode("synthetic evidence tamper source");
+	const part = documentVersionRow({
+		documentId: "doc-evidence-tamper",
+		versionId: "ver-evidence-tamper",
+		ownMediaType: "text/plain",
+		ownContent: content,
+	});
+	const evidenceRow = {
+		record_type: "evidence", record_key: "evidence-tamper", message_id: `outbound_${"f".repeat(40)}`,
+		visibility: "PUBLIC", schema_version: "collector-outbound-v4",
+		payload_json: JSON.stringify({ source_reference: {
+			document_id: "doc-evidence-tamper", document_version_id: "ver-evidence-tamper", attachment_id: null,
+			content_sha256: part.payload.version.content_sha256, byte_start: 0, byte_end: 1,
+			span_sha256: sha256HexOf(content.slice(0, 1)),
+		} }), generated_at: null, updated_at: "2026-09-15T00:00:00Z",
+	};
+	const tampered = new Map(part.objects);
+	tampered.set(`research-objects/sha256/${part.payload.version.content_sha256}`, encoder.encode("tampered"));
+	const adapter = new remote.CollectorResearchRemoteAdapter({
+		db: new FakeD1([evidenceRow, part.row]), objects: new FakeR2(tampered),
+	}, { visibility: "PUBLIC" });
+	await assert.rejects(() => adapter.getEvidence("evidence-tamper"), (error) =>
+		error?.error_code === "INTEGRITY_FAILED",
+	);
+});

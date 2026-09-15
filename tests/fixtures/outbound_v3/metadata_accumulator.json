@@ -1,0 +1,35 @@
+[
+  {
+    "generated_at": "2026-09-13T03:00:00+00:00",
+    "message_id": "outbound_1fda3b17808b34df0c7136410def6dc6ad763640",
+    "payload": {
+      "conflict_count": 0,
+      "created_at": "2026-09-13T03:00:00+00:00",
+      "dimensions": {
+        "C": 0,
+        "D": 1,
+        "E": 0,
+        "M": 1,
+        "P": 0,
+        "S": 1
+      },
+      "evidence_ids": [
+        "ev_3e41afeaba381ca8568b8a2b57040d599046afb0",
+        "ev-fixture-2"
+      ],
+      "independent_cluster_count": 2,
+      "last_evidence_at": "2026-09-13T02:00:00+00:00",
+      "rule_version": "accumulator-v1",
+      "snapshot_id": "snap-fixture-0001",
+      "status": "ACCUMULATING",
+      "subject_key": "fixture-theme",
+      "total_weight": 1.4,
+      "unknown_cluster_count": 0,
+      "visibility": "PUBLIC"
+    },
+    "policy_version": "accumulator-v1",
+    "record_type": "accumulator",
+    "schema_version": "collector-outbound-v3",
+    "visibility": "PUBLIC"
+  }
+]
