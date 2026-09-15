@@ -4,7 +4,7 @@
  * §6 test-stack convention).
  *
  * Unlike the pattern-matching FakeD1 used by the ingest-face tests, this shim
- * executes the REAL migration DDL (0001-0006) and the REAL production SQL —
+ * executes the REAL migration DDL (0001-0007) and the REAL production SQL —
  * conditional upserts (`ON CONFLICT ... WHERE`), partial unique indexes
  * (`research_proposals_one_formal`), and batches — so database-level
  * guarantees are proven, not assumed.
@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "migrations");
-const MIGRATION_PREFIXES = ["0001", "0002", "0003", "0004", "0005", "0006"];
+const MIGRATION_PREFIXES = ["0001", "0002", "0003", "0004", "0005", "0006", "0007"];
 
 /** The frozen migration chain, concatenated in order. */
 function loadMigrationSql() {

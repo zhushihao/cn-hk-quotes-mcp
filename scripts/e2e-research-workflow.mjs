@@ -23,7 +23,6 @@
  *     [--base-url http://127.0.0.1:8787] \
  *     [--mcp-token local-dev-token] \
  *     [--ingest-token local-ingest-token] \
- *     [--receipts-token local-receipts-token] \
  *     [--evidence-dir e2e-evidence]
  */
 import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
@@ -39,7 +38,6 @@ function parseArgs(argv) {
 		baseUrl: process.env.E2E_BASE_URL ?? "http://127.0.0.1:8790",
 		mcpToken: "local-dev-token",
 		ingestToken: "local-ingest-token",
-		receiptsToken: "local-receipts-token",
 		evidenceDir: "e2e-evidence",
 	};
 	for (let index = 2; index < argv.length; index += 2) {
@@ -638,7 +636,7 @@ async function step7ReceiptsEndpointContract() {
 		`unauthenticated receipts gave ${unauthenticated.status}`,
 	);
 	const page = await fetch(`${options.baseUrl}/internal/research-replica/v2/receipts`, {
-		headers: { Authorization: `Bearer ${options.receiptsToken}` },
+		headers: { Authorization: `Bearer ${options.ingestToken}` },
 	});
 	assertOk(step, page.status === 200, `receipts page status ${page.status}`);
 	const body = await page.json();

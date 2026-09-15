@@ -477,7 +477,6 @@ test("local migrated D1 trigger preserves the first formal OAuth claim and submi
 				COLLECTOR_MCP_FORMAL_CLIENT_IDS: client.client_id,
 				COLLECTOR_MCP_FORMAL_RESEARCH_NAMESPACES: "research-formal",
 				RESEARCH_REPLICA_INGEST_TOKEN: "synthetic-replica-ingest-token",
-				RESEARCH_REPLICA_RECEIPTS_TOKEN: "synthetic-replica-receipts-token",
 			},
 		});
 
@@ -534,7 +533,7 @@ test("local migrated D1 trigger preserves the first formal OAuth claim and submi
 		assert.equal(submitted.payload.status, "ACCEPTED", "first migrated-D1 submit must not become an idempotent replay");
 		assert.equal(submitted.payload.terminal_status, "COMPLETED");
 		const receiptsResponse = await fetch(`${worker.origin}/internal/research-replica/v2/receipts`, {
-			headers: { authorization: "Bearer synthetic-replica-receipts-token" },
+			headers: { authorization: "Bearer synthetic-replica-ingest-token" },
 		});
 		assert.equal(receiptsResponse.status, 200, "new D1 event mappings must be readable atomically");
 		const receipts = await receiptsResponse.json();

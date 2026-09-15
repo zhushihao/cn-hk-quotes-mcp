@@ -28,18 +28,16 @@ const worker = (await import("../src/index.ts")).default;
 const workflow = await import("../src/research-workflow.ts");
 const { createResearchWorkflowDb } = await import("./helpers/d1-sqlite-shim.mjs");
 
-const RECEIPTS_TOKEN = "local-receipts-token";
 const INGEST_TOKEN = "local-ingest-token";
-const PRODUCTION = workflow.RESEARCH_PRODUCTION_PRINCIPAL;
+const PRODUCTION = `oauth-client:${"a".repeat(64)}`;
 const RECEIPTS_URL = "https://worker.example/internal/research-replica/v2/receipts";
 const INGEST_URL = "https://worker.example/internal/research-replica/v2/ingest";
 
-function env({ withReceiptsToken = true } = {}) {
+function env({ withTransportToken = true } = {}) {
 	return {
 		RESEARCH_REPLICA: createResearchWorkflowDb(),
 		RESEARCH_OBJECTS: { async put() {} },
-		RESEARCH_REPLICA_INGEST_TOKEN: INGEST_TOKEN,
-		...(withReceiptsToken ? { RESEARCH_REPLICA_RECEIPTS_TOKEN: RECEIPTS_TOKEN } : {}),
+		...(withTransportToken ? { RESEARCH_REPLICA_INGEST_TOKEN: INGEST_TOKEN } : {}),
 	};
 }
 
@@ -74,6 +72,7 @@ async function seedLifecycle(envObject, jobId, when) {
 	const synthetic = await workflow.submitResearchResultProposal(db, {
 		jobId,
 		claimToken: claim.claim_token,
+		expectedGeneration: claim.lease_generation,
 		idempotencyKey: `key-${jobId}-synth`,
 		origin: "SYNTHETIC",
 		proposal,
@@ -86,6 +85,7 @@ async function seedLifecycle(envObject, jobId, when) {
 	const conflict = await workflow.submitResearchResultProposal(db, {
 		jobId,
 		claimToken: "clt_" + "0".repeat(32),
+		expectedGeneration: claim.lease_generation,
 		idempotencyKey: `key-${jobId}-synth`,
 		origin: "SYNTHETIC",
 		proposal: { ...proposal, summary: "different" },
@@ -105,6 +105,7 @@ async function seedLifecycle(envObject, jobId, when) {
 	const formal = await workflow.submitResearchResultProposal(db, {
 		jobId,
 		claimToken: formalClaim.claim_token,
+		expectedGeneration: formalClaim.lease_generation,
 		idempotencyKey: `key-${jobId}-formal`,
 		proposal,
 		callerPrincipal: PRODUCTION,
@@ -114,10 +115,10 @@ async function seedLifecycle(envObject, jobId, when) {
 	assert.equal(formal.status, "ACCEPTED");
 }
 
-test("B13 receipts endpoint is fail-closed without a configured token (503)", async () => {
-	const envObject = env({ withReceiptsToken: false });
+test("B13 receipts endpoint shares the RESEARCH transport token and fails closed when it is absent (503)", async () => {
+	const envObject = env({ withTransportToken: false });
 	const response = await worker.fetch(
-		new Request(RECEIPTS_URL, { headers: { Authorization: `Bearer ${RECEIPTS_TOKEN}` } }),
+		new Request(RECEIPTS_URL, { headers: { Authorization: `Bearer ${INGEST_TOKEN}` } }),
 		envObject,
 		{},
 	);
@@ -136,7 +137,7 @@ test("B13 receipts endpoint rejects a wrong or missing token (401) and non-GET (
 	const post = await worker.fetch(
 		new Request(RECEIPTS_URL, {
 			method: "POST",
-			headers: { Authorization: `Bearer ${RECEIPTS_TOKEN}` },
+			headers: { Authorization: `Bearer ${INGEST_TOKEN}` },
 		}),
 		envObject,
 		{},
@@ -149,7 +150,7 @@ test("B13 receipts endpoint validates since/limit bounds (400)", async () => {
 	for (const query of ["limit=0", "limit=501", "limit=abc", "since=not-a-date"]) {
 		const response = await worker.fetch(
 			new Request(`${RECEIPTS_URL}?${query}`, {
-				headers: { Authorization: `Bearer ${RECEIPTS_TOKEN}` },
+				headers: { Authorization: `Bearer ${INGEST_TOKEN}` },
 			}),
 			envObject,
 			{},
@@ -163,7 +164,7 @@ test("B13 receipts page is the fixed whitelist with no claim_token or payload", 
 	const envObject = env();
 	await seedLifecycle(envObject, "job-b13-1", "2026-09-15T08:00:00.000Z");
 	const response = await worker.fetch(
-		new Request(RECEIPTS_URL, { headers: { Authorization: `Bearer ${RECEIPTS_TOKEN}` } }),
+		new Request(RECEIPTS_URL, { headers: { Authorization: `Bearer ${INGEST_TOKEN}` } }),
 		envObject,
 		{},
 	);
@@ -205,18 +206,18 @@ test("B13 receipts page is the fixed whitelist with no claim_token or payload", 
 	assert.equal(typeof page.next_since, "string");
 });
 
-test("B13 since cursor replays closed-interval and receipt ids are stable", async () => {
+test("B13 rcpt3 cursor is monotonic and legacy timestamps replay from zero with stable receipt ids", async () => {
 	const envObject = env();
 	await seedLifecycle(envObject, "job-b13-2", "2026-09-15T08:00:00.000Z");
-	const headers = { Authorization: `Bearer ${RECEIPTS_TOKEN}` };
+	const headers = { Authorization: `Bearer ${INGEST_TOKEN}` };
 	const first = await (
 		await worker.fetch(new Request(RECEIPTS_URL, { headers }), envObject, {})
 	).json();
 	assert.equal(first.receipts.length, 6);
-	// Closed-interval replay: every event at the cursor timestamp comes back
-	// (the accept batch writes SUBMIT_RECEIVED + COMPLETED at one instant),
-	// including the byte-identical boundary receipt — the RESEARCH-side
-	// UNIQUE dedupe absorbs exactly this overlap.
+	assert.match(first.next_since, /^rcpt3\./);
+
+	// A current-epoch rcpt3 cursor resumes strictly after its sequence; once at
+	// the end, the page is empty and the cursor is echoed unchanged.
 	const again = await (
 		await worker.fetch(
 			new Request(`${RECEIPTS_URL}?since=${encodeURIComponent(first.next_since)}`, {
@@ -226,11 +227,11 @@ test("B13 since cursor replays closed-interval and receipt ids are stable", asyn
 			{},
 		)
 	).json();
-	const boundaryId = first.receipts[first.receipts.length - 1].receipt_id;
-	assert.ok(again.receipts.length >= 1);
-	assert.ok(again.receipts.some((receipt) => receipt.receipt_id === boundaryId));
-	assert.ok(again.receipts.every((receipt) => receipt.occurred_at === first.next_since));
-	// A fully overlapping re-pull is byte-stable (idempotent observation).
+	assert.deepEqual(again.receipts, []);
+	assert.equal(again.next_since, first.next_since);
+
+	// Legacy timestamp cursors deliberately replay the complete new ordering from
+	// zero once. Stable receipt ids let the RESEARCH mirror absorb that overlap.
 	const replay = await (
 		await worker.fetch(
 			new Request(
@@ -242,20 +243,11 @@ test("B13 since cursor replays closed-interval and receipt ids are stable", asyn
 		)
 	).json();
 	assert.equal(replay.receipts.length, 6);
+	assert.match(replay.next_since, /^rcpt3\./);
 	assert.deepEqual(
 		replay.receipts.map((receipt) => receipt.receipt_id),
 		first.receipts.map((receipt) => receipt.receipt_id),
 	);
-	// An empty page echoes the since cursor.
-	const empty = await (
-		await worker.fetch(
-			new Request(`${RECEIPTS_URL}?since=2099-01-01T00:00:00.000Z`, { headers }),
-			envObject,
-			{},
-		)
-	).json();
-	assert.deepEqual(empty.receipts, []);
-	assert.equal(empty.next_since, "2099-01-01T00:00:00.000Z");
 });
 
 test("A8 ingest 2 MiB body gate: Content-Length precheck and measured-bytes double gate", async () => {

@@ -86,9 +86,8 @@ interface Env {
 	CF_ACCESS_CLIENT_SECRET?: string;
 	RESEARCH_REPLICA?: D1Database;
 	RESEARCH_OBJECTS?: R2Bucket;
+	/** RESEARCH 私有 transport credential；ingest 与 receipts 共用，不与 market/research OAuth scopes 混用。 */
 	RESEARCH_REPLICA_INGEST_TOKEN?: string;
-	/** receipts 只读端点独立 token；与 ingest token 刻意分离（独立轮转/爆炸半径）。 */
-	RESEARCH_REPLICA_RECEIPTS_TOKEN?: string;
 }
 
 /**
@@ -1249,20 +1248,20 @@ async function handleResearchReplicaIngest(request: Request, env: Env): Promise<
 }
 
 /**
- * §A1 receipts 只读回流端点（内部通道，非 MCP 工具）。与 ingest 刻意使用
- * 独立 secret（独立轮转、爆炸半径更小）；未配置 → 503 fail-closed，
- * token 不匹配 → 401 FILTERED。响应为 §5.4 collector-receipts-v1 白名单，
- * claim_token / proposal 正文 / 客户端原始输入结构上不可能出现。
+ * §A1 receipts 只读回流端点（内部通道，非 MCP 工具）。与 ingest 共用现有
+ * RESEARCH transport credential；未配置 → 503 fail-closed，token 不匹配 →
+ * 401 FILTERED。响应为 §5.4 collector-receipts-v1 白名单，claim_token /
+ * proposal 正文 / 客户端原始输入结构上不可能出现。
  */
 async function handleResearchReplicaReceipts(request: Request, env: Env): Promise<Response> {
 	if (request.method !== "GET") {
 		return researchBoundaryResponse(new ResearchBoundaryError("UNSUPPORTED_OPERATION"), 405);
 	}
 	const storage = researchReplicaStorage(env);
-	if (!storage || !env.RESEARCH_REPLICA_RECEIPTS_TOKEN) {
+	if (!storage || !env.RESEARCH_REPLICA_INGEST_TOKEN) {
 		return researchBoundaryResponse(new ResearchBoundaryError("STORE_UNAVAILABLE"), 503);
 	}
-	if (request.headers.get("Authorization") !== `Bearer ${env.RESEARCH_REPLICA_RECEIPTS_TOKEN}`) {
+	if (request.headers.get("Authorization") !== `Bearer ${env.RESEARCH_REPLICA_INGEST_TOKEN}`) {
 		return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
 	}
 	const url = new URL(request.url);
