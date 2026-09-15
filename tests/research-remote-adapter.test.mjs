@@ -568,7 +568,13 @@ test("C9 v4 Evidence refuses a tampered referenced object instead of serving unv
 // are exercised against production SQL.
 // ---------------------------------------------------------------------------
 const workflowModule = await import("../src/research-workflow.ts");
+const scopesModule = await import("../src/research-scopes.ts");
 const { createResearchWorkflowDb } = await import("./helpers/d1-sqlite-shim.mjs");
+
+// The workflow owner identity is the origin `oauth-client:<sha256(issuer\0clientId)>`
+// form (isFormalResearchOwner).  The adapter B15 lifecycle drives a formal claim,
+// so it uses a valid formal owner derived from the production issuer + client id.
+const FORMAL_OWNER_B15 = `oauth-client:${"c".repeat(64)}`;
 
 function shimStorage() {
 	return {
@@ -723,14 +729,14 @@ test("B15 job server_state derivation: terminal over unexpired lease over record
 	// 2. Unexpired lease -> CLAIMED with owner; filtered out by claimable_only.
 	const lease = await workflowModule.claimResearchJob(storage.db, {
 		jobId: "job-b15",
-		leaseOwner: workflowModule.RESEARCH_PRODUCTION_PRINCIPAL,
+		leaseOwner: FORMAL_OWNER_B15,
 		requestId: "req-b15",
 		now: nowIsoPlus(0),
 	});
 	assert.equal(lease.status, "CLAIMED");
 	jobs = await adapter.listResearchJobs();
 	assert.equal(jobs[0].server_state.effective_status, "CLAIMED");
-	assert.equal(jobs[0].server_state.lease_owner, workflowModule.RESEARCH_PRODUCTION_PRINCIPAL);
+	assert.equal(jobs[0].server_state.lease_owner, FORMAL_OWNER_B15);
 	assert.equal(jobs[0].server_state.lease_expires_at, lease.lease_expires_at);
 	assert.equal((await adapter.listResearchJobs(50, { claimableOnly: true })).length, 0);
 
@@ -738,6 +744,8 @@ test("B15 job server_state derivation: terminal over unexpired lease over record
 	const formal = await workflowModule.submitResearchResultProposal(storage.db, {
 		jobId: "job-b15",
 		claimToken: lease.claim_token,
+		expectedGeneration: lease.lease_generation,
+		origin: "CHATGPT",
 		idempotencyKey: "key-b15-formal",
 		proposal: {
 			job_id: "job-b15",
@@ -747,7 +755,7 @@ test("B15 job server_state derivation: terminal over unexpired lease over record
 			sources_consulted: [],
 			completed_at: "2026-09-15T00:00:00Z",
 		},
-		callerPrincipal: workflowModule.RESEARCH_PRODUCTION_PRINCIPAL,
+		callerPrincipal: FORMAL_OWNER_B15,
 		requestId: "req-b15-formal",
 		now: nowIsoPlus(1_000),
 	});
@@ -770,6 +778,7 @@ test("B15 context exposes proposals but never the claim token", async () => {
 	await workflowModule.submitResearchResultProposal(storage.db, {
 		jobId: "job-b15c",
 		claimToken: lease.claim_token,
+		expectedGeneration: lease.lease_generation,
 		idempotencyKey: "key-b15c-synth",
 		origin: "SYNTHETIC",
 		proposal: {
