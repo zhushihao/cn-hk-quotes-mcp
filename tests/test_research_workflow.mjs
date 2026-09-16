@@ -19,7 +19,10 @@ const replica = await import("../src/research-replica.ts");
 const outbound = await import("../src/research-outbound-v2.ts");
 const adapterMod = await import("../src/research-remote-adapter.ts");
 
-const PRODUCTION = workflow.RESEARCH_PRODUCTION_PRINCIPAL; // "chatgpt-production"
+// Synthetic values matching the current derived stable-owner shape returned by
+// formalResearchOwner(); the domain receives the derived owner, never a DCR
+// client id or a model-ferried claim token.
+const PRODUCTION = `oauth-client:${"a".repeat(64)}`;
 const ENGINEERING = "chatgpt-engineering";
 
 class FakeR2 {
@@ -116,15 +119,15 @@ async function submit(
 	storage,
 	jobId,
 	owner,
-	claimToken,
+	expectedGeneration,
 	idempotencyKey,
 	proposalPayload,
 	when,
-	{ origin, db } = {},
+	{ origin = "CHATGPT", db } = {},
 ) {
 	return workflow.submitResearchResultProposal(db ?? storage.db, {
 		jobId,
-		claimToken,
+		expectedGeneration,
 		idempotencyKey,
 		origin,
 		proposal: proposalPayload,
@@ -183,7 +186,7 @@ test("B1 concurrent double-claim yields exactly one CLAIMED", async () => {
 	}
 });
 
-test("B2 claim same-owner retry returns original lease and token", async () => {
+test("B2 claim same-owner retry returns the original lease generation", async () => {
 	const storage = freshStorage();
 	await ingestJob(storage, "job-b2");
 	const when = nowIso();
@@ -191,22 +194,21 @@ test("B2 claim same-owner retry returns original lease and token", async () => {
 	assert.equal(first.status, "CLAIMED");
 	const retry = await claim(storage, "job-b2", ENGINEERING, nowIso(5_000));
 	assert.equal(retry.status, "CLAIMED");
-	assert.equal(retry.claim_token, first.claim_token);
+	assert.equal(retry.lease_generation, first.lease_generation);
 	assert.equal(retry.claimed_at, first.claimed_at);
 	assert.equal(retry.lease_expires_at, first.lease_expires_at);
 	assert.equal(retry.claim_count, 1);
-	assert.match(first.claim_token, /^clt_[0-9a-f]{32}$/);
 	assert.equal(await countEvents(storage.db, "job-b2", "CLAIMED"), 1);
 });
 
-test("B3 expired lease can be taken over and old token dies", async () => {
+test("B3 expired lease takeover fences the old owner and generation", async () => {
 	const storage = freshStorage();
 	await ingestJob(storage, "job-b3");
 	const stale = await claim(storage, "job-b3", "client-a", nowIso(-7_200_000));
 	assert.equal(stale.status, "CLAIMED");
 	const takeover = await claim(storage, "job-b3", "client-b", nowIso());
 	assert.equal(takeover.status, "CLAIMED");
-	assert.notEqual(takeover.claim_token, stale.claim_token);
+	assert.notEqual(takeover.lease_generation, stale.lease_generation);
 	assert.equal(takeover.claim_count, 2);
 	const events = await eventRows(storage.db, "job-b3");
 	// Initial CLAIMED, then the takeover batch: one LEASE_EXPIRED for the
@@ -220,20 +222,20 @@ test("B3 expired lease can be taken over and old token dies", async () => {
 	const expiredEvents = events.filter((row) => row.event_type === "LEASE_EXPIRED");
 	assert.equal(expiredEvents.length, 1);
 	assert.equal(expiredEvents[0].actor, "client-a");
-	// The stale token is dead: submit with it hits TOKEN_MISMATCH and the
-	// proposal is audited as REJECTED without occupying the formal slot.
+	// The stale owner is fenced: submit with the old owner/generation pair hits
+	// OWNER_MISMATCH and is audited as REJECTED without occupying the formal slot.
 	const verdict = await submit(
 		storage,
 		"job-b3",
 		"client-a",
-		stale.claim_token,
+		stale.lease_generation,
 		"key-b3-stale",
 		proposal("job-b3"),
 		nowIso(),
 	);
 	assert.equal(verdict.status, "REJECTED");
 	assert.equal(verdict.reason, "LEASE_INVALID");
-	assert.equal(verdict.detail.sub_reason, "TOKEN_MISMATCH");
+	assert.equal(verdict.detail.sub_reason, "OWNER_MISMATCH");
 	const rejected = await storage.db
 		.prepare("SELECT status, reject_reason FROM research_proposals WHERE job_id='job-b3'")
 		.all();
@@ -244,7 +246,7 @@ test("B3 expired lease can be taken over and old token dies", async () => {
 		storage,
 		"job-b3",
 		"client-b",
-		takeover.claim_token,
+		takeover.lease_generation,
 		"key-b3-fresh",
 		proposal("job-b3"),
 		nowIso(),
@@ -296,7 +298,7 @@ test("B4 claimed job abandoned returns to QUEUED and context stays intact", asyn
 		storage,
 		jobId,
 		PRODUCTION,
-		reclaimed.claim_token,
+		reclaimed.lease_generation,
 		"key-b4-formal",
 		proposal(jobId),
 		nowIso(),
@@ -313,7 +315,7 @@ test("B5 completed job rejects further claims and submits", async () => {
 		storage,
 		"job-b5",
 		PRODUCTION,
-		lease.claim_token,
+		lease.lease_generation,
 		"key-b5-formal",
 		proposal("job-b5"),
 		nowIso(),
@@ -344,7 +346,7 @@ test("B5 completed job rejects further claims and submits", async () => {
 		storage,
 		"job-b5",
 		PRODUCTION,
-		"clt_" + "b".repeat(32),
+		1,
 		"key-b5-second",
 		proposal("job-b5", "second attempt"),
 		nowIso(),
@@ -366,7 +368,7 @@ test("B6 submit idempotent replay / conflict / second result and index backstop"
 		storage,
 		"job-b6",
 		PRODUCTION,
-		lease.claim_token,
+		lease.lease_generation,
 		"key-b6-formal",
 		proposal("job-b6"),
 		nowIso(),
@@ -378,7 +380,7 @@ test("B6 submit idempotent replay / conflict / second result and index backstop"
 		storage,
 		"job-b6",
 		PRODUCTION,
-		"clt_" + "c".repeat(32),
+		lease.lease_generation,
 		"key-b6-formal",
 		proposal("job-b6"),
 		nowIso(),
@@ -403,7 +405,7 @@ test("B6 submit idempotent replay / conflict / second result and index backstop"
 		storage,
 		"job-b6",
 		PRODUCTION,
-		"clt_" + "c".repeat(32),
+		lease.lease_generation,
 		"key-b6-formal",
 		proposal("job-b6", "different payload"),
 		nowIso(),
@@ -461,17 +463,17 @@ test("B9 inbound job republish never touches lease or terminal", async () => {
 	});
 	assert.equal(republished.status, "APPLIED");
 	const leaseRow = await storage.db
-		.prepare("SELECT lease_owner, claim_token FROM research_job_leases WHERE job_id='job-b9'")
+		.prepare("SELECT lease_owner, claim_count FROM research_job_leases WHERE job_id='job-b9'")
 		.first();
 	assert.equal(leaseRow.lease_owner, ENGINEERING);
-	assert.equal(leaseRow.claim_token, lease.claim_token);
+	assert.equal(leaseRow.claim_count, lease.lease_generation);
 
 	// Complete formally, then republish again: terminal wins over inbound.
 	const accepted = await submit(
 		storage,
 		"job-b9",
 		ENGINEERING,
-		lease.claim_token,
+		lease.lease_generation,
 		"key-b9-synth",
 		proposal("job-b9"),
 		nowIso(),
@@ -479,11 +481,12 @@ test("B9 inbound job republish never touches lease or terminal", async () => {
 	);
 	assert.equal(accepted.status, "ACCEPTED_SYNTHETIC");
 	const formalLease = await claim(storage, "job-b9", PRODUCTION, nowIso(1_000));
+	assert.equal(formalLease.status, "CLAIMED");
 	const formal = await submit(
 		storage,
 		"job-b9",
 		PRODUCTION,
-		formalLease.claim_token,
+		formalLease.lease_generation,
 		"key-b9-formal",
 		proposal("job-b9"),
 		nowIso(2_000),
@@ -516,7 +519,7 @@ test("B12 synthetic submit stored but never completes job; origin forge downgrad
 		storage,
 		"job-b12-synth",
 		ENGINEERING,
-		lease.claim_token,
+		lease.lease_generation,
 		"key-b12-synth",
 		proposal("job-b12-synth"),
 		nowIso(),
@@ -543,7 +546,7 @@ test("B12 synthetic submit stored but never completes job; origin forge downgrad
 		storage,
 		"job-b12-synth",
 		"client-b",
-		reClaim.claim_token,
+		reClaim.lease_generation,
 		"key-b12-forge",
 		proposal("job-b12-synth"),
 		nowIso(2_000),
@@ -571,7 +574,7 @@ test("B12 synthetic submit stored but never completes job; origin forge downgrad
 		storage,
 		"job-b12-synth",
 		PRODUCTION,
-		prodLease.claim_token,
+		prodLease.lease_generation,
 		"key-b12-shadow",
 		proposal("job-b12-synth"),
 		nowIso(4_000),
@@ -585,7 +588,7 @@ test("B12 synthetic submit stored but never completes job; origin forge downgrad
 		storage,
 		"job-b12-synth",
 		PRODUCTION,
-		prodLease.claim_token,
+		prodLease.lease_generation,
 		"key-b12-formal",
 		proposal("job-b12-synth"),
 		nowIso(5_000),
@@ -613,7 +616,7 @@ test("B11 submit 64 KiB / field-level ceilings and claim id bound", async () => 
 		storage,
 		"job-b11",
 		PRODUCTION,
-		lease.claim_token,
+		lease.lease_generation,
 		"key-b11-oversize",
 		oversized,
 		nowIso(),
@@ -647,7 +650,7 @@ test("B11 submit 64 KiB / field-level ceilings and claim id bound", async () => 
 			storage,
 			"job-b11",
 			PRODUCTION,
-			lease.claim_token,
+			lease.lease_generation,
 			key,
 			payload,
 			nowIso(),
@@ -660,7 +663,7 @@ test("B11 submit 64 KiB / field-level ceilings and claim id bound", async () => 
 		storage,
 		"job-b11",
 		PRODUCTION,
-		lease.claim_token,
+		lease.lease_generation,
 		"short",
 		proposal("job-b11"),
 		nowIso(),
@@ -682,7 +685,7 @@ test("B11 submit 64 KiB / field-level ceilings and claim id bound", async () => 
 		storage,
 		"job-b11",
 		PRODUCTION,
-		lease.claim_token,
+		lease.lease_generation,
 		"key-b11-formal",
 		proposal("job-b11"),
 		nowIso(),

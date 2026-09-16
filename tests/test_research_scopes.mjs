@@ -149,8 +149,13 @@ test("B10 no scope implies any other scope (escalation ban)", () => {
 	}
 });
 
-async function connectedClient(env, grantedScopes) {
-	const server = createServer(env, "ENABLED", grantedScopes);
+async function connectedClient(
+	env,
+	grantedScopes,
+	researchPrincipal = null,
+	researchIssuer = null,
+) {
+	const server = createServer(env, "ENABLED", grantedScopes, researchPrincipal, researchIssuer);
 	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 	const client = new Client({ name: "scope-gate-test", version: "0.0.0" });
 	await Promise.all([server.server.connect(serverTransport), client.connect(clientTransport)]);
@@ -198,7 +203,7 @@ test("B8 submit without research:submit is FILTERED even with research:claim", a
 			name: "submit_research_result_proposal",
 			arguments: {
 				job_id: "job-b8",
-				claim_token: "clt_" + "0".repeat(32),
+				expected_generation: 1,
 				idempotency_key: "key-b8-submit",
 				proposal: {},
 			},
@@ -219,6 +224,8 @@ test("B8 control: with research:claim granted the claim reaches the workflow", a
 	const { client, server } = await connectedClient(
 		env,
 		new Set(["market:read", RESEARCH_CLAIM_SCOPE]),
+		"stable-research-principal",
+		"https://issuer.example",
 	);
 	try {
 		const result = await client.callTool({

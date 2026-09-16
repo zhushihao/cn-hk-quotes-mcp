@@ -52,6 +52,7 @@ import {
 	claimResearchJob,
 	deferResearchJob,
 	listResearchJobReceipts,
+	RESEARCH_IDEMPOTENCY_KEY_PATTERN,
 	submitResearchResultProposal,
 } from "./research-workflow.ts";
 import { ingestResearchReplicaRecord, type ResearchReplicaStorage } from "./research-replica.ts";
@@ -65,6 +66,14 @@ const PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL =
 const GITHUB_REPOSITORY = "zhushihao/cn-hk-quotes-mcp";
 const GITHUB_ISSUE_NUMBER = 1;
 const GITHUB_API_VERSION = "2022-11-28";
+
+const RESEARCH_IDEMPOTENCY_KEY_SCHEMA = z
+	.string()
+	.min(8)
+	.max(128)
+	.regex(RESEARCH_IDEMPOTENCY_KEY_PATTERN);
+const RESEARCH_IDEMPOTENCY_KEY_DESCRIPTION =
+	" idempotency_key 必须为 8–128 个字符，仅允许 ASCII A-Z/a-z/0-9/:/_/-；`.`、`+` 和空格不合法。";
 
 interface Env {
 	GITHUB_TOKEN: string;
@@ -1073,11 +1082,13 @@ export function createServer(
 				" recommendation_hint（枚举 \"NONE\"|\"THESIS_REVIEW\"|\"COUNTER_EVIDENCE_FOUND\"|\"NO_SECOND_SOURCE\"|\"INSUFFICIENT_DATA\"）；" +
 				" sources_consulted（字符串数组 ≤100 项，每项 ≤500 字符，可为空数组）；completed_at（可解析的 ISO 时间字符串）；" +
 				" 可选 tokens_used（非负整数）。禁止任何其他键；整体负载 ≤64KiB。" +
-				" 写权限由服务端裁决：当前 OAuth 稳定主体必须是该 Job 现行租约的持有者，expected_generation 取 claim_research_job 返回的 lease_generation；不需要也不接受任何提交凭据。",
+				" 写权限由服务端裁决：当前 OAuth 稳定主体必须是该 Job 现行租约的持有者，expected_generation 取 claim_research_job 返回的 lease_generation；不需要也不接受任何提交凭据。" +
+				RESEARCH_IDEMPOTENCY_KEY_DESCRIPTION +
+				" 稳定键格式示例：chatgpt_submit:<job_id>:g<lease_generation>。",
 			inputSchema: z.object({
 				job_id: z.string().min(1),
 				expected_generation: z.number().int().min(1),
-				idempotency_key: z.string().min(1),
+				idempotency_key: RESEARCH_IDEMPOTENCY_KEY_SCHEMA,
 				origin: z.enum(["CHATGPT", "SYNTHETIC", "REPLAY"]).optional(),
 				proposal: z.record(z.string(), z.unknown()),
 			}),
@@ -1109,11 +1120,13 @@ export function createServer(
 		"defer_research_job",
 		{
 			description:
-				"远端延期当前正式租约到指定 recheck 时刻并原子释放租约；defer 不产生完成终态，正式终态仅由提交 result proposal 产生。写权限与 submit 相同（服务端主体+generation 裁决，无需凭据）。需要 research:submit scope。",
+				"远端延期当前正式租约到指定 recheck 时刻并原子释放租约；defer 不产生完成终态，正式终态仅由提交 result proposal 产生。写权限与 submit 相同（服务端主体+generation 裁决，无需凭据）。需要 research:submit scope。" +
+				RESEARCH_IDEMPOTENCY_KEY_DESCRIPTION +
+				" 稳定键格式示例：chatgpt_defer:<job_id>:g<lease_generation>。",
 			inputSchema: z.object({
 				job_id: z.string().min(1),
 				expected_generation: z.number().int().min(1),
-				idempotency_key: z.string().min(1),
+				idempotency_key: RESEARCH_IDEMPOTENCY_KEY_SCHEMA,
 				reason: z.enum(["RECHECK_REQUIRED", "UPSTREAM_UNAVAILABLE", "NEEDS_OWNER_INPUT"]),
 				recheck_at: z.string().datetime(),
 			}),
