@@ -22,7 +22,7 @@ GitHub 不是持仓真相源、也不是行情源；它只承担**私有控制�
 Worker 发送 code-only 投影，并携带 LIVE 机器现有 `gh auth` token 作为身份凭证。
 Worker 实时向 GitHub 校验 login=`zhushihao` 且该 token 对私有
 `zhushihao/quantpro-qmt` 具有写权限，验证通过才允许写 KV。token 不保存于
-Cloudflare KV、仓库或日志。PUBLIC `cn-hk-quotes-mcp` 不保存真实 LIVE universe。
+Cloudflare KV、仓库或日志。PUBLIC `quantpro-collector` 不保存真实 LIVE universe。
 本仓现有 Cron → GitHub Issue #1 仅作为旧行情桥兼容链保留，不注入 LIVE active set。
 
 ## `quote-universe/1`

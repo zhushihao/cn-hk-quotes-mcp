@@ -26,7 +26,7 @@ Issue #1 当前包含旧的持仓身份与数量字段，但线上任务仍依�
 - 当前账户可见 9 个活动 Scheduled Tasks；任务级 MCP、Plugin、Connector 和通知权限仍为 `AGENT_CONSUMPTION_UNVERIFIED`。
 - #2/#3 分别承担市场与研究状态账本职责；GitHub comments 是 append-only 记录，不提供数据库式 CAS。
 
-事实来源为总计划 [Issue #4](https://github.com/zhushihao/cn-hk-quotes-mcp/issues/4)、本机计划 [Issue #5](https://github.com/zhushihao/cn-hk-quotes-mcp/issues/5)、[Issue #1](https://github.com/zhushihao/cn-hk-quotes-mcp/issues/1)、[Issue #2](https://github.com/zhushihao/cn-hk-quotes-mcp/issues/2)、[Issue #3](https://github.com/zhushihao/cn-hk-quotes-mcp/issues/3) 和上述固定 SHA 源码。源码存在某条路径不等于它已经部署。
+事实来源为总计划 [Issue #4](https://github.com/zhushihao/quantpro-collector/issues/4)、本机计划 [Issue #5](https://github.com/zhushihao/quantpro-collector/issues/5)、[Issue #1](https://github.com/zhushihao/quantpro-collector/issues/1)、[Issue #2](https://github.com/zhushihao/quantpro-collector/issues/2)、[Issue #3](https://github.com/zhushihao/quantpro-collector/issues/3) 和上述固定 SHA 源码。源码存在某条路径不等于它已经部署。
 
 ## 3. 目标与非目标
 

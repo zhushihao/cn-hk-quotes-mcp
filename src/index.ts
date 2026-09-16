@@ -63,7 +63,7 @@ const PORTFOLIO_QUOTES_URL =
 	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
 const PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL =
 	"https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes";
-const GITHUB_REPOSITORY = "zhushihao/cn-hk-quotes-mcp";
+const GITHUB_REPOSITORY = "zhushihao/quantpro-collector";
 const GITHUB_ISSUE_NUMBER = 1;
 const GITHUB_API_VERSION = "2022-11-28";
 

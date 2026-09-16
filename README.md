@@ -16,7 +16,7 @@
 
 为避免对已上线链路造成破坏，以下标识暂不因产品改名而变化：
 
-- GitHub repository: `zhushihao/cn-hk-quotes-mcp`
+- GitHub repository: `zhushihao/quantpro-collector`
 - 生产 MCP endpoint: `https://cn-hk-quotes-mcp.zhushihao710.workers.dev/mcp`
 - 内部 `PORTFOLIO_UNIVERSE_TOKEN` 配置名
 - 已发布 MCP tool 名称

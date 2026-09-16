@@ -108,7 +108,7 @@ test("Cron and manual rerun accept the same dynamically added legal security", a
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input, options = {}) => {
 		const url = String(input);
-		if (url === "https://api.github.com/repos/zhushihao/cn-hk-quotes-mcp/issues/1") {
+		if (url === "https://api.github.com/repos/zhushihao/quantpro-collector/issues/1") {
 			return response(options.method === "PATCH" ? {} : { body: "" });
 		}
 		return response(snapshot);

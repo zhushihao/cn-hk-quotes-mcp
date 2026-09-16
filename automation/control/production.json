@@ -1,7 +1,7 @@
 {
   "schema_version": "quantpro-automation-control-v1",
   "status": "PRODUCTION",
-  "repository": "zhushihao/cn-hk-quotes-mcp",
+  "repository": "zhushihao/quantpro-collector",
   "migrated_from": {
     "repository": "zhushihao/QuantPro",
     "issue": 28,
@@ -10,31 +10,31 @@
   "registry": {
     "holding-assistant": {
       "path": "automation/prompts/holding-assistant.md",
-      "production_ref": "600e002b1e5759f16e98d4425aa9b8a8d84b8ff4",
+      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
       "write_scope": "READ_ONLY",
       "schedule": "工作日 09:10 / 09:50 / 10:50 / 11:50 / 13:50 / 14:50 / 16:45"
     },
     "industry-research": {
       "path": "automation/prompts/industry-research.md",
-      "production_ref": "600e002b1e5759f16e98d4425aa9b8a8d84b8ff4",
+      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
       "write_scope": "RESEARCH_JOB_ONLY",
       "schedule": "每小时 :25"
     },
     "company-facts": {
       "path": "automation/prompts/company-facts.md",
-      "production_ref": "600e002b1e5759f16e98d4425aa9b8a8d84b8ff4",
+      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
       "write_scope": "READ_ONLY",
       "schedule": "每小时"
     },
     "central-policy": {
       "path": "automation/prompts/central-policy.md",
-      "production_ref": "600e002b1e5759f16e98d4425aa9b8a8d84b8ff4",
+      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
       "write_scope": "READ_ONLY",
       "schedule": "每小时"
     },
     "ai-financing-rates": {
       "path": "automation/prompts/ai-financing-rates.md",
-      "production_ref": "600e002b1e5759f16e98d4425aa9b8a8d84b8ff4",
+      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
       "write_scope": "READ_ONLY",
       "schedule": "每 4 小时"
     }

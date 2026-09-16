@@ -5,7 +5,7 @@
 
 ## 账本定位
 
-- GitHub Issue：`zhushihao/cn-hk-quotes-mcp#2`
+- GitHub Issue：`zhushihao/quantpro-collector#2`
 - 写入方式：append-only Issue Comment；不覆盖、编辑或删除历史评论。
 - 行情原始事实：Issue #1；不是状态账本。
 - 产业/公司 Thesis：Issue #3；不是 Action Gate 或市场观察账本。
