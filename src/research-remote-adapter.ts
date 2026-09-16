@@ -377,27 +377,25 @@ export class CollectorResearchRemoteAdapter {
 	}
 
 	/**
-	 * §A5: market signal state reads the accumulator record projected into
-	 * the reserved `market:` subject namespace.  An absent record is the
-	 * honest NO_DATA domain result (the market detector is not deployed this
-	 * round), never an error and never fabricated data.
+	 * Market signals have their own latest-state record type. They never reuse
+	 * the D/S/M/E/P/C Evidence accumulator. An absent record is honest NO_DATA.
 	 */
 	async getMarketSignalState(subjectKey: string): Promise<Record<string, unknown>> {
 		if (typeof subjectKey !== "string" || subjectKey.trim().length === 0) fail("INTEGRITY_FAILED");
 		const normalized = subjectKey.startsWith("market:")
 			? subjectKey
 			: `market:${subjectKey.trim()}`;
-		for (const row of await this.records("accumulator", 100)) {
-			const payload = parsePayload(row);
-			if (payload.subject_key === normalized) {
-				return { ...recordView(row), subject_kind: "MARKET" };
-			}
+		try {
+			const row = await this.recordByKey("market_signal", normalized);
+			return { ...recordView(row), subject_kind: "MARKET", signal_kind: "R3_R4_PRICE_INPUT" };
+		} catch (error) {
+			if (!(error instanceof ResearchBoundaryError) || error.error_code !== "NOT_FOUND") throw error;
 		}
 		return {
 			status: "NO_DATA",
 			subject_key: normalized,
 			source: "COLLECTOR_REPLICA",
-			note: "MARKET_DETECTOR_NOT_DEPLOYED",
+			note: "MARKET_SIGNAL_NOT_AVAILABLE",
 		};
 	}
 

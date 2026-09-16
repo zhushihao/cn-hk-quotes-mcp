@@ -123,6 +123,48 @@ function storage() {
 	return { db: new FakeD1(), objects: new FakeR2() };
 }
 
+async function marketSignalRecord(subjectKey = "market:000001.SZ") {
+	const payload = {
+		subject_key: subjectKey,
+		as_of: "2026-09-16",
+		status: "READY",
+		benchmark_mapping_version: "market-benchmarks.v1",
+		mapping_id: "cn-a-share-stock-v1",
+		primary_benchmark: "510300.SH",
+		secondary_benchmark: "510500.SH",
+		source: { provider: "amazingdata", snapshot_hash: "a".repeat(64), snapshot_as_of: "2026-09-16T17:44:28+08:00" },
+		quality: { valid_trading_days: 10, required_trading_days: 10, future_rows_dropped: 0, missing_sessions: 0 },
+		returns: Object.fromEntries([1, 3, 5, 10].map((window) => [`${window}D`, { window_complete: true, valid_trading_days: window, subject_return: 0.1, primary_benchmark_return: 0.05, secondary_benchmark_return: 0.04 }])),
+		relative_strength: { primary_pct_points: { "1D": 5, "3D": 5, "5D": 5, "10D": 5 }, secondary_pct_points: { "1D": 6, "3D": 6, "5D": 6, "10D": 6 } },
+		volume_price_structure: { up_volume_ratio_5d: 1.25, pullback_volume_ratio_5d: null, volume_up: true, pullback_volume_contraction: false },
+		continuous_market_structure: { required_sessions: 3, observed_sessions: 3, relative_positive_sessions: 3, status: "CONFIRMED" },
+		visibility: "PUBLIC",
+	};
+	const record = {
+		record_type: "market_signal",
+		message_id: "",
+		schema_version: "collector-market-signal-v1",
+		policy_version: "market-signal-v1",
+		visibility: "PUBLIC",
+		payload,
+		generated_at: "2026-09-16T18:00:00Z",
+	};
+	record.message_id = await outbound.computeOutboundV2MessageId(record);
+	return record;
+}
+
+test("C5 ingests an independently versioned market_signal record without an Evidence accumulator", async () => {
+	const store = storage();
+	const record = await marketSignalRecord();
+	const result = await replica.ingestResearchReplicaRecord(store, record, null, "2026-09-16T18:00:01Z");
+	assert.equal(result.status, "APPLIED");
+	assert.equal(result.record_type, "market_signal");
+	const saved = store.db.records.get("market_signal:market:000001.SZ");
+	assert.equal(saved.schemaVersion, "collector-market-signal-v1");
+	assert.equal(JSON.parse(saved.payloadJson).returns["10D"].valid_trading_days, 10);
+	assert.equal(JSON.stringify(saved.payloadJson).includes("evidence_ids"), false);
+});
+
 test("C5 stores path-free metadata, document links, and an immutable recovery journal", async () => {
 	const store = storage();
 	const document = (await fixture("metadata_document_version.public.json"))[0];

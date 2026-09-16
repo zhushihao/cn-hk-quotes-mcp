@@ -647,33 +647,35 @@ test("B15 market signal state returns the honest NO_DATA domain result", async (
 			status: "NO_DATA",
 			subject_key: "market:synthetic-index",
 			source: "COLLECTOR_REPLICA",
-			note: "MARKET_DETECTOR_NOT_DEPLOYED",
+			note: "MARKET_SIGNAL_NOT_AVAILABLE",
 		});
 	}
 });
 
-test("B15 market signal state returns the accumulator record view on a hit", async () => {
+test("B15 market signal state returns the independent numeric record view on a hit", async () => {
 	const storage = shimStorage();
-	await insertRecord(storage.db, "accumulator", "snap-market-1", {
-		conflict_count: 0,
-		created_at: "2026-09-15T00:00:00+00:00",
-		dimensions: { C: 0, D: 1, E: 0, M: 1, P: 0, S: 1 },
-		evidence_ids: ["ev-1"],
-		independent_cluster_count: 1,
-		last_evidence_at: "2026-09-15T00:00:00+00:00",
-		rule_version: "accumulator-v1",
-		snapshot_id: "snap-market-1",
-		status: "ACCUMULATING",
+	await insertRecord(storage.db, "market_signal", "market:synthetic-index", {
+		as_of: "2026-09-15",
+		benchmark_mapping_version: "market-benchmarks.v1",
+		continuous_market_structure: { required_sessions: 3, observed_sessions: 3, relative_positive_sessions: 3, status: "CONFIRMED" },
+		mapping_id: "synthetic-v1",
+		primary_benchmark: "510300.SH",
+		quality: { valid_trading_days: 10, required_trading_days: 10, future_rows_dropped: 0, missing_sessions: 0 },
+		relative_strength: { primary_pct_points: { "1D": 1, "3D": 2, "5D": 3, "10D": 4 }, secondary_pct_points: { "1D": 1, "3D": 2, "5D": 3, "10D": 4 } },
+		returns: Object.fromEntries(["1D", "3D", "5D", "10D"].map((window) => [window, { window_complete: true, valid_trading_days: Number.parseInt(window, 10), subject_return: 0.1, primary_benchmark_return: 0.05, secondary_benchmark_return: 0.04 }])),
+		secondary_benchmark: "510500.SH",
+		source: { provider: "amazingdata", snapshot_hash: "a".repeat(64), snapshot_as_of: "2026-09-15T18:00:00+08:00" },
+		status: "READY",
 		subject_key: "market:synthetic-index",
-		total_weight: 1,
-		unknown_cluster_count: 0,
+		volume_price_structure: { up_volume_ratio_5d: 1.2, pullback_volume_ratio_5d: null, volume_up: true, pullback_volume_contraction: false },
 		visibility: "PUBLIC",
 	});
 	const adapter = new remote.CollectorResearchRemoteAdapter(storage, { visibility: "PUBLIC" });
 	for (const key of ["synthetic-index", "market:synthetic-index"]) {
 		const view = await adapter.getMarketSignalState(key);
 		assert.equal(view.subject_kind, "MARKET");
-		assert.equal(view.record_key, "snap-market-1");
+		assert.equal(view.signal_kind, "R3_R4_PRICE_INPUT");
+		assert.equal(view.record_key, "market:synthetic-index");
 		assert.equal(view.payload.subject_key, "market:synthetic-index");
 		assert.equal(view.source, "COLLECTOR_REPLICA");
 	}

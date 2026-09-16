@@ -17,12 +17,15 @@
 export const OUTBOUND_V2_SCHEMA_VERSION = "collector-outbound-v2";
 export const OUTBOUND_V3_SCHEMA_VERSION = "collector-outbound-v3";
 export const OUTBOUND_V4_SCHEMA_VERSION = "collector-outbound-v4";
+/** Independently versioned numeric price-signal record; not an Evidence stream. */
+export const MARKET_SIGNAL_SCHEMA_VERSION = "collector-market-signal-v1";
 
 /** Ingest compatibility window: both generations are accepted (§5.1). */
 export const ACCEPTED_OUTBOUND_SCHEMA_VERSIONS = new Set([
 	OUTBOUND_V2_SCHEMA_VERSION,
 	OUTBOUND_V3_SCHEMA_VERSION,
 	OUTBOUND_V4_SCHEMA_VERSION,
+	MARKET_SIGNAL_SCHEMA_VERSION,
 ]);
 
 /** Producer-side current schema version (RESEARCH outbound.py mirrors this). */
@@ -37,6 +40,7 @@ const RECORD_TYPES = new Set([
 	"job",
 	"object",
 ]);
+const MARKET_SIGNAL_RECORD_TYPE = "market_signal";
 
 /** v3-only record type (§A6). Bucketed per schema version in validate. */
 const V3_RECORD_TYPES = new Set(["source_health"]);
@@ -285,6 +289,18 @@ const EVIDENCE_KEYS = [
 	"historical_backfill",
 	"claim",
 ];
+const MARKET_SIGNAL_KEYS = [
+	"subject_key", "as_of", "status", "benchmark_mapping_version", "mapping_id",
+	"primary_benchmark", "secondary_benchmark", "source", "quality", "returns",
+	"relative_strength", "volume_price_structure", "continuous_market_structure", "visibility",
+];
+const MARKET_SIGNAL_SOURCE_KEYS = ["provider", "snapshot_hash", "snapshot_as_of"];
+const MARKET_SIGNAL_QUALITY_KEYS = ["valid_trading_days", "required_trading_days", "future_rows_dropped", "missing_sessions"];
+const MARKET_SIGNAL_RETURN_KEYS = ["window_complete", "valid_trading_days", "subject_return", "primary_benchmark_return", "secondary_benchmark_return"];
+const MARKET_SIGNAL_RELATIVE_KEYS = ["primary_pct_points", "secondary_pct_points"];
+const MARKET_SIGNAL_VOLUME_KEYS = ["up_volume_ratio_5d", "pullback_volume_ratio_5d", "volume_up", "pullback_volume_contraction"];
+const MARKET_SIGNAL_CONTINUOUS_KEYS = ["required_sessions", "observed_sessions", "relative_positive_sessions", "status"];
+const MARKET_SIGNAL_STATUSES = new Set(["READY", "INSUFFICIENT_HISTORY", "NO_VALID_BENCHMARK", "QUALITY_FAILED"]);
 const EVIDENCE_V4_KEYS = [
 	...EVIDENCE_KEYS,
 	"source_reference",
@@ -480,6 +496,8 @@ export function outboundV2RecordKey(record: OutboundV2Record): string {
 			return stringField(payload.job_id);
 		case "source_health":
 			return stringField(payload.source_id);
+		case MARKET_SIGNAL_RECORD_TYPE:
+			return stringField(payload.subject_key);
 		default:
 			return fail("UNSUPPORTED_OPERATION");
 	}
@@ -538,6 +556,43 @@ function validateSourceHealthPayload(payload: Record<string, unknown>): void {
 	) {
 		fail("INTEGRITY_FAILED");
 	}
+}
+
+function finiteOrNull(value: unknown): void {
+	if (value !== null && (typeof value !== "number" || !Number.isFinite(value))) fail("INTEGRITY_FAILED");
+}
+
+/** Closed schema for numeric R3/R4 inputs. It contains no Evidence/R1/R2 fields. */
+function validateMarketSignalPayload(payload: Record<string, unknown>): void {
+	exactKeys(payload, MARKET_SIGNAL_KEYS);
+	stringField(payload.subject_key);
+	if (!String(payload.subject_key).startsWith("market:")) fail("INTEGRITY_FAILED");
+	if (payload.as_of !== null && (typeof payload.as_of !== "string" || Number.isNaN(Date.parse(payload.as_of)))) fail("INTEGRITY_FAILED");
+	if (typeof payload.status !== "string" || !MARKET_SIGNAL_STATUSES.has(payload.status)) fail("INTEGRITY_FAILED");
+	for (const key of ["benchmark_mapping_version", "mapping_id", "primary_benchmark", "secondary_benchmark"]) if (payload[key] !== null && typeof payload[key] !== "string") fail("INTEGRITY_FAILED");
+	if (!isRecord(payload.source) || !isRecord(payload.quality) || !isRecord(payload.returns) || !isRecord(payload.relative_strength) || !isRecord(payload.volume_price_structure) || !isRecord(payload.continuous_market_structure)) fail("INTEGRITY_FAILED");
+	exactKeys(payload.source, MARKET_SIGNAL_SOURCE_KEYS);
+	exactKeys(payload.quality, MARKET_SIGNAL_QUALITY_KEYS);
+	exactKeys(payload.relative_strength, MARKET_SIGNAL_RELATIVE_KEYS);
+	exactKeys(payload.volume_price_structure, MARKET_SIGNAL_VOLUME_KEYS);
+	exactKeys(payload.continuous_market_structure, MARKET_SIGNAL_CONTINUOUS_KEYS);
+	if (typeof payload.source.provider !== "string") fail("INTEGRITY_FAILED");
+	for (const key of ["snapshot_hash", "snapshot_as_of"]) if (payload.source[key] !== null && typeof payload.source[key] !== "string") fail("INTEGRITY_FAILED");
+	for (const key of MARKET_SIGNAL_QUALITY_KEYS) if (typeof payload.quality[key] !== "number" || !Number.isInteger(payload.quality[key]) || payload.quality[key] < 0) fail("INTEGRITY_FAILED");
+	const relative = payload.relative_strength as Record<string, Record<string, unknown>>;
+	for (const window of ["1D", "3D", "5D", "10D"]) {
+		const value = payload.returns[window];
+		if (!isRecord(value)) fail("INTEGRITY_FAILED");
+		exactKeys(value, MARKET_SIGNAL_RETURN_KEYS);
+		if (typeof value.window_complete !== "boolean" || typeof value.valid_trading_days !== "number" || !Number.isInteger(value.valid_trading_days) || value.valid_trading_days < 0) fail("INTEGRITY_FAILED");
+		for (const key of ["subject_return", "primary_benchmark_return", "secondary_benchmark_return"]) finiteOrNull(value[key]);
+		finiteOrNull(relative.primary_pct_points?.[window]);
+		finiteOrNull(relative.secondary_pct_points?.[window]);
+	}
+	for (const key of ["up_volume_ratio_5d", "pullback_volume_ratio_5d"]) finiteOrNull(payload.volume_price_structure[key]);
+	for (const key of ["volume_up", "pullback_volume_contraction"]) if (payload.volume_price_structure[key] !== null && typeof payload.volume_price_structure[key] !== "boolean") fail("INTEGRITY_FAILED");
+	for (const key of ["required_sessions", "observed_sessions", "relative_positive_sessions"]) if (typeof payload.continuous_market_structure[key] !== "number" || !Number.isInteger(payload.continuous_market_structure[key]) || payload.continuous_market_structure[key] < 0) fail("INTEGRITY_FAILED");
+	if (!["CONFIRMED", "NOT_CONFIRMED", "INSUFFICIENT_HISTORY"].includes(String(payload.continuous_market_structure.status))) fail("INTEGRITY_FAILED");
 }
 
 function validateNestedPayload(record: OutboundV2Record): void {
@@ -611,6 +666,7 @@ function validateNestedPayload(record: OutboundV2Record): void {
 	if (record.record_type === "source_health") {
 		validateSourceHealthPayload(payload);
 	}
+	if (record.record_type === MARKET_SIGNAL_RECORD_TYPE) validateMarketSignalPayload(payload);
 	if (record.record_type === "object") {
 		exactKeys(payload, PAYLOAD_KEYS.object);
 		if (payload.object_id !== payload.content_sha256 || payload.encoding !== "identity") {
@@ -656,7 +712,8 @@ export function validateOutboundV2Record(value: unknown): OutboundV2Record {
 		typeof value.record_type === "string" &&
 		(RECORD_TYPES.has(value.record_type) ||
 			(schemaVersion !== OUTBOUND_V2_SCHEMA_VERSION && V3_RECORD_TYPES.has(value.record_type)));
-	if (!recordTypeAllowed) fail("UNSUPPORTED_OPERATION");
+	const marketSignalAllowed = schemaVersion === MARKET_SIGNAL_SCHEMA_VERSION && value.record_type === MARKET_SIGNAL_RECORD_TYPE;
+	if (!recordTypeAllowed && !marketSignalAllowed) fail("UNSUPPORTED_OPERATION");
 	if (!/^outbound_[0-9a-f]{40}$/.test(stringField(value.message_id))) fail("INTEGRITY_FAILED");
 	stringField(value.policy_version);
 	if (value.generated_at !== null && typeof value.generated_at !== "string")

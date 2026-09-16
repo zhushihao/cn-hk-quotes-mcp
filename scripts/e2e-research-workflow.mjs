@@ -398,7 +398,8 @@ async function step2ReadPlane() {
 		{ health },
 	);
 	markTool("get_source_health");
-	// §A5 verbatim empty state: the market detector is not deployed this round.
+	// Empty state remains an honest domain result when this synthetic workflow
+	// does not ingest a market_signal record.
 	const signal = domainPayload(
 		step,
 		"get_market_signal_state",
@@ -413,9 +414,9 @@ async function step2ReadPlane() {
 				status: "NO_DATA",
 				subject_key: "market:e2e-synthetic-index",
 				source: "COLLECTOR_REPLICA",
-				note: "MARKET_DETECTOR_NOT_DEPLOYED",
+				note: "MARKET_SIGNAL_NOT_AVAILABLE",
 			}),
-		"market signal NO_DATA shape drifted from §A5",
+		"market signal NO_DATA shape drifted",
 		{ signal },
 	);
 	markTool("get_market_signal_state");

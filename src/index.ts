@@ -1015,7 +1015,7 @@ export function createServer(
 		"get_market_signal_state",
 		{
 			description:
-				"读取市场信号状态（market: 命名空间 accumulator 投影）。无生产者时如实返回 NO_DATA（MARKET_DETECTOR_NOT_DEPLOYED），不报错也不伪造数据。",
+				"读取市场信号状态（独立 market_signal 数值记录，仅作 R3/R4 价格输入）。无记录时如实返回 NO_DATA，不报错也不伪造数据。",
 			inputSchema: z.object({ subject_key: z.string().min(1).max(128) }),
 		},
 		async ({ subject_key }) =>
