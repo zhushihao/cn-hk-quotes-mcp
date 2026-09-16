@@ -165,6 +165,31 @@ test("C5 ingests an independently versioned market_signal record without an Evid
 	assert.equal(JSON.stringify(saved.payloadJson).includes("evidence_ids"), false);
 });
 
+test("C5 preserves Python market-signal 0.0 and 1.0 spellings in the message id", async () => {
+	const record = await marketSignalRecord("market:canonical-float.SZ");
+	record.payload.mapping_id = "canonical-float-v1";
+	for (const window of ["1D", "3D", "5D", "10D"]) {
+		record.payload.returns[window] = {
+			window_complete: true,
+			valid_trading_days: Number.parseInt(window, 10),
+			subject_return: 0,
+			primary_benchmark_return: 1,
+			secondary_benchmark_return: 0,
+		};
+		record.payload.relative_strength.primary_pct_points[window] = 0;
+		record.payload.relative_strength.secondary_pct_points[window] = 1;
+	}
+	record.payload.volume_price_structure = {
+		up_volume_ratio_5d: 1,
+		pullback_volume_ratio_5d: 0,
+		volume_up: true,
+		pullback_volume_contraction: false,
+	};
+	record.message_id = await outbound.computeOutboundV2MessageId(record);
+	assert.equal(record.message_id, "outbound_c314986b1f1f182d9e17ec92f0ccd5cfbdf2e681");
+	await assert.doesNotReject(() => outbound.verifyOutboundV2Record(record));
+});
+
 test("C5 stores path-free metadata, document links, and an immutable recovery journal", async () => {
 	const store = storage();
 	const document = (await fixture("metadata_document_version.public.json"))[0];
