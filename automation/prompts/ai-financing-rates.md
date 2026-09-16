@@ -18,7 +18,7 @@ WRITE_SCOPE=READ_ONLY
 
 ## 账本路由
 
-`zhushihao/cn-hk-quotes-mcp#1` 是行情原始事实，`#2` 是持仓助手的市场状态与
+`zhushihao/quantpro-collector#1` 是行情原始事实，`#2` 是持仓助手的市场状态与
 Action Gate，`#3` 只接受产业/公司/日终有效状态。AI 融资与利率任务不是这些账本的
 授权 producer，因此三者都只读、不 append、不改写。不得把本地文件、旧报告、聊天
 记忆或 QuantPro #28/#30 当作生产状态；本轮 Collector 与正式来源仍是事实源。

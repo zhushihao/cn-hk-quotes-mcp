@@ -34,9 +34,9 @@ WRITE_SCOPE=READ_ONLY
 只使用以下生产账本；不得把 #28、#30、本地文件、旧报告或聊天记忆当作运行态：
 
 ```text
-行情原始事实：zhushihao/cn-hk-quotes-mcp#1（只读）
-市场状态、Action Gate、盘中与收盘检查点：zhushihao/cn-hk-quotes-mcp#2
-产业/公司 Thesis 状态：zhushihao/cn-hk-quotes-mcp#3（只读）
+行情原始事实：zhushihao/quantpro-collector#1（只读）
+市场状态、Action Gate、盘中与收盘检查点：zhushihao/quantpro-collector#2
+产业/公司 Thesis 状态：zhushihao/quantpro-collector#3（只读）
 ```
 
 Issue #2 是 append-only 市场状态账本。每轮先完整分页读取当日有效评论与

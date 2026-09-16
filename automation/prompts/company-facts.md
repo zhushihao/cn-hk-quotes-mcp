@@ -26,13 +26,13 @@ WRITE_SCOPE=READ_ONLY
 ## 账本路由
 
 只在出现实质公司 Evidence、公司 Thesis、公司确认或反证迁移时，向
-`zhushihao/cn-hk-quotes-mcp#3` append 一条既有
+`zhushihao/quantpro-collector#3` append 一条既有
 `investment_state_batch_v1` 批量评论，`producer=company_validation`、
 `dimension=COMPANY`。写前完整分页读取同一标的 + COMPANY 的最新有效事件；无实质
 新增不写，写后回读确认。公司确认 R2 只能由公司级事实形成，价格、成交量或市场结构
 不得形成 R2。
 
-`zhushihao/cn-hk-quotes-mcp#1` 仅是行情原始事实，`#2` 仅是持仓助手市场状态账本；
+`zhushihao/quantpro-collector#1` 仅是行情原始事实，`#2` 仅是持仓助手市场状态账本；
 本任务对二者只读且不写。不得以本地文件、旧报告、聊天记忆或 QuantPro #28/#30 代替
 上述账本。
 

@@ -27,12 +27,12 @@ WRITE_SCOPE=RESEARCH_JOB_ONLY
 ## 账本路由
 
 只在出现实质产业 Evidence、产业 Thesis、Research Priority 或 R0/R1 迁移时，向
-`zhushihao/cn-hk-quotes-mcp#3` append 一条既有
+`zhushihao/quantpro-collector#3` append 一条既有
 `investment_state_batch_v1` 批量评论，`producer=industry_trend`、
 `dimension=INDUSTRY`。写前完整分页读取同一标的 + INDUSTRY 的最新有效事件；无
 实质新增不写，写后回读确认。不得把市场结构、价格、Action Gate 或 R2/R4 写入 #3。
 
-`zhushihao/cn-hk-quotes-mcp#1` 仅是行情原始事实，`#2` 仅是持仓助手市场状态账本；
+`zhushihao/quantpro-collector#1` 仅是行情原始事实，`#2` 仅是持仓助手市场状态账本；
 本任务对二者只读且不写。不得以本地文件、旧报告、聊天记忆或 QuantPro #28/#30 代替
 上述账本。
 
