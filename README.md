@@ -2,7 +2,7 @@
 
 > QuantPro 的统一远程 MCP Collector / Gateway。
 
-`QuantPro Collector` 是现有 `cn-hk-quotes-mcp` 服务的产品名称。仓库名、Cloudflare Worker URL 和既有工具名保持兼容；命名调整不应破坏现有 LIVE overlay、行情查询和 Codex/ChatGPT 客户端配置。
+`QuantPro Collector` 是现有 `cn-hk-quotes-mcp` 服务的产品名称。GitHub 仓库已于 2026-09-16 由 `zhushihao/cn-hk-quotes-mcp` 更名为 `zhushihao/quantpro-collector`（旧 URL 由 GitHub 重定向）；Cloudflare Worker URL 和既有工具名保持兼容，命名调整不应破坏现有 LIVE overlay、行情查询和 Codex/ChatGPT 客户端配置。
 
 当前已承载的只读能力包括：
 
