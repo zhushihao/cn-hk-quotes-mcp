@@ -61,13 +61,14 @@ function context() {
 	return { waitUntil() {}, passThroughOnException() {} };
 }
 
-function envWithKv() {
+function envWithKv(overrides = {}) {
 	return {
 		GITHUB_TOKEN: "test-token",
 		PORTFOLIO_UNIVERSE_TOKEN: "private-token",
 		PORTFOLIO_UNIVERSE: {
 			get: async () => { throw new Error("public route must not read LIVE KV"); },
 		},
+		...overrides,
 	};
 }
 
@@ -109,22 +110,25 @@ async function readMcpJson(response) {
 	return JSON.parse(text);
 }
 
-const PUBLIC_QUOTES_SOURCE = "https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes";
-const DYNAMIC_QUOTES_SOURCE = "https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
+const PROTECTED_QUOTES_SOURCE = "https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
 
-function publicUpstream(fetchCount, status = 200, body = snapshot()) {
-	return async (input) => {
+function protectedUpstream(fetchCount, status = 200, body = snapshot(), expectedAccess = null) {
+	return async (input, init = {}) => {
 		fetchCount.count += 1;
 		const url = String(input);
-		assert.match(url, new RegExp(`${PUBLIC_QUOTES_SOURCE.replaceAll(".", "\\.")}\\?_bridge_ts=`));
-		assert.equal(url.startsWith(DYNAMIC_QUOTES_SOURCE), false);
+		assert.match(url, new RegExp(`${PROTECTED_QUOTES_SOURCE.replaceAll(".", "\\.")}\\?_bridge_ts=`));
+		if (expectedAccess) {
+			const headers = new Headers(init.headers);
+			assert.equal(headers.get("CF-Access-Client-Id"), expectedAccess.id);
+			assert.equal(headers.get("CF-Access-Client-Secret"), expectedAccess.secret);
+		}
 		return jsonResponse(body, status);
 	};
 }
 
-test("public route returns a quote-only snapshot without reading LIVE KV", async () => {
+test("public route returns a quote-only snapshot from the protected proxy without reading LIVE KV", async () => {
 	const fetchCount = { count: 0 };
-	const response = await fetchPublicRoute(publicUpstream(fetchCount));
+	const response = await fetchPublicRoute(protectedUpstream(fetchCount));
 	assert.equal(response.status, 200);
 	assert.equal(response.headers.get("Cache-Control"), "no-store");
 	const body = await response.json();
@@ -135,9 +139,20 @@ test("public route returns a quote-only snapshot without reading LIVE KV", async
 	assert.equal(fetchCount.count, 1);
 });
 
+test("public route forwards Cloudflare Access service credentials to the protected proxy", async () => {
+	const fetchCount = { count: 0 };
+	const access = { id: "access-client", secret: "access-secret" };
+	const response = await fetchPublicRoute(
+		protectedUpstream(fetchCount, 200, snapshot(), access),
+		envWithKv({ CF_ACCESS_CLIENT_ID: access.id, CF_ACCESS_CLIENT_SECRET: access.secret }),
+	);
+	assert.equal(response.status, 200);
+	assert.equal(fetchCount.count, 1);
+});
+
 test("public MCP tool uses the same quote-only snapshot shape", async () => {
 	const fetchCount = { count: 0 };
-	const response = await callPublicTool(publicUpstream(fetchCount));
+	const response = await callPublicTool(protectedUpstream(fetchCount));
 	assert.equal(response.status, 200);
 	const payload = await readMcpJson(response);
 	const content = payload.result?.content?.find((item) => item.type === "text");
@@ -160,9 +175,9 @@ test("public route returns a closed 502 error and never falls back to private ou
 	assert.equal(fetchCount.count, 1);
 });
 
-test("public route converts a public-source 404 into the closed public error", async () => {
+test("public route converts a protected-proxy 404 into the closed public error", async () => {
 	const fetchCount = { count: 0 };
-	const response = await fetchPublicRoute(publicUpstream(fetchCount, 404, { private: "should not be returned" }));
+	const response = await fetchPublicRoute(protectedUpstream(fetchCount, 404, { private: "should not be returned" }));
 	assert.equal(response.status, 502);
 	assert.deepEqual(await response.json(), { error: "UPSTREAM_UNAVAILABLE", message: "Public quote snapshot is unavailable" });
 	assert.equal(fetchCount.count, 1);
@@ -171,7 +186,7 @@ test("public route converts a public-source 404 into the closed public error", a
 test("public route converts a structurally invalid snapshot into the closed public error", async () => {
 	const malformed = snapshot();
 	delete malformed.stocks[0].quality;
-	const response = await fetchPublicRoute(publicUpstream({ count: 0 }, 200, malformed));
+	const response = await fetchPublicRoute(protectedUpstream({ count: 0 }, 200, malformed));
 	assert.equal(response.status, 502);
 	assert.deepEqual(await response.json(), { error: "UPSTREAM_UNAVAILABLE", message: "Public quote snapshot is unavailable" });
 });
