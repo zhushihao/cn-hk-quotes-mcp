@@ -61,10 +61,8 @@ import { ResearchBoundaryError } from "./research-outbound-v2.ts";
 
 const PORTFOLIO_QUOTES_URL =
 	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
-// Compatibility alias retained so the existing retry structure remains stable while
-// the retired Site is no longer a runtime dependency. Both entries resolve to the
-// same Access-protected upstream; a later cleanup may collapse the duplicate retry.
-const PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL = PORTFOLIO_QUOTES_URL;
+const PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL =
+	"https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes";
 const GITHUB_REPOSITORY = "zhushihao/quantpro-collector";
 const GITHUB_ISSUE_NUMBER = 1;
 const GITHUB_API_VERSION = "2022-11-28";
@@ -88,7 +86,7 @@ interface Env {
 	COLLECTOR_MCP_CLIENT_ID?: string;
 	/** 空格或逗号分隔的批准 scopes；LIVE overlay 至少要求 market:read。 */
 	COLLECTOR_MCP_CLIENT_SCOPES?: string;
-	/** 受保护行情 origin（cn-hk-quotes-proxy）使用的 Cloudflare Access 服务令牌。 */
+	/** 旧行情 origin（cn-hk-quotes-proxy / chatgpt.site）启用 Cloudflare Access 后注入。 */
 	CF_ACCESS_CLIENT_ID?: string;
 	CF_ACCESS_CLIENT_SECRET?: string;
 	RESEARCH_REPLICA?: D1Database;
@@ -373,7 +371,7 @@ async function completeMissingLiveQuotes(
  * `fetchUpstreamSnapshot()` 的 LIVE 叠加门（D-1 选项 A）。
  *
  * 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：只有显式传入 `ENABLED`
- * 的调用方才可能应用 LIVE 叠加。`updateQuoteBridge()`（旧行情桥）不传叠加门参，
+ * 的调用方才可能应用 LIVE 叠加。`updateQuoteBridge()`（旧行情桥）本就不传 `env`，
  * 叠加在结构上不可能发生（见 `PORTFOLIO_SYNC.md`「与旧桥的兼容」）。
  */
 type UpstreamFetchOptions = {
@@ -398,8 +396,9 @@ async function fetchUpstreamSnapshot(
 
 		try {
 			const separator = source.includes("?") ? "&" : "?";
-			// 受保护行情 proxy 使用 Cloudflare Access 服务令牌；绑定未配置时
-			// 保持匿名（本地 dev / Access 未开启阶段），凭据不进日志。
+			// 旧行情 origin（proxy/chatgpt.site）启用 Cloudflare Access 服务令牌后，
+			// 内部抓取凭 CF-Access-Client-Id/Secret 通过边（issue #7 Step 3）；
+			// 绑定未配置时保持匿名（本地 dev / Access 未开启阶段），凭据不进日志。
 			const accessHeaders: Record<string, string> = {};
 			if (env?.CF_ACCESS_CLIENT_ID && env?.CF_ACCESS_CLIENT_SECRET) {
 				accessHeaders["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
@@ -492,6 +491,8 @@ async function fetchUpstreamSnapshot(
 			return { snapshot: projectedSnapshot, source };
 		} catch (error) {
 			if (error instanceof LiveCoverageError) {
+				// D-1 要求 2：面向调用方的文本只出数量（error.message 已是数量文本），
+				// 逐代码明细只进服务端结构化日志。
 				logBridgeStage(context, "live_universe_coverage_incomplete", {
 					active_count: error.activeCount,
 					quoted_active_count: error.quotedActiveCount,
@@ -504,9 +505,9 @@ async function fetchUpstreamSnapshot(
 				error instanceof BridgeError
 					? error
 					: new BridgeError("upstream_fetch", safeErrorMessage(error));
-			const canRetryWithNextSource =
+			const canRetryWithPublicSite =
 				lastError.httpStatus === 404 && index < sources.length - 1;
-			if (!canRetryWithNextSource) {
+			if (!canRetryWithPublicSite) {
 				throw lastError;
 			}
 			logBridgeStage(context, "upstream_fetch_retry", {
@@ -526,10 +527,10 @@ async function fetchPublicQuoteSnapshot(
 	context: BridgeStageContext,
 	env?: Env,
 ): Promise<PublicQuoteSnapshot> {
-	// 公开行情由 Worker 内部访问受 Access 保护的 quote proxy，再投影为 quote-only。
-	// 旧 Site 已退出运行链；Access 凭据只存在服务端 env，不对调用方暴露。
+	// 公开行情 pickup 仍指向旧 Worker 的 chatgpt.site 公开入口（public host，
+	// issue #7 Step 4 起由 Cloudflare Access + 服务令牌保护），投影为 quote-only 后外发。
 	const upstream = await fetchUpstreamSnapshot(
-		[PORTFOLIO_QUOTES_URL],
+		[PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
 		context,
 		env,
 	);
@@ -578,7 +579,7 @@ export async function updateQuoteBridge(
 	let upstreamError: BridgeError | null = null;
 
 	try {
-		// env 仅用于受保护行情 proxy 的 Access 服务令牌；不传叠加门参，
+		// env 仅用于旧 origin 的 Access 服务令牌（Step 3）；不传叠加门参，
 		// 叠加（LIVE overlay / KV 读取）在 cron 路径结构上仍不可能发生。
 		const upstream = await fetchUpstreamSnapshot(
 			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
@@ -650,6 +651,7 @@ export async function updateQuoteBridge(
 	}
 
 	logBridgeStage(context, "bridge_success", {
+		// 旧（v4 富件）与新（public_quote_snapshot/1）两种载荷各自带版本字段。
 		portfolio_version:
 			payload.snapshot == null
 				? null
@@ -665,6 +667,13 @@ export async function updateQuoteBridge(
 
 /**
  * MCP server 工厂（每个 HTTP 请求构造一次，`ctx.requestInfo` 即原始请求）。
+ *
+ * `liveOverlayStatus` 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：
+ * 只有 `fetch()` 路由把请求头判定结果显式传进来时才可能应用 LIVE 叠加。
+ * `researchScopes` 由 `fetch()` 按 §A4 解析（凭据逐字节匹配 + 转发头 ∩ 配置
+ * 上限），写工具各查各的 scope，无任何蕴含关系。`researchPrincipal` 是 OAuth
+ * 桥从已验证 grant props 盖章的稳定业务主体（#19：不是动态 DCR client_id），
+ * 仅在内部 bridge credential 匹配时被接受。
  */
 export function createServer(
 	env?: Env,
@@ -678,6 +687,7 @@ export function createServer(
 		version: "1.1.0",
 	});
 
+	// 保留测试工具，确认 MCP 基础链路持续正常
 	server.registerTool(
 		"calculate",
 		{
@@ -690,18 +700,40 @@ export function createServer(
 		},
 		async ({ operation, a, b }) => {
 			let result: number;
+
 			switch (operation) {
-				case "add": result = a + b; break;
-				case "subtract": result = a - b; break;
-				case "multiply": result = a * b; break;
+				case "add":
+					result = a + b;
+					break;
+				case "subtract":
+					result = a - b;
+					break;
+				case "multiply":
+					result = a * b;
+					break;
 				case "divide":
-					if (b === 0) return { isError: true, content: [{ type: "text", text: "Error: Cannot divide by zero" }] };
-					result = a / b; break;
+					if (b === 0) {
+						return {
+							isError: true,
+							content: [
+								{
+									type: "text",
+									text: "Error: Cannot divide by zero",
+								},
+							],
+						};
+					}
+					result = a / b;
+					break;
 			}
-			return { content: [{ type: "text", text: String(result) }] };
+
+			return {
+				content: [{ type: "text", text: String(result) }],
+			};
 		},
 	);
 
+	// 正式行情工具
 	server.registerTool(
 		"get_portfolio_quotes",
 		{
@@ -718,6 +750,8 @@ export function createServer(
 					env,
 					{ liveOverlayStatus },
 				);
+				// 双契约（issue #7 Step 2）：有效 bearer 保留完整 LIVE 语义；
+				// 匿名 / 未授权调用投影为 quote-only（白名单 + 精确键断言）。
 				const displaySnapshot = isLiveOverlayEnabled(liveOverlayStatus)
 					? upstream.snapshot
 					: toPublicQuoteSnapshot(upstream.snapshot);
@@ -741,10 +775,36 @@ export function createServer(
 							live_overlay_status: liveOverlayStatus,
 							market_read_auth: marketReadAuditFields(env, liveOverlayStatus),
 						};
-				return { content: [{ type: "text", text: JSON.stringify({ ...displaySnapshot, control_plane_status: controlPlaneStatus }, null, 2) }] };
+				return {
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								{ ...displaySnapshot, control_plane_status: controlPlaneStatus },
+								null,
+								2,
+							),
+						},
+					],
+				};
 			} catch (error) {
 				logBridgeFailure(context, error, "upstream_fetch");
-				return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: "UPSTREAM_FETCH_ERROR", message: clientFacingErrorMessage(error) }, null, 2) }] };
+				return {
+					isError: true,
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								{
+									error: "UPSTREAM_FETCH_ERROR",
+									message: clientFacingErrorMessage(error),
+								},
+								null,
+								2,
+							),
+						},
+					],
+				};
 			}
 		},
 	);
@@ -759,10 +819,27 @@ export function createServer(
 			const context = bridgeContext("mcp:get_public_quotes");
 			try {
 				const snapshot = await fetchPublicQuoteSnapshot(context, env);
-				return { content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }] };
+				return {
+					content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
+				};
 			} catch (error) {
 				logBridgeFailure(context, error, "public_quotes");
-				return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: "UPSTREAM_UNAVAILABLE", message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE }, null, 2) }] };
+				return {
+					isError: true,
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								{
+									error: "UPSTREAM_UNAVAILABLE",
+									message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE,
+								},
+								null,
+								2,
+							),
+						},
+					],
+				};
 			}
 		},
 	);
@@ -775,13 +852,29 @@ export function createServer(
 			inputSchema: z.object({}),
 		},
 		async () => ({
-			content: [{
-				type: "text",
-				text: JSON.stringify({ ...(await getControlPlaneStatus(env ?? ({} as Env))), live_overlay_status: liveOverlayStatus, market_read_auth: marketReadAuditFields(env, liveOverlayStatus) }, null, 2),
-			}],
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(
+						{
+							...(await getControlPlaneStatus(env ?? ({} as Env))),
+							live_overlay_status: liveOverlayStatus,
+							market_read_auth: marketReadAuditFields(env, liveOverlayStatus),
+						},
+						null,
+						2,
+					),
+				},
+			],
 		}),
 	);
 
+	// C7: these tools deliberately use only the Collector-owned C5 replica.
+	// They do not share market/LIVE authorization, and the default research
+	// scope is PUBLIC.  PRIVATE remains unavailable until a separate future
+	// research-read scope is wired; it never falls through from this surface.
+	// 写面（claim/submit）各由独立 research scope 门控（§A4）；scope 缺失 →
+	// isError + FILTERED 信封 + 服务端结构化日志（request_id + 主体）。
 	const researchAdapter = () => {
 		const storage = env ? researchReplicaStorage(env) : null;
 		if (!storage) throw new ResearchBoundaryError("STORE_UNAVAILABLE");
@@ -794,10 +887,20 @@ export function createServer(
 	};
 	const researchDomain = async (operation: () => Promise<unknown>) => {
 		try {
-			return { content: [{ type: "text" as const, text: JSON.stringify(await operation(), null, 2) }] };
+			return {
+				content: [
+					{ type: "text" as const, text: JSON.stringify(await operation(), null, 2) },
+				],
+			};
 		} catch (error) {
-			const safe = error instanceof ResearchBoundaryError ? error.asError() : new ResearchBoundaryError("STORE_UNAVAILABLE").asError();
-			return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
+			const safe =
+				error instanceof ResearchBoundaryError
+					? error.asError()
+					: new ResearchBoundaryError("STORE_UNAVAILABLE").asError();
+			return {
+				isError: true,
+				content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }],
+			};
 		}
 	};
 	const researchRead = researchDomain;
@@ -805,73 +908,250 @@ export function createServer(
 	const requireResearchScope = (scope: string, tool: string) => {
 		if (researchScopes.has(scope)) return null;
 		const safe = new ResearchBoundaryError("FILTERED").asError();
-		console.log(JSON.stringify({ event: "research_tool_scope_denied", timestamp: new Date().toISOString(), tool, required_scope: scope, granted_scopes: [...researchScopes].sort(), principal: researchPrincipal ?? "unverified-principal", request_id: safe.request_id }));
-		return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
+		// 结构化审计日志：仅 request_id 与主体名，绝无 token / claim_token。
+		console.log(
+			JSON.stringify({
+				event: "research_tool_scope_denied",
+				timestamp: new Date().toISOString(),
+				tool,
+				required_scope: scope,
+				granted_scopes: [...researchScopes].sort(),
+				principal: researchPrincipal ?? "unverified-principal",
+				request_id: safe.request_id,
+			}),
+		);
+		return {
+			isError: true as const,
+			content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }],
+		};
 	};
 	const requireFormalResearchClient = (tool: string, requiredScope: string) => {
-		if (permitsFormalResearchOperation({ principal: researchPrincipal, issuer: researchIssuer, scopes: researchScopes, requiredScope })) return null;
+		// #19：正式身份 = 已验证 stable principal + issuer + 必需 scope；
+		// Job eligibility 完全由服务端记录/租约状态裁决，job_id 格式不参与授权。
+		if (permitsFormalResearchOperation({
+			principal: researchPrincipal,
+			issuer: researchIssuer,
+			scopes: researchScopes,
+			requiredScope,
+		})) return null;
 		const safe = new ResearchBoundaryError("FILTERED").asError();
 		console.log(JSON.stringify({ event: "research_tool_client_denied", tool, principal: researchPrincipal ?? null, request_id: safe.request_id }));
 		return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(safe, null, 2) }] };
 	};
 
-	server.registerTool("search_documents", { description: "在 Collector 的 PUBLIC Research replica 中搜索文档元数据。", inputSchema: z.object({ query: z.string().optional(), limit: z.number().int().min(1).max(100).optional() }) }, async ({ query, limit }) => researchRead(() => researchAdapter().searchDocuments(query, limit)));
-	server.registerTool("get_document", { description: "读取 Collector replica 中经 SHA-256 校验的 PUBLIC 文档正文。", inputSchema: z.object({ document_id: z.string().min(1) }) }, async ({ document_id }) => researchRead(() => researchAdapter().getDocument(document_id)));
-	server.registerTool("search_evidence", { description: "列出 Collector replica 中的 PUBLIC Evidence。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().searchEvidence(limit)));
-	server.registerTool("get_evidence", { description: "读取 Collector replica 中指定的 PUBLIC Evidence。", inputSchema: z.object({ evidence_id: z.string().min(1) }) }, async ({ evidence_id }) => researchRead(() => researchAdapter().getEvidence(evidence_id)));
-	server.registerTool("get_theme_accumulator", { description: "读取指定主题的 PUBLIC Evidence Accumulator。", inputSchema: z.object({ subject_key: z.string().min(1) }) }, async ({ subject_key }) => researchRead(() => researchAdapter().getThemeAccumulator(subject_key)));
-	server.registerTool("get_company_evidence_state", { description: "读取指定公司的 PUBLIC Evidence Accumulator 状态。", inputSchema: z.object({ company: z.string().min(1) }) }, async ({ company }) => researchRead(() => researchAdapter().getCompanyEvidenceState(company)));
-	server.registerTool("get_coverage_status", { description: "读取 Collector replica 中的 PUBLIC Research Coverage。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().getCoverageStatus(limit)));
-	server.registerTool("get_source_health", { description: "读取 Research source health（outbound-v3 source_health 记录投影，实读 replica）。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }) }, async ({ limit }) => researchRead(() => researchAdapter().getSourceHealth(limit)));
-	server.registerTool("get_market_signal_state", { description: "读取市场信号状态（独立 market_signal 数值记录，仅作 R3/R4 价格输入）。无记录时如实返回 NO_DATA，不报错也不伪造数据。", inputSchema: z.object({ subject_key: z.string().min(1).max(128) }) }, async ({ subject_key }) => researchRead(() => researchAdapter().getMarketSignalState(subject_key)));
-	server.registerTool("list_research_jobs", { description: "列出 Collector replica 中的 PUBLIC Research Job，附服务端状态推导 server_state。", inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional(), claimable_only: z.boolean().optional() }) }, async ({ limit, claimable_only }) => researchRead(() => researchAdapter().listResearchJobs(limit, { claimableOnly: claimable_only })));
-	server.registerTool("get_research_job_context", { description: "读取 Collector replica 中指定 PUBLIC Research Job 的上下文。", inputSchema: z.object({ job_id: z.string().min(1) }) }, async ({ job_id }) => researchRead(() => researchAdapter().getResearchJobContext(job_id)));
-
+	server.registerTool(
+		"search_documents",
+		{
+			description: "在 Collector 的 PUBLIC Research replica 中搜索文档元数据。",
+			inputSchema: z.object({
+				query: z.string().optional(),
+				limit: z.number().int().min(1).max(100).optional(),
+			}),
+		},
+		async ({ query, limit }) =>
+			researchRead(() => researchAdapter().searchDocuments(query, limit)),
+	);
+	server.registerTool(
+		"get_document",
+		{
+			description: "读取 Collector replica 中经 SHA-256 校验的 PUBLIC 文档正文。",
+			inputSchema: z.object({ document_id: z.string().min(1) }),
+		},
+		async ({ document_id }) => researchRead(() => researchAdapter().getDocument(document_id)),
+	);
+	server.registerTool(
+		"search_evidence",
+		{
+			description: "列出 Collector replica 中的 PUBLIC Evidence。",
+			inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+		},
+		async ({ limit }) => researchRead(() => researchAdapter().searchEvidence(limit)),
+	);
+	server.registerTool(
+		"get_evidence",
+		{
+			description: "读取 Collector replica 中指定的 PUBLIC Evidence。",
+			inputSchema: z.object({ evidence_id: z.string().min(1) }),
+		},
+		async ({ evidence_id }) => researchRead(() => researchAdapter().getEvidence(evidence_id)),
+	);
+	server.registerTool(
+		"get_theme_accumulator",
+		{
+			description: "读取指定主题的 PUBLIC Evidence Accumulator。",
+			inputSchema: z.object({ subject_key: z.string().min(1) }),
+		},
+		async ({ subject_key }) =>
+			researchRead(() => researchAdapter().getThemeAccumulator(subject_key)),
+	);
+	server.registerTool(
+		"get_company_evidence_state",
+		{
+			description: "读取指定公司的 PUBLIC Evidence Accumulator 状态。",
+			inputSchema: z.object({ company: z.string().min(1) }),
+		},
+		async ({ company }) =>
+			researchRead(() => researchAdapter().getCompanyEvidenceState(company)),
+	);
+	server.registerTool(
+		"get_coverage_status",
+		{
+			description: "读取 Collector replica 中的 PUBLIC Research Coverage。",
+			inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+		},
+		async ({ limit }) => researchRead(() => researchAdapter().getCoverageStatus(limit)),
+	);
+	server.registerTool(
+		"get_source_health",
+		{
+			description: "读取 Research source health（outbound-v3 source_health 记录投影，实读 replica）。",
+			inputSchema: z.object({
+				limit: z.number().int().min(1).max(100).optional(),
+			}),
+		},
+		async ({ limit }) => researchRead(() => researchAdapter().getSourceHealth(limit)),
+	);
+	server.registerTool(
+		"get_market_signal_state",
+		{
+			description:
+				"读取市场信号状态（独立 market_signal 数值记录，仅作 R3/R4 价格输入）。无记录时如实返回 NO_DATA，不报错也不伪造数据。",
+			inputSchema: z.object({ subject_key: z.string().min(1).max(128) }),
+		},
+		async ({ subject_key }) =>
+			researchRead(() => researchAdapter().getMarketSignalState(subject_key)),
+	);
+	server.registerTool(
+		"list_research_jobs",
+		{
+			description:
+				"列出 Collector replica 中的 PUBLIC Research Job，附服务端状态推导 server_state（terminal > 未过期 lease > record）。claimable_only=true 时仅返回 effective_status=QUEUED 的任务。",
+			inputSchema: z.object({
+				limit: z.number().int().min(1).max(100).optional(),
+				claimable_only: z.boolean().optional(),
+			}),
+		},
+		async ({ limit, claimable_only }) =>
+			researchRead(() =>
+				researchAdapter().listResearchJobs(limit, { claimableOnly: claimable_only }),
+			),
+	);
+	server.registerTool(
+		"get_research_job_context",
+		{
+			description:
+				"读取 Collector replica 中指定 PUBLIC Research Job 的上下文：job record（含触发证据）+ server_state + 提交历史 proposals。claim_token 永不出现在本面。",
+			inputSchema: z.object({ job_id: z.string().min(1) }),
+		},
+		async ({ job_id }) => researchRead(() => researchAdapter().getResearchJobContext(job_id)),
+	);
 	server.registerTool(
 		"claim_research_job",
-		{ description: "认领一个 PUBLIC QUEUED Research Job。需要 research:claim scope。", inputSchema: z.object({ job_id: z.string().min(1) }) },
+		{
+			description:
+				"认领一个 PUBLIC QUEUED Research Job（服务端固定租约 3600 秒，原子抢占；同主体重复认领幂等返回原租约）。返回的 lease_generation 即后续 submit/defer 的 expected_generation。需要 research:claim scope。",
+			inputSchema: z.object({ job_id: z.string().min(1) }),
+		},
 		async ({ job_id }) => {
 			const denied = requireResearchScope(RESEARCH_CLAIM_SCOPE, "claim_research_job");
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE);
 			if (clientDenied) return clientDenied;
-			const owner = await callerPrincipal();
+			// Belt-and-suspenders: the formal gate above already implies a non-null
+			// principal and issuer, so callerPrincipal cannot return null here.
+		const owner = await callerPrincipal();
 			if (!owner) return requireFormalResearchClient("claim_research_job", RESEARCH_CLAIM_SCOPE)!;
-			return researchRead(async () => claimResearchJob(researchWorkflowDb(), { jobId: job_id, leaseOwner: owner, requestId: crypto.randomUUID().replaceAll("-", ""), now: new Date().toISOString() }));
+			return researchRead(async () =>
+				claimResearchJob(researchWorkflowDb(), {
+					jobId: job_id,
+					leaseOwner: owner,
+					requestId: crypto.randomUUID().replaceAll("-", ""),
+					now: new Date().toISOString(),
+				}),
+			);
 		},
 	);
-
 	server.registerTool(
 		"submit_research_result_proposal",
 		{
-			description: "提交研究结果 proposal。需要 research:submit scope。" + RESEARCH_IDEMPOTENCY_KEY_DESCRIPTION,
-			inputSchema: z.object({ job_id: z.string().min(1), expected_generation: z.number().int().min(1), idempotency_key: RESEARCH_IDEMPOTENCY_KEY_SCHEMA, origin: z.enum(["CHATGPT", "SYNTHETIC", "REPLAY"]).optional(), proposal: z.record(z.string(), z.unknown()) }),
+			description:
+				"提交研究结果 proposal。正式（CHATGPT）提交被接受即 Job 终态 COMPLETED；非生产主体的 CHATGPT 声明一律降级为 SYNTHETIC 隔离存储（不完成 Job）。需要 research:submit scope。" +
+				" proposal 是 exact-keys 对象——键集合必须与下面完全一致，多余/缺失/改名任一都会被拒（REJECTED=VALIDATION_FAILED）：" +
+				" job_id（必须等于本工具的 job_id 参数）；summary（非空字符串，≤4000 字符）；" +
+				" findings（数组 ≤50 项，每项恰为 {claim: 字符串 ≤2000, evidence_ids: 字符串数组且元素非空, confidence: \"HIGH\"|\"MEDIUM\"|\"LOW\", counter_evidence: null 或字符串 ≤2000}）；" +
+				" recommendation_hint（枚举 \"NONE\"|\"THESIS_REVIEW\"|\"COUNTER_EVIDENCE_FOUND\"|\"NO_SECOND_SOURCE\"|\"INSUFFICIENT_DATA\"）；" +
+				" sources_consulted（字符串数组 ≤100 项，每项 ≤500 字符，可为空数组）；completed_at（可解析的 ISO 时间字符串）；" +
+				" 可选 tokens_used（非负整数）。禁止任何其他键；整体负载 ≤64KiB。" +
+				" 写权限由服务端裁决：当前 OAuth 稳定主体必须是该 Job 现行租约的持有者，expected_generation 取 claim_research_job 返回的 lease_generation；不需要也不接受任何提交凭据。" +
+				RESEARCH_IDEMPOTENCY_KEY_DESCRIPTION +
+				" 稳定键格式示例：chatgpt_submit:<job_id>:g<lease_generation>。",
+			inputSchema: z.object({
+				job_id: z.string().min(1),
+				expected_generation: z.number().int().min(1),
+				idempotency_key: RESEARCH_IDEMPOTENCY_KEY_SCHEMA,
+				origin: z.enum(["CHATGPT", "SYNTHETIC", "REPLAY"]).optional(),
+				proposal: z.record(z.string(), z.unknown()),
+			}),
 		},
 		async ({ job_id, expected_generation, idempotency_key, origin, proposal }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "submit_research_result_proposal");
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE);
 			if (clientDenied) return clientDenied;
-			const owner = await callerPrincipal();
+			// Belt-and-suspenders: the formal gate above already implies a non-null
+			// principal and issuer, so callerPrincipal cannot return null here.
+		const owner = await callerPrincipal();
 			if (!owner) return requireFormalResearchClient("submit_research_result_proposal", RESEARCH_SUBMIT_SCOPE)!;
-			return researchRead(async () => submitResearchResultProposal(researchWorkflowDb(), { jobId: job_id, expectedGeneration: expected_generation, idempotencyKey: idempotency_key, origin, proposal, callerPrincipal: owner, requestId: crypto.randomUUID().replaceAll("-", ""), now: new Date().toISOString() }));
+			return researchRead(async () =>
+				submitResearchResultProposal(researchWorkflowDb(), {
+					jobId: job_id,
+					expectedGeneration: expected_generation,
+					idempotencyKey: idempotency_key,
+					origin,
+					proposal,
+					callerPrincipal: owner,
+					requestId: crypto.randomUUID().replaceAll("-", ""),
+					now: new Date().toISOString(),
+				}),
+			);
 		},
 	);
-
 	server.registerTool(
 		"defer_research_job",
 		{
-			description: "远端延期当前正式租约并释放租约。需要 research:submit scope。" + RESEARCH_IDEMPOTENCY_KEY_DESCRIPTION,
-			inputSchema: z.object({ job_id: z.string().min(1), expected_generation: z.number().int().min(1), idempotency_key: RESEARCH_IDEMPOTENCY_KEY_SCHEMA, reason: z.enum(["RECHECK_REQUIRED", "UPSTREAM_UNAVAILABLE", "NEEDS_OWNER_INPUT"]), recheck_at: z.string().datetime() }),
+			description:
+				"远端延期当前正式租约到指定 recheck 时刻并原子释放租约；defer 不产生完成终态，正式终态仅由提交 result proposal 产生。写权限与 submit 相同（服务端主体+generation 裁决，无需凭据）。需要 research:submit scope。" +
+				RESEARCH_IDEMPOTENCY_KEY_DESCRIPTION +
+				" 稳定键格式示例：chatgpt_defer:<job_id>:g<lease_generation>。",
+			inputSchema: z.object({
+				job_id: z.string().min(1),
+				expected_generation: z.number().int().min(1),
+				idempotency_key: RESEARCH_IDEMPOTENCY_KEY_SCHEMA,
+				reason: z.enum(["RECHECK_REQUIRED", "UPSTREAM_UNAVAILABLE", "NEEDS_OWNER_INPUT"]),
+				recheck_at: z.string().datetime(),
+			}),
 		},
 		async ({ job_id, expected_generation, idempotency_key, reason, recheck_at }) => {
 			const denied = requireResearchScope(RESEARCH_SUBMIT_SCOPE, "defer_research_job");
 			if (denied) return denied;
 			const clientDenied = requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE);
 			if (clientDenied) return clientDenied;
-			const owner = await callerPrincipal();
+			// Belt-and-suspenders: the formal gate above already implies a non-null
+			// principal and issuer, so callerPrincipal cannot return null here.
+		const owner = await callerPrincipal();
 			if (!owner) return requireFormalResearchClient("defer_research_job", RESEARCH_SUBMIT_SCOPE)!;
-			return researchRead(async () => deferResearchJob(researchWorkflowDb(), { jobId: job_id, expectedGeneration: expected_generation, idempotencyKey: idempotency_key, reason, recheckAt: recheck_at, callerPrincipal: owner, requestId: crypto.randomUUID().replaceAll("-", ""), now: new Date().toISOString() }));
+			return researchRead(async () =>
+				deferResearchJob(researchWorkflowDb(), {
+					jobId: job_id,
+					expectedGeneration: expected_generation,
+					idempotencyKey: idempotency_key,
+					reason,
+					recheckAt: recheck_at,
+					callerPrincipal: owner,
+					requestId: crypto.randomUUID().replaceAll("-", ""),
+					now: new Date().toISOString(),
+				}),
+			);
 		},
 	);
 
@@ -881,12 +1161,17 @@ export function createServer(
 function jsonResponse(payload: unknown, status = 200): Response {
 	return new Response(JSON.stringify(payload, null, 2), {
 		status,
-		headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+		headers: {
+			"Content-Type": "application/json; charset=utf-8",
+			"Cache-Control": "no-store",
+		},
 	});
 }
 
 function researchReplicaStorage(env: Env): ResearchReplicaStorage | null {
-	return env.RESEARCH_REPLICA && env.RESEARCH_OBJECTS ? { db: env.RESEARCH_REPLICA, objects: env.RESEARCH_OBJECTS } : null;
+	return env.RESEARCH_REPLICA && env.RESEARCH_OBJECTS
+		? { db: env.RESEARCH_REPLICA, objects: env.RESEARCH_OBJECTS }
+		: null;
 }
 
 function researchReplicaAuthorized(request: Request, env: Env): boolean {
@@ -895,7 +1180,10 @@ function researchReplicaAuthorized(request: Request, env: Env): boolean {
 }
 
 function researchBoundaryResponse(error: unknown, status = 400): Response {
-	const safe = error instanceof ResearchBoundaryError ? error.asError() : new ResearchBoundaryError("STORE_UNAVAILABLE").asError();
+	const safe =
+		error instanceof ResearchBoundaryError
+			? error.asError()
+			: new ResearchBoundaryError("STORE_UNAVAILABLE").asError();
 	return jsonResponse(safe, status);
 }
 
@@ -903,7 +1191,9 @@ function decodeBase64Chunks(value: unknown): Uint8Array[] {
 	if (!Array.isArray(value)) throw new ResearchBoundaryError("INTEGRITY_FAILED");
 	try {
 		return value.map((encoded) => {
-			if (typeof encoded !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error("invalid base64");
+			if (typeof encoded !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+				throw new Error("invalid base64");
+			}
 			const binary = atob(encoded);
 			return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 		});
@@ -912,87 +1202,208 @@ function decodeBase64Chunks(value: unknown): Uint8Array[] {
 	}
 }
 
+/**
+ * C5 private one-way transport.  This is an internal ingestion endpoint, not
+ * an MCP tool and not a RESEARCH database connection.  The separate secret is
+ * deliberately unrelated to LIVE/market scopes and remains fail-closed until
+ * configured.
+ */
 async function handleResearchReplicaIngest(request: Request, env: Env): Promise<Response> {
-	if (request.method !== "POST") return researchBoundaryResponse(new ResearchBoundaryError("UNSUPPORTED_OPERATION"), 405);
+	if (request.method !== "POST") {
+		return researchBoundaryResponse(new ResearchBoundaryError("UNSUPPORTED_OPERATION"), 405);
+	}
 	const storage = researchReplicaStorage(env);
-	if (!storage || !env.RESEARCH_REPLICA_INGEST_TOKEN) return researchBoundaryResponse(new ResearchBoundaryError("STORE_UNAVAILABLE"), 503);
-	if (!researchReplicaAuthorized(request, env)) return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
+	if (!storage || !env.RESEARCH_REPLICA_INGEST_TOKEN) {
+		return researchBoundaryResponse(new ResearchBoundaryError("STORE_UNAVAILABLE"), 503);
+	}
+	if (!researchReplicaAuthorized(request, env)) {
+		return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
+	}
+	// §A8 双道尺寸门：Content-Length 预检（缺失/非数值跳过）+ 读体后实测。
 	const contentLength = Number(request.headers.get("Content-Length"));
-	if (Number.isFinite(contentLength) && contentLength > RESEARCH_INGEST_MAX_BODY_BYTES) return researchBoundaryResponse(new ResearchBoundaryError("RATE_LIMITED"), 413);
+	if (Number.isFinite(contentLength) && contentLength > RESEARCH_INGEST_MAX_BODY_BYTES) {
+		return researchBoundaryResponse(new ResearchBoundaryError("RATE_LIMITED"), 413);
+	}
 	let raw: string;
-	try { raw = await request.text(); } catch { return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400); }
-	if (new TextEncoder().encode(raw).byteLength > RESEARCH_INGEST_MAX_BODY_BYTES) return researchBoundaryResponse(new ResearchBoundaryError("RATE_LIMITED"), 413);
+	try {
+		raw = await request.text();
+	} catch {
+		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > RESEARCH_INGEST_MAX_BODY_BYTES) {
+		return researchBoundaryResponse(new ResearchBoundaryError("RATE_LIMITED"), 413);
+	}
 	let body: unknown;
-	try { body = JSON.parse(raw); } catch { return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400); }
-	if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body as Record<string, unknown>).some((key) => key !== "record" && key !== "object_chunks_base64")) return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	try {
+		body = JSON.parse(raw);
+	} catch {
+		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	}
+	if (
+		!body ||
+		typeof body !== "object" ||
+		Array.isArray(body) ||
+		Object.keys(body as Record<string, unknown>).some(
+			(key) => key !== "record" && key !== "object_chunks_base64",
+		)
+	) {
+		return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+	}
 	const transport = body as { record?: unknown; object_chunks_base64?: unknown };
 	try {
-		const objectChunks = transport.object_chunks_base64 === undefined ? null : decodeBase64Chunks(transport.object_chunks_base64);
-		return jsonResponse(await ingestResearchReplicaRecord(storage, transport.record, objectChunks));
+		const objectChunks =
+			transport.object_chunks_base64 === undefined
+				? null
+				: decodeBase64Chunks(transport.object_chunks_base64);
+		return jsonResponse(
+			await ingestResearchReplicaRecord(storage, transport.record, objectChunks),
+		);
 	} catch (error) {
-		return researchBoundaryResponse(error, error instanceof ResearchBoundaryError && error.retryable ? 503 : 400);
+		return researchBoundaryResponse(
+			error,
+			error instanceof ResearchBoundaryError && error.retryable ? 503 : 400,
+		);
 	}
 }
 
+/**
+ * §A1 receipts 只读回流端点（内部通道，非 MCP 工具）。与 ingest 共用现有
+ * RESEARCH transport credential；未配置 → 503 fail-closed，token 不匹配 →
+ * 401 FILTERED。响应为 §5.4 collector-receipts-v1 白名单，claim_token /
+ * proposal 正文 / 客户端原始输入结构上不可能出现。
+ */
 async function handleResearchReplicaReceipts(request: Request, env: Env): Promise<Response> {
-	if (request.method !== "GET") return researchBoundaryResponse(new ResearchBoundaryError("UNSUPPORTED_OPERATION"), 405);
+	if (request.method !== "GET") {
+		return researchBoundaryResponse(new ResearchBoundaryError("UNSUPPORTED_OPERATION"), 405);
+	}
 	const storage = researchReplicaStorage(env);
-	if (!storage || !env.RESEARCH_REPLICA_INGEST_TOKEN) return researchBoundaryResponse(new ResearchBoundaryError("STORE_UNAVAILABLE"), 503);
-	if (request.headers.get("Authorization") !== `Bearer ${env.RESEARCH_REPLICA_INGEST_TOKEN}`) return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
+	if (!storage || !env.RESEARCH_REPLICA_INGEST_TOKEN) {
+		return researchBoundaryResponse(new ResearchBoundaryError("STORE_UNAVAILABLE"), 503);
+	}
+	if (request.headers.get("Authorization") !== `Bearer ${env.RESEARCH_REPLICA_INGEST_TOKEN}`) {
+		return researchBoundaryResponse(new ResearchBoundaryError("FILTERED"), 401);
+	}
 	const url = new URL(request.url);
 	const since = url.searchParams.get("since");
 	const limitParam = url.searchParams.get("limit");
 	let limit: number | undefined;
 	if (limitParam !== null) {
 		limit = Number(limitParam);
-		if (!Number.isInteger(limit) || limit < 1 || limit > 500) return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+		if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+			return researchBoundaryResponse(new ResearchBoundaryError("INTEGRITY_FAILED"), 400);
+		}
 	}
-	try { return jsonResponse(await listResearchJobReceipts(storage.db, { since, limit, now: new Date().toISOString() })); }
-	catch (error) { return researchBoundaryResponse(error, error instanceof ResearchBoundaryError && error.retryable ? 503 : 400); }
+	try {
+		return jsonResponse(
+			await listResearchJobReceipts(storage.db, {
+				since,
+				limit,
+				now: new Date().toISOString(),
+			}),
+		);
+	} catch (error) {
+		return researchBoundaryResponse(
+			error,
+			error instanceof ResearchBoundaryError && error.retryable ? 503 : 400,
+		);
+	}
 }
 
+/** 内部 universe API / writer 鉴权；只认 PORTFOLIO_UNIVERSE_TOKEN。 */
 function requestInternalUniverseStatus(request: Request | undefined, env: Env): LiveOverlayStatus {
-	return resolveLiveOverlayStatus(request?.headers.get("Authorization") ?? null, env.PORTFOLIO_UNIVERSE_TOKEN);
+	return resolveLiveOverlayStatus(
+		request?.headers.get("Authorization") ?? null,
+		env.PORTFOLIO_UNIVERSE_TOKEN,
+	);
 }
 
+/**
+ * 外部 ChatGPT / Automation MCP 鉴权；只认独立 Collector client credential，
+ * 并要求 market:read。绝不回退到 PORTFOLIO_UNIVERSE_TOKEN。
+ */
 function requestMcpMarketReadStatus(request: Request | undefined, env: Env): LiveOverlayStatus {
-	const status = resolveMarketReadLiveOverlayStatus(request?.headers.get("Authorization") ?? null, env.COLLECTOR_MCP_CLIENT_TOKEN, env.COLLECTOR_MCP_CLIENT_SCOPES);
-	if (status === "ENABLED" && !env.COLLECTOR_MCP_CLIENT_ID?.trim()) return "SKIPPED_UNAUTHORIZED";
+	const status = resolveMarketReadLiveOverlayStatus(
+		request?.headers.get("Authorization") ?? null,
+		env.COLLECTOR_MCP_CLIENT_TOKEN,
+		env.COLLECTOR_MCP_CLIENT_SCOPES,
+	);
+	// A credential without an explicit production client identity is not an auditable principal.
+	// Fail closed rather than silently granting an identity-less LIVE read.
+	if (status === "ENABLED" && !env.COLLECTOR_MCP_CLIENT_ID?.trim()) {
+		return "SKIPPED_UNAUTHORIZED";
+	}
 	return status;
 }
 
+/** 内部 token 未配置或请求头不匹配 → 未授权（fail-closed，`!== "ENABLED"`）。 */
 function isUniverseAuthorized(request: Request, env: Env): boolean {
 	return isLiveOverlayEnabled(requestInternalUniverseStatus(request, env));
 }
 
 async function handleUniverseApi(request: Request, env: Env): Promise<Response> {
-	if (!env.PORTFOLIO_UNIVERSE) return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
-	if (!isUniverseAuthorized(request, env)) return jsonResponse({ error: "UNAUTHORIZED" }, 401);
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
+	if (!isUniverseAuthorized(request, env)) {
+		return jsonResponse({ error: "UNAUTHORIZED" }, 401);
+	}
 	if (request.method === "GET") {
 		try {
 			const universe = await readLiveUniverse(env.PORTFOLIO_UNIVERSE);
-			return universe ? jsonResponse(universe) : jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 404);
+			return universe
+				? jsonResponse(universe)
+				: jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 404);
 		} catch (error) {
-			return jsonResponse({ error: "LIVE_UNIVERSE_READ_FAILED", message: clientFacingErrorMessage(error) }, 500);
+			return jsonResponse(
+				{ error: "LIVE_UNIVERSE_READ_FAILED", message: clientFacingErrorMessage(error) },
+				500,
+			);
 		}
 	}
-	if (request.method !== "POST") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+	if (request.method !== "POST") {
+		return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
+	}
+
 	let raw: string;
-	try { raw = await request.text(); } catch { return jsonResponse({ error: "BODY_READ_FAILED" }, 400); }
-	if (new TextEncoder().encode(raw).byteLength > 32_768) return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	try {
+		raw = await request.text();
+	} catch {
+		return jsonResponse({ error: "BODY_READ_FAILED" }, 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > 32_768) {
+		return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	}
 	let payload: unknown;
-	try { payload = JSON.parse(raw); } catch { return jsonResponse({ error: "INVALID_JSON" }, 400); }
+	try {
+		payload = JSON.parse(raw);
+	} catch {
+		return jsonResponse({ error: "INVALID_JSON" }, 400);
+	}
 	try {
 		const stored = await writeLiveUniverse(env.PORTFOLIO_UNIVERSE, payload);
-		return jsonResponse({ status: "SUCCESS", schema_version: stored.schema_version, content_hash: stored.content_hash, generated_at: stored.generated_at, source_manifest_hash: stored.source_manifest_hash, received_at: stored.received_at, active_count: stored.active.length });
+		return jsonResponse({
+			status: "SUCCESS",
+			schema_version: stored.schema_version,
+			content_hash: stored.content_hash,
+			generated_at: stored.generated_at,
+			source_manifest_hash: stored.source_manifest_hash,
+			received_at: stored.received_at,
+			active_count: stored.active.length,
+		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) }, 400);
+		return jsonResponse(
+			{ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) },
+			400,
+		);
 	}
 }
 
 async function getControlPlaneStatus(env: Env) {
-	const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date(), { tolerateUnreadableUniverse: true });
+	const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date(), {
+		tolerateUnreadableUniverse: true,
+	});
 	const universePresent = live.universe !== null;
+	// 双轨锚：LRCCA 优先，缺失时回退 generated_at（C-4），口径仍是既有 10 天可用窗口。
 	const universeFresh = live.presentation.fresh;
 	return {
 		status: universePresent && universeFresh ? "OK" : "PENDING",
@@ -1001,6 +1412,7 @@ async function getControlPlaneStatus(env: Env) {
 		kv_bound: Boolean(env.PORTFOLIO_UNIVERSE),
 		universe_present: universePresent,
 		universe_fresh: universeFresh,
+		// C-3：只出三态枚举词（无代码 / 数量 / hash）；无件 / 损坏 / 交叉不一致按保守态呈现。
 		portfolio_state: live.presentation.portfolio_state,
 		stale: live.presentation.stale,
 		freshness_anchor: live.presentation.freshness_anchor,
@@ -1016,83 +1428,233 @@ async function handleControlPlaneStatus(env: Env): Promise<Response> {
 
 async function handleGithubAuthProbe(request: Request): Promise<Response> {
 	if (request.method !== "POST") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
-	try { await verifyGithubAccessToken(githubBearerToken(request)); return jsonResponse({ status: "OK", identity: "GITHUB_VERIFIED" }); }
-	catch (error) { return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401); }
+	try {
+		await verifyGithubAccessToken(githubBearerToken(request));
+		return jsonResponse({ status: "OK", identity: "GITHUB_VERIFIED" });
+	} catch (error) {
+		return jsonResponse(
+			{ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) },
+			401,
+		);
+	}
 }
 
 async function handleGithubAuthUniverse(request: Request, env: Env): Promise<Response> {
 	if (request.method !== "POST") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
-	if (!env.PORTFOLIO_UNIVERSE) return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
-	try { await verifyGithubAccessToken(githubBearerToken(request)); }
-	catch (error) { return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401); }
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
+	try {
+		await verifyGithubAccessToken(githubBearerToken(request));
+	} catch (error) {
+		return jsonResponse(
+			{ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) },
+			401,
+		);
+	}
 	let raw: string;
-	try { raw = await request.text(); } catch { return jsonResponse({ error: "BODY_READ_FAILED" }, 400); }
-	if (new TextEncoder().encode(raw).byteLength > 32_768) return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	try {
+		raw = await request.text();
+	} catch {
+		return jsonResponse({ error: "BODY_READ_FAILED" }, 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > 32_768) {
+		return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	}
 	let payload: unknown;
-	try { payload = JSON.parse(raw); } catch { return jsonResponse({ error: "INVALID_JSON" }, 400); }
+	try {
+		payload = JSON.parse(raw);
+	} catch {
+		return jsonResponse({ error: "INVALID_JSON" }, 400);
+	}
 	try {
 		const stored = await writeLiveUniverse(env.PORTFOLIO_UNIVERSE, payload);
-		return jsonResponse({ status: "SUCCESS", content_hash: stored.content_hash, generated_at: stored.generated_at, received_at: stored.received_at, active_count: stored.active.length });
+		return jsonResponse({
+			status: "SUCCESS",
+			content_hash: stored.content_hash,
+			generated_at: stored.generated_at,
+			received_at: stored.received_at,
+			active_count: stored.active.length,
+		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) }, 400);
+		return jsonResponse(
+			{ error: "INVALID_QUOTE_UNIVERSE", message: clientFacingErrorMessage(error) },
+			400,
+		);
 	}
 }
 
+/**
+ * C-1：`POST /api/github-auth/portfolio-status` —— 接收 LIVE 侧状态件。
+ *
+ * 失败语义与 `/api/github-auth/quote-universe` 完全同款（401 / 413 / 400），
+ * 写入前全量校验，非法件拒写且旧件保留（LKG 语义，见 writePortfolioStatus）。
+ * 写入内容为状态件原样（LIVE 是三态的权威计算方，J-4）；Worker 的保守复核
+ * 发生在**读取**侧（resolveLivePresentation），不回写 KV。
+ */
 async function handleGithubAuthPortfolioStatus(request: Request, env: Env): Promise<Response> {
 	if (request.method !== "POST") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
-	if (!env.PORTFOLIO_UNIVERSE) return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
-	try { await verifyGithubAccessToken(githubBearerToken(request)); }
-	catch (error) { return jsonResponse({ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) }, 401); }
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
+	try {
+		await verifyGithubAccessToken(githubBearerToken(request));
+	} catch (error) {
+		return jsonResponse(
+			{ error: "GITHUB_AUTH_FAILED", message: clientFacingErrorMessage(error) },
+			401,
+		);
+	}
 	let raw: string;
-	try { raw = await request.text(); } catch { return jsonResponse({ error: "BODY_READ_FAILED" }, 400); }
-	if (new TextEncoder().encode(raw).byteLength > PORTFOLIO_STATUS_MAX_PAYLOAD_BYTES) return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	try {
+		raw = await request.text();
+	} catch {
+		return jsonResponse({ error: "BODY_READ_FAILED" }, 400);
+	}
+	if (new TextEncoder().encode(raw).byteLength > PORTFOLIO_STATUS_MAX_PAYLOAD_BYTES) {
+		return jsonResponse({ error: "PAYLOAD_TOO_LARGE" }, 413);
+	}
 	let payload: unknown;
-	try { payload = JSON.parse(raw); } catch { return jsonResponse({ error: "INVALID_JSON" }, 400); }
+	try {
+		payload = JSON.parse(raw);
+	} catch {
+		return jsonResponse({ error: "INVALID_JSON" }, 400);
+	}
 	try {
 		const stored = await writePortfolioStatus(env.PORTFOLIO_UNIVERSE, payload);
-		try { await recordPortfolioDeltaAfterStatusWrite(env.PORTFOLIO_UNIVERSE, stored); }
-		catch (error) { return jsonResponse({ error: "PORTFOLIO_DELTA_UPDATE_FAILED", message: clientFacingErrorMessage(error) }, 503); }
-		return jsonResponse({ status: "SUCCESS", schema_version: stored.schema_version, state: stored.state, generated_at: stored.generated_at, last_real_complete_confirmed_at: stored.last_real_complete_confirmed_at, universe_content_hash: stored.universe_content_hash, source_manifest_hash: stored.source_manifest_hash, received_at: stored.received_at });
+		try {
+			await recordPortfolioDeltaAfterStatusWrite(env.PORTFOLIO_UNIVERSE, stored);
+		} catch (error) {
+			// The authenticated status document is already LKG-valid.  Report the
+			// private reducer failure explicitly so LIVE retries instead of treating
+			// the batch as a fully accepted C3 observation.
+			return jsonResponse(
+				{
+					error: "PORTFOLIO_DELTA_UPDATE_FAILED",
+					message: clientFacingErrorMessage(error),
+				},
+				503,
+			);
+		}
+		return jsonResponse({
+			status: "SUCCESS",
+			schema_version: stored.schema_version,
+			state: stored.state,
+			generated_at: stored.generated_at,
+			last_real_complete_confirmed_at: stored.last_real_complete_confirmed_at,
+			universe_content_hash: stored.universe_content_hash,
+			source_manifest_hash: stored.source_manifest_hash,
+			received_at: stored.received_at,
+		});
 	} catch (error) {
-		return jsonResponse({ error: "INVALID_PORTFOLIO_STATUS", message: clientFacingErrorMessage(error) }, 400);
+		return jsonResponse(
+			{ error: "INVALID_PORTFOLIO_STATUS", message: clientFacingErrorMessage(error) },
+			400,
+		);
 	}
 }
 
-async function recordPortfolioDeltaAfterStatusWrite(kv: KVNamespace, status: StoredPortfolioStatus): Promise<void> {
+/**
+ * C3 only observes the authenticated LIVE status push.  A mismatch or an
+ * unreadable universe is deliberately downgraded to UNKNOWN for the reducer:
+ * it breaks continuity, never manufactures a removal event, and preserves
+ * the existing three-state/LRCCA presentation semantics.
+ */
+async function recordPortfolioDeltaAfterStatusWrite(
+	kv: KVNamespace,
+	status: StoredPortfolioStatus,
+): Promise<void> {
 	let universe: StoredLiveUniverse | null = null;
-	try { universe = await readLiveUniverse(kv); } catch { universe = null; }
+	try {
+		universe = await readLiveUniverse(kv);
+	} catch {
+		// A corrupted private universe cannot participate in COMPLETE→COMPLETE.
+		universe = null;
+	}
 	let state: PortfolioDeltaState = "PORTFOLIO_UNKNOWN";
 	if (universe) {
-		const freshness = resolveLiveUniverseFreshness(universe, { lrcca: status.last_real_complete_confirmed_at, now: new Date() });
-		state = resolvePortfolioPresentation({ universePresent: true, universeContentHash: universe.content_hash, universeManifestHash: universe.source_manifest_hash, status, anchor: { anchor: freshness.anchor, anchor_fallback: freshness.anchor_fallback, fresh: freshness.fresh }, }).portfolio_state;
+		const freshness = resolveLiveUniverseFreshness(universe, {
+			lrcca: status.last_real_complete_confirmed_at,
+			now: new Date(),
+		});
+		// C3 must consume the same conservative state that guards LIVE overlay.
+		// A stale LRCCA or hash drift may downgrade a self-declared COMPLETE
+		// status, and such a transition must never confirm a removal.
+		state = resolvePortfolioPresentation({
+			universePresent: true,
+			universeContentHash: universe.content_hash,
+			universeManifestHash: universe.source_manifest_hash,
+			status,
+			anchor: {
+				anchor: freshness.anchor,
+				anchor_fallback: freshness.anchor_fallback,
+				fresh: freshness.fresh,
+			},
+		}).portfolio_state;
 	}
-	await recordPortfolioUniverseObservation(kv, { state, current_complete_hash: status.universe_content_hash, active_codes: universe?.active ?? [], observed_at: status.generated_at });
+	await recordPortfolioUniverseObservation(kv, {
+		state,
+		current_complete_hash: status.universe_content_hash,
+		active_codes: universe?.active ?? [],
+		observed_at: status.generated_at,
+	});
 }
 
 async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise<Response> {
-	if (!isUniverseAuthorized(request, env)) return jsonResponse({ error: "UNAUTHORIZED" }, 401);
-	if (!env.PORTFOLIO_UNIVERSE) return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	if (!isUniverseAuthorized(request, env)) {
+		return jsonResponse({ error: "UNAUTHORIZED" }, 401);
+	}
+	if (!env.PORTFOLIO_UNIVERSE) {
+		return jsonResponse({ error: "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED" }, 503);
+	}
 	const context = bridgeContext("http:dynamic-portfolio-quotes");
 	try {
+		// C-4/C-5：本端点是「LIVE 动态投影」诊断面，状态未知时不静默返回静态目录。
 		const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date());
 		if (!live.universe) return jsonResponse({ error: "NO_LIVE_UNIVERSE" }, 503);
-		if (!live.presentation.fresh) return jsonResponse({ error: "LIVE_UNIVERSE_STALE", portfolio_state: live.presentation.portfolio_state }, 503);
-		if (!live.presentation.apply_overlay) return jsonResponse({ error: "PORTFOLIO_UNKNOWN", portfolio_state: live.presentation.portfolio_state }, 503);
-		const upstream = await fetchUpstreamSnapshot([PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL], context, env, { liveOverlayStatus: requestInternalUniverseStatus(request, env) });
+		if (!live.presentation.fresh) {
+			return jsonResponse(
+				{
+					error: "LIVE_UNIVERSE_STALE",
+					portfolio_state: live.presentation.portfolio_state,
+				},
+				503,
+			);
+		}
+		if (!live.presentation.apply_overlay) {
+			return jsonResponse(
+				{ error: "PORTFOLIO_UNKNOWN", portfolio_state: live.presentation.portfolio_state },
+				503,
+			);
+		}
+		const upstream = await fetchUpstreamSnapshot(
+			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+			context,
+			env,
+			// 本端点已在上面用同一入口鉴权（未授权直接 401），故门必为放行态。
+			{ liveOverlayStatus: requestInternalUniverseStatus(request, env) },
+		);
 		return jsonResponse(upstream.snapshot);
 	} catch (error) {
 		logBridgeFailure(context, error, "dynamic_portfolio_quotes");
-		return jsonResponse({ error: "PORTFOLIO_QUOTES_UNAVAILABLE", message: clientFacingErrorMessage(error) }, 502);
+		return jsonResponse(
+			{ error: "PORTFOLIO_QUOTES_UNAVAILABLE", message: clientFacingErrorMessage(error) },
+			502,
+		);
 	}
 }
 
 async function handlePublicQuotes(request: Request, env: Env): Promise<Response> {
 	if (request.method !== "GET") return jsonResponse({ error: "METHOD_NOT_ALLOWED" }, 405);
 	const context = bridgeContext("http:public-quotes");
-	try { return jsonResponse(await fetchPublicQuoteSnapshot(context, env)); }
-	catch (error) {
+	try {
+		return jsonResponse(await fetchPublicQuoteSnapshot(context, env));
+	} catch (error) {
 		logBridgeFailure(context, error, "public_quotes");
-		return jsonResponse({ error: "UPSTREAM_UNAVAILABLE", message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE }, 502);
+		return jsonResponse(
+			{ error: "UPSTREAM_UNAVAILABLE", message: PUBLIC_QUOTES_UNAVAILABLE_MESSAGE },
+			502,
+		);
 	}
 }
 
@@ -1100,20 +1662,53 @@ export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
 		if (url.pathname === "/api/github-auth/probe") return handleGithubAuthProbe(request);
-		if (url.pathname === "/api/github-auth/quote-universe") return handleGithubAuthUniverse(request, env);
-		if (url.pathname === "/api/github-auth/portfolio-status") return handleGithubAuthPortfolioStatus(request, env);
-		if (url.pathname === "/internal/research-replica/v2/ingest") return handleResearchReplicaIngest(request, env);
-		if (url.pathname === "/internal/research-replica/v2/receipts") return handleResearchReplicaReceipts(request, env);
-		if (url.pathname === "/api/control-plane-status" && request.method === "GET") return handleControlPlaneStatus(env);
+		if (url.pathname === "/api/github-auth/quote-universe")
+			return handleGithubAuthUniverse(request, env);
+		if (url.pathname === "/api/github-auth/portfolio-status") {
+			return handleGithubAuthPortfolioStatus(request, env);
+		}
+		if (url.pathname === "/internal/research-replica/v2/ingest") {
+			return handleResearchReplicaIngest(request, env);
+		}
+		if (url.pathname === "/internal/research-replica/v2/receipts") {
+			return handleResearchReplicaReceipts(request, env);
+		}
+		if (url.pathname === "/api/control-plane-status" && request.method === "GET") {
+			return handleControlPlaneStatus(env);
+		}
 		if (url.pathname === "/api/quote-universe") return handleUniverseApi(request, env);
 		if (url.pathname === "/api/public/quotes") return handlePublicQuotes(request, env);
-		if (url.pathname === "/api/portfolio-quotes") return handleDynamicPortfolioQuotes(request, env);
+		if (url.pathname === "/api/portfolio-quotes")
+			return handleDynamicPortfolioQuotes(request, env);
+		// MCP 面（含 `get_portfolio_quotes`）：外部 client auth 与内部 universe token 解耦。
+		// 工厂按请求构造 server，故 `ctx.requestInfo` 就是当前请求；market:read 不足一律 fail-closed。
 		const handler = createMcpHandler((ctx) => {
 			const liveOverlayStatus = requestMcpMarketReadStatus(ctx.requestInfo, env);
-			logBridgeStage(bridgeContext("mcp:market-read-auth"), "mcp_market_read_auth", { ...marketReadAuditFields(env, liveOverlayStatus), live_overlay_status: liveOverlayStatus });
-			const researchScopes = resolveResearchScopes(ctx.requestInfo?.headers.get("Authorization") ?? null, ctx.requestInfo?.headers.get(FORWARDED_SCOPES_HEADER) ?? null, env.COLLECTOR_MCP_CLIENT_TOKEN, env.COLLECTOR_MCP_CLIENT_SCOPES);
-			const researchPrincipal = resolveResearchPrincipal(ctx.requestInfo?.headers.get("Authorization") ?? null, ctx.requestInfo?.headers.get(FORWARDED_PRINCIPAL_HEADER) ?? null, env.COLLECTOR_MCP_CLIENT_TOKEN);
-			const researchIssuer = resolveResearchIssuer(ctx.requestInfo?.headers.get("Authorization") ?? null, ctx.requestInfo?.headers.get(FORWARDED_ISSUER_HEADER) ?? null, env.COLLECTOR_MCP_CLIENT_TOKEN);
+			logBridgeStage(bridgeContext("mcp:market-read-auth"), "mcp_market_read_auth", {
+				...marketReadAuditFields(env, liveOverlayStatus),
+				live_overlay_status: liveOverlayStatus,
+			});
+			// §A4 研究写面 scope 解析：凭据逐字节匹配为前提，转发 scope 头 ∩
+			// server 配置上限（该头仅由 OAuth 桥在剥除客户端同名头后设置）。
+			const researchScopes = resolveResearchScopes(
+				ctx.requestInfo?.headers.get("Authorization") ?? null,
+				ctx.requestInfo?.headers.get(FORWARDED_SCOPES_HEADER) ?? null,
+				env.COLLECTOR_MCP_CLIENT_TOKEN,
+				env.COLLECTOR_MCP_CLIENT_SCOPES,
+			);
+			// #19：桥接层从已验证 grant props 盖章的稳定业务主体（chatgpt-production）。
+			// 动态 DCR client_id 不再进入授权路径；该头只在内部 bridge credential
+			// 逐字节匹配时被接受，客户端自带的同名头已在桥内剥除。
+			const researchPrincipal = resolveResearchPrincipal(
+				ctx.requestInfo?.headers.get("Authorization") ?? null,
+				ctx.requestInfo?.headers.get(FORWARDED_PRINCIPAL_HEADER) ?? null,
+				env.COLLECTOR_MCP_CLIENT_TOKEN,
+			);
+			const researchIssuer = resolveResearchIssuer(
+				ctx.requestInfo?.headers.get("Authorization") ?? null,
+				ctx.requestInfo?.headers.get(FORWARDED_ISSUER_HEADER) ?? null,
+				env.COLLECTOR_MCP_CLIENT_TOKEN,
+			);
 			return createServer(env, liveOverlayStatus, researchScopes, researchPrincipal, researchIssuer);
 		});
 		return handler(request, env, ctx);
@@ -1122,9 +1717,14 @@ export default {
 		const runId = controller.cron ? `cron:${controller.cron}` : "test:scheduled";
 		const context = bridgeContext(runId);
 		logBridgeStage(context, "scheduled_enter");
+
 		try {
 			const payload = await updateQuoteBridge(env, context.runId);
-			logBridgeStage(context, "scheduled_complete", { bridge_status: payload.bridge.last_attempt_status, snapshot_time: payload.snapshot?.snapshot_time ?? null, system_quality: payload.snapshot?.system_quality ?? null });
+			logBridgeStage(context, "scheduled_complete", {
+				bridge_status: payload.bridge.last_attempt_status,
+				snapshot_time: payload.snapshot?.snapshot_time ?? null,
+				system_quality: payload.snapshot?.system_quality ?? null,
+			});
 		} catch (error) {
 			logBridgeFailure(context, error, "scheduled");
 			throw error;
