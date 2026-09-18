@@ -135,6 +135,25 @@ function objectContentHash(record: OutboundV2Record): string | null {
 }
 
 /**
+ * Accumulator ordering is semantic, not replica-arrival based.  The outbound
+ * contract has carried created_at since v2 and the producer sets it from
+ * snapshot.calculated_at.  Validate it at the boundary so malformed legacy
+ * payloads cannot accidentally participate in a latest-state query.
+ */
+function accumulatorOrdering(record: OutboundV2Record): { subject: string | null; createdAt: string | null } {
+	if (record.record_type !== "accumulator") return { subject: null, createdAt: null };
+	const subject = String(record.payload.subject_key ?? "").trim();
+	const createdAt = String(record.payload.created_at ?? "");
+	if (!subject || !/^\d{4}-\d{2}-\d{2}T/.test(createdAt) || Number.isNaN(Date.parse(createdAt))) {
+		safeFailure("INTEGRITY_FAILED");
+	}
+	// Canonical outbound payloads are UTC ISO timestamps.  This closes the
+	// ordering surface to local-time strings and keeps D1 lexical ordering safe.
+	if (!/(Z|[+-]00:00)$/.test(createdAt)) safeFailure("INTEGRITY_FAILED");
+	return { subject, createdAt: new Date(createdAt).toISOString() };
+}
+
+/**
  * Store one verified message.  Re-applying the same message is a no-op for
  * logical state and reports REPLAY.  The immutable R2 journal permits safe
  * D1 recovery by sending the same record again through this function.
@@ -167,6 +186,7 @@ export async function ingestResearchReplicaRecord(
 	const payloadJson = canonicalJson(record.payload);
 	const payloadSha256 = await sha256Hex(payloadJson);
 	const contentSha256 = objectContentHash(record);
+	const accumulator = accumulatorOrdering(record);
 	const journal = canonicalJson(record);
 	const journalBytes = new TextEncoder().encode(journal).byteLength;
 	let objectBody: Uint8Array | null = null;
@@ -223,7 +243,7 @@ export async function ingestResearchReplicaRecord(
 				),
 		storage.db
 			.prepare(
-				"INSERT INTO research_records (record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(record_type, record_key) DO UPDATE SET message_id=excluded.message_id, visibility=excluded.visibility, schema_version=excluded.schema_version, payload_json=excluded.payload_json, generated_at=excluded.generated_at, updated_at=excluded.updated_at WHERE NOT (research_records.record_type='evidence' AND research_records.schema_version='collector-outbound-v4' AND excluded.schema_version<>'collector-outbound-v4')",
+				"INSERT INTO research_records (record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at, accumulator_subject_key, accumulator_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(record_type, record_key) DO UPDATE SET message_id=excluded.message_id, visibility=excluded.visibility, schema_version=excluded.schema_version, payload_json=excluded.payload_json, generated_at=excluded.generated_at, updated_at=excluded.updated_at, accumulator_subject_key=excluded.accumulator_subject_key, accumulator_created_at=excluded.accumulator_created_at WHERE NOT (research_records.record_type='evidence' AND research_records.schema_version='collector-outbound-v4' AND excluded.schema_version<>'collector-outbound-v4')",
 				)
 				.bind(
 					record.record_type,
@@ -234,6 +254,8 @@ export async function ingestResearchReplicaRecord(
 					payloadJson,
 					record.generated_at,
 					now,
+					accumulator.subject,
+					accumulator.createdAt,
 				),
 		];
 		if (contentSha256) {

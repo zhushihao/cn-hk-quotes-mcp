@@ -223,6 +223,32 @@ export class CollectorResearchRemoteAdapter {
 		});
 	}
 
+	/**
+	 * Return the semantic-current accumulator for one subject.  Accumulator
+	 * snapshots are immutable facts, so the replica's receive/update time is
+	 * deliberately not a state ordering signal.  The producer defines
+	 * payload.created_at as the UTC calculation time; snapshot_id is the stable
+	 * lexicographic tiebreak when two calculations have the same instant.
+	 *
+	 * This is intentionally a subject-scoped query rather than records(100): a
+	 * busy unrelated accumulator stream must not hide an older subject row.
+	 * Existing v2/v3/v4 rows remain readable because created_at has been part
+	 * of the frozen accumulator payload since v2.
+	 */
+	private async currentAccumulator(subjectKey: string): Promise<ReplicaRecordRow> {
+		if (typeof subjectKey !== "string" || subjectKey.trim().length === 0) fail("INTEGRITY_FAILED");
+		return this.guarded(async () => {
+			const row = await this.storage.db
+				.prepare(
+					"SELECT record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at FROM research_records WHERE record_type='accumulator' AND visibility=? AND accumulator_subject_key=? ORDER BY accumulator_created_at DESC, record_key DESC LIMIT 1",
+				)
+				.bind(this.visibility, subjectKey)
+				.first<ReplicaRecordRow>();
+			if (!row) fail("NOT_FOUND");
+			return row;
+		});
+	}
+
 	async searchDocuments(query?: string, limit?: number): Promise<Array<Record<string, unknown>>> {
 		const needle = query?.trim().toLocaleLowerCase();
 		return (await this.records("document_version", limit))
@@ -353,11 +379,7 @@ export class CollectorResearchRemoteAdapter {
 	}
 
 	async getThemeAccumulator(subjectKey: string): Promise<Record<string, unknown>> {
-		for (const row of await this.records("accumulator", 100)) {
-			const payload = parsePayload(row);
-			if (payload.subject_key === subjectKey) return recordView(row);
-		}
-		fail("NOT_FOUND");
+		return recordView(await this.currentAccumulator(subjectKey));
 	}
 
 	async getCompanyEvidenceState(company: string): Promise<Record<string, unknown>> {

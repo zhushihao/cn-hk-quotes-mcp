@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 const remote = await import("../src/research-remote-adapter.ts");
+const replica = await import("../src/research-replica.ts");
+const outbound = await import("../src/research-outbound-v2.ts");
 
 const encoder = new TextEncoder();
 
@@ -51,6 +53,15 @@ class FakeD1 {
 				return { results: typeof limit === "number" ? rows.slice(0, limit) : rows };
 			},
 			async first() {
+				if (sql.includes("accumulator_subject_key")) {
+					const [visibility, subjectKey] = this.params;
+					return db.records
+						.filter((row) => row.record_type === "accumulator" && row.visibility === visibility && row.accumulator_subject_key === subjectKey)
+					.sort((a, b) => {
+						const byCreated = String(b.accumulator_created_at).localeCompare(String(a.accumulator_created_at));
+						return byCreated || String(b.record_key).localeCompare(String(a.record_key));
+						})[0] ?? null;
+				}
 				if (sql.includes("json_extract")) {
 					const [visibility, documentId] = this.params;
 					return db.documentRows(visibility, documentId)[0] ?? null;
@@ -72,6 +83,56 @@ class FakeD1 {
 	}
 }
 
+function accumulatorRow({
+	snapshotId,
+	subjectKey = "ai-compute",
+	createdAt,
+	updatedAt = "2026-09-18T00:00:00.000Z",
+	status = "OBSERVED",
+	schemaVersion = "collector-outbound-v4",
+}) {
+	return {
+		record_type: "accumulator",
+		record_key: snapshotId,
+		message_id: `outbound_${snapshotId}`,
+		visibility: "PUBLIC",
+		schema_version: schemaVersion,
+		payload_json: JSON.stringify({ snapshot_id: snapshotId, subject_key: subjectKey, created_at: createdAt, status }),
+		generated_at: "2099-01-01T00:00:00.000Z",
+		updated_at: updatedAt,
+		accumulator_subject_key: subjectKey,
+		accumulator_created_at: new Date(createdAt).toISOString(),
+	};
+}
+
+async function accumulatorEnvelope({ snapshotId, createdAt, status }) {
+	const record = {
+		record_type: "accumulator",
+		message_id: "",
+		schema_version: "collector-outbound-v3",
+		policy_version: "accumulator-v1",
+		visibility: "PUBLIC",
+		generated_at: "2099-01-01T00:00:00+00:00",
+		payload: {
+			snapshot_id: snapshotId,
+			subject_key: "ai-compute",
+			evidence_ids: [],
+			total_weight: 0,
+			dimensions: { C: 0, D: 0, E: 0, M: 0, P: 0, S: 0 },
+			independent_cluster_count: 0,
+			unknown_cluster_count: 0,
+			conflict_count: 0,
+			last_evidence_at: null,
+			rule_version: "accumulator-v1",
+			status,
+			created_at: createdAt,
+			visibility: "PUBLIC",
+		},
+	};
+	record.message_id = await outbound.computeOutboundV2MessageId(record);
+	return record;
+}
+
 class FakeR2 {
 	constructor(objects) {
 		this.objects = objects;
@@ -85,6 +146,11 @@ class FakeR2 {
 						bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
 				}
 			: null;
+	}
+
+	async put(key, body) {
+		const bytes = typeof body === "string" ? encoder.encode(body) : new Uint8Array(body);
+		this.objects.set(key, bytes);
 	}
 }
 
@@ -229,6 +295,57 @@ test("C6 remote adapter is visibility fail-closed and emits only the common safe
 			Object.keys(error.asError()).sort().join(",") ===
 				"error_code,request_id,retryable,safe_message",
 	);
+});
+
+test("#25 current accumulator uses producer created_at, not late replica arrival", async () => {
+	const newer = accumulatorRow({
+		snapshotId: "snap_b49b_new",
+		createdAt: "2026-09-17T10:00:00+00:00",
+		updatedAt: "2026-09-17T10:01:00.000Z",
+		status: "ACCUMULATING",
+	});
+	const oldLate = accumulatorRow({
+		snapshotId: "snap_6242_old",
+		createdAt: "2026-09-17T09:00:00+00:00",
+		updatedAt: "2026-09-18T12:00:00.000Z",
+		status: "OBSERVED",
+		schemaVersion: "collector-outbound-v2",
+	});
+	const adapter = new remote.CollectorResearchRemoteAdapter({ db: new FakeD1([newer, oldLate]), objects: new FakeR2(new Map()) });
+	const current = await adapter.getThemeAccumulator("ai-compute");
+	assert.equal(current.record_key, "snap_b49b_new");
+	assert.equal(current.payload.status, "ACCUMULATING");
+});
+
+test("#25 accumulator semantic ordering is replay-safe, generation-safe, stable on ties, and not globally windowed", async () => {
+	const targetNew = accumulatorRow({ snapshotId: "snap-z", createdAt: "2026-09-18T10:00:00Z", status: "ACCUMULATING" });
+	const targetReplay = accumulatorRow({ snapshotId: "snap-z", createdAt: "2026-09-18T10:00:00Z", updatedAt: "2099-01-01T00:00:00Z", status: "ACCUMULATING" });
+	const targetSameTimeOlderTie = accumulatorRow({ snapshotId: "snap-a", createdAt: "2026-09-18T10:00:00Z", updatedAt: "2100-01-01T00:00:00Z", status: "OBSERVED", schemaVersion: "collector-outbound-v3" });
+	const targetLateOld = accumulatorRow({ snapshotId: "snap-old", createdAt: "2026-09-18T09:00:00Z", updatedAt: "2200-01-01T00:00:00Z", status: "ESCALATED" });
+	const unrelated = Array.from({ length: 150 }, (_, index) => accumulatorRow({
+		snapshotId: `other-${String(index).padStart(3, "0")}`,
+		subjectKey: `other-${index}`,
+		createdAt: "2026-09-19T00:00:00Z",
+		updatedAt: "2200-01-01T00:00:00Z",
+	}));
+	const adapter = new remote.CollectorResearchRemoteAdapter({
+		db: new FakeD1([...unrelated, targetLateOld, targetSameTimeOlderTie, targetReplay, targetNew]),
+		objects: new FakeR2(new Map()),
+	});
+	const current = await adapter.getThemeAccumulator("ai-compute");
+	assert.equal(current.record_key, "snap-z"); // snapshot id is deterministic tie-break.
+	assert.equal(current.payload.status, "ACCUMULATING"); // semantic state may legally decline after a correction.
+});
+
+test("#25 replica ingest new then old keeps semantic-current state in real migrated D1 SQL", async () => {
+	const storage = { db: createResearchWorkflowDb(), objects: new FakeR2(new Map()) };
+	const newer = await accumulatorEnvelope({ snapshotId: "snap-new", createdAt: "2026-09-18T10:00:00+00:00", status: "ACCUMULATING" });
+	const oldLate = await accumulatorEnvelope({ snapshotId: "snap-old", createdAt: "2026-09-18T09:00:00+00:00", status: "OBSERVED" });
+	await replica.ingestResearchReplicaRecord(storage, newer, null, "2026-09-18T10:01:00+00:00");
+	await replica.ingestResearchReplicaRecord(storage, oldLate, null, "2099-01-01T00:00:00+00:00");
+	const current = await new remote.CollectorResearchRemoteAdapter(storage).getThemeAccumulator("ai-compute");
+	assert.equal(current.record_key, "snap-new");
+	assert.equal(current.payload.status, "ACCUMULATING");
 });
 
 test("C8 PDF version with a FETCHED text-extraction projection serves projection bytes", async () => {
