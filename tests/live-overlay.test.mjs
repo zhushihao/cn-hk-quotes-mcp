@@ -612,7 +612,7 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 	assert.match(source, /liveOverlayStatus \?\? "SKIPPED_UNAUTHORIZED"/);
 	assert.match(source, /liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED"/);
 	// 5. 旧行情桥（cron）不传门（liveOverlayStatus），结构上不可能叠加；
-	//    env 仅用于旧 origin 的 Access 服务令牌（issue #7 Step 3）。
+	//    env 仅用于受保护 quote proxy 的 Access 服务令牌。
 	const bridgeBody = source.slice(
 		source.indexOf("export async function updateQuoteBridge"),
 		source.lastIndexOf("/**", source.indexOf("function createServer")),
@@ -620,8 +620,9 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 	assert.doesNotMatch(bridgeBody, /liveOverlayStatus/);
 	assert.match(
 		bridgeBody,
-		/fetchUpstreamSnapshot\(\s*\[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL\],\s*context,\s*env,\s*\);/,
+		/fetchUpstreamSnapshot\(\s*\[PORTFOLIO_QUOTES_URL\],\s*context,\s*env,\s*\);/,
 	);
+	assert.doesNotMatch(source, /chatgpt\.site|PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL/);
 });
 
 test("D-1 wiring: no security code and no un-scrubbed message can reach a caller", async () => {
