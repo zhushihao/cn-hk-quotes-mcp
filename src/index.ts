@@ -61,8 +61,6 @@ import { ResearchBoundaryError } from "./research-outbound-v2.ts";
 
 const PORTFOLIO_QUOTES_URL =
 	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
-const PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL =
-	"https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes";
 const GITHUB_REPOSITORY = "zhushihao/quantpro-collector";
 const GITHUB_ISSUE_NUMBER = 1;
 const GITHUB_API_VERSION = "2022-11-28";
@@ -86,7 +84,7 @@ interface Env {
 	COLLECTOR_MCP_CLIENT_ID?: string;
 	/** 空格或逗号分隔的批准 scopes；LIVE overlay 至少要求 market:read。 */
 	COLLECTOR_MCP_CLIENT_SCOPES?: string;
-	/** 旧行情 origin（cn-hk-quotes-proxy / chatgpt.site）启用 Cloudflare Access 后注入。 */
+	/** 受保护行情 origin（cn-hk-quotes-proxy）启用 Cloudflare Access 后注入。 */
 	CF_ACCESS_CLIENT_ID?: string;
 	CF_ACCESS_CLIENT_SECRET?: string;
 	RESEARCH_REPLICA?: D1Database;
@@ -396,7 +394,7 @@ async function fetchUpstreamSnapshot(
 
 		try {
 			const separator = source.includes("?") ? "&" : "?";
-			// 旧行情 origin（proxy/chatgpt.site）启用 Cloudflare Access 服务令牌后，
+			// 受保护行情 origin（proxy）启用 Cloudflare Access 服务令牌后，
 			// 内部抓取凭 CF-Access-Client-Id/Secret 通过边（issue #7 Step 3）；
 			// 绑定未配置时保持匿名（本地 dev / Access 未开启阶段），凭据不进日志。
 			const accessHeaders: Record<string, string> = {};
@@ -505,9 +503,9 @@ async function fetchUpstreamSnapshot(
 				error instanceof BridgeError
 					? error
 					: new BridgeError("upstream_fetch", safeErrorMessage(error));
-			const canRetryWithPublicSite =
+			const canRetryWithNextSource =
 				lastError.httpStatus === 404 && index < sources.length - 1;
-			if (!canRetryWithPublicSite) {
+			if (!canRetryWithNextSource) {
 				throw lastError;
 			}
 			logBridgeStage(context, "upstream_fetch_retry", {
@@ -527,10 +525,10 @@ async function fetchPublicQuoteSnapshot(
 	context: BridgeStageContext,
 	env?: Env,
 ): Promise<PublicQuoteSnapshot> {
-	// 公开行情 pickup 仍指向旧 Worker 的 chatgpt.site 公开入口（public host，
-	// issue #7 Step 4 起由 Cloudflare Access + 服务令牌保护），投影为 quote-only 后外发。
+	// 公开行情统一从受 Cloudflare Access 保护的 quote proxy 取数，
+	// 再投影为 quote-only 后外发；旧 Site 不再参与运行链。
 	const upstream = await fetchUpstreamSnapshot(
-		[PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+		[PORTFOLIO_QUOTES_URL],
 		context,
 		env,
 	);
@@ -579,10 +577,10 @@ export async function updateQuoteBridge(
 	let upstreamError: BridgeError | null = null;
 
 	try {
-		// env 仅用于旧 origin 的 Access 服务令牌（Step 3）；不传叠加门参，
+		// env 仅用于受保护 quote proxy 的 Access 服务令牌；不传叠加门参，
 		// 叠加（LIVE overlay / KV 读取）在 cron 路径结构上仍不可能发生。
 		const upstream = await fetchUpstreamSnapshot(
-			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+			[PORTFOLIO_QUOTES_URL],
 			context,
 			env,
 		);
@@ -745,7 +743,7 @@ export function createServer(
 			const context = bridgeContext("mcp:get_portfolio_quotes");
 			try {
 				const upstream = await fetchUpstreamSnapshot(
-					[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+					[PORTFOLIO_QUOTES_URL],
 					context,
 					env,
 					{ liveOverlayStatus },
@@ -1628,7 +1626,7 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 			);
 		}
 		const upstream = await fetchUpstreamSnapshot(
-			[PORTFOLIO_QUOTES_URL, PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL],
+			[PORTFOLIO_QUOTES_URL],
 			context,
 			env,
 			// 本端点已在上面用同一入口鉴权（未授权直接 401），故门必为放行态。
