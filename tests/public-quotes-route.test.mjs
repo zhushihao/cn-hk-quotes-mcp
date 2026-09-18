@@ -65,6 +65,8 @@ function envWithKv() {
 	return {
 		GITHUB_TOKEN: "test-token",
 		PORTFOLIO_UNIVERSE_TOKEN: "private-token",
+		CF_ACCESS_CLIENT_ID: "test-access-id",
+		CF_ACCESS_CLIENT_SECRET: "test-access-secret",
 		PORTFOLIO_UNIVERSE: {
 			get: async () => { throw new Error("public route must not read LIVE KV"); },
 		},
@@ -109,15 +111,16 @@ async function readMcpJson(response) {
 	return JSON.parse(text);
 }
 
-const PUBLIC_QUOTES_SOURCE = "https://cn-hk-quotes.zhushihao710.chatgpt.site/api/portfolio-quotes";
-const DYNAMIC_QUOTES_SOURCE = "https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
+const PROTECTED_QUOTES_SOURCE = "https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
 
 function publicUpstream(fetchCount, status = 200, body = snapshot()) {
-	return async (input) => {
+	return async (input, options = {}) => {
 		fetchCount.count += 1;
 		const url = String(input);
-		assert.match(url, new RegExp(`${PUBLIC_QUOTES_SOURCE.replaceAll(".", "\\.")}\\?_bridge_ts=`));
-		assert.equal(url.startsWith(DYNAMIC_QUOTES_SOURCE), false);
+		assert.match(url, new RegExp(`${PROTECTED_QUOTES_SOURCE.replaceAll(".", "\\.")}\\?_bridge_ts=`));
+		const headers = new Headers(options.headers);
+		assert.equal(headers.get("CF-Access-Client-Id"), "test-access-id");
+		assert.equal(headers.get("CF-Access-Client-Secret"), "test-access-secret");
 		return jsonResponse(body, status);
 	};
 }
@@ -160,7 +163,7 @@ test("public route returns a closed 502 error and never falls back to private ou
 	assert.equal(fetchCount.count, 1);
 });
 
-test("public route converts a public-source 404 into the closed public error", async () => {
+test("public route converts a protected-source 404 into the closed public error", async () => {
 	const fetchCount = { count: 0 };
 	const response = await fetchPublicRoute(publicUpstream(fetchCount, 404, { private: "should not be returned" }));
 	assert.equal(response.status, 502);
