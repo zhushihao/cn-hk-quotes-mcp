@@ -250,13 +250,25 @@ export class CollectorResearchRemoteAdapter {
 	}
 
 	async searchDocuments(query?: string, limit?: number): Promise<Array<Record<string, unknown>>> {
-		const needle = query?.trim().toLocaleLowerCase();
-		return (await this.records("document_version", limit))
-			.filter((row) => {
-				if (!needle) return true;
-				const document = parsePayload(row).document as Record<string, unknown>;
-				return String(document?.title ?? "").toLocaleLowerCase().includes(needle);
-			})
+		const needle = query?.trim().toLocaleLowerCase() ?? "";
+		// Apply a requested title filter in D1 before LIMIT.  Fetching the most
+		// recently received N documents and filtering in memory made a matching
+		// older document disappear as the replica grew (the 960 / Hi-ONE official
+		// backfill is a production example).  LIMIT belongs to search results,
+		// not to an unrelated arrival-time window.
+		const rows = await this.guarded(async () => {
+			const base = "SELECT record_type, record_key, message_id, visibility, schema_version, payload_json, generated_at, updated_at FROM research_records WHERE record_type='document_version' AND visibility=?";
+			const statement = needle
+				? this.storage.db
+						.prepare(`${base} AND lower(json_extract(payload_json, '$.document.title')) LIKE ? ORDER BY updated_at DESC LIMIT ?`)
+						.bind(this.visibility, `%${needle}%`, boundedLimit(limit))
+				: this.storage.db
+						.prepare(`${base} ORDER BY updated_at DESC LIMIT ?`)
+						.bind(this.visibility, boundedLimit(limit));
+			const result = await statement.all<ReplicaRecordRow>();
+			return result.results ?? [];
+		});
+		return rows
 			.map((row) => {
 				const view = recordView(row);
 				// Effective readable (SPEC-C8 §3.3): recomputed from the same

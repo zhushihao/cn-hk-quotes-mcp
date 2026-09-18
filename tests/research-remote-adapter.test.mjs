@@ -43,8 +43,25 @@ class FakeD1 {
 			},
 			async all() {
 				if (sql.includes("json_extract")) {
+					if (sql.includes("lower(json_extract(payload_json, '$.document.title'))")) {
+						const [visibility, titleNeedle, limit] = this.params;
+						const rows = db.records.filter((row) =>
+							row.record_type === "document_version" &&
+							row.visibility === visibility &&
+							String(JSON.parse(row.payload_json).document.title ?? "").toLocaleLowerCase()
+								.includes(String(titleNeedle).replaceAll("%", "").toLocaleLowerCase()),
+						);
+						return { results: typeof limit === "number" ? rows.slice(0, limit) : rows };
+					}
 					const [visibility, documentId] = this.params;
 					return { results: db.documentRows(visibility, documentId) };
+				}
+				if (sql.includes("record_type='document_version'")) {
+					const [visibility, limit] = this.params;
+					const rows = db.records.filter(
+						(row) => row.record_type === "document_version" && row.visibility === visibility,
+					);
+					return { results: typeof limit === "number" ? rows.slice(0, limit) : rows };
 				}
 				const [recordType, visibility, limit] = this.params;
 				const rows = db.records.filter(
@@ -521,6 +538,25 @@ test("C8 searchDocuments overrides effective readable without rewriting stored p
 		storage.db.records.map((row) => row.payload_json),
 		storedBefore,
 	);
+});
+
+test("#25 searchDocuments applies its title filter before the result limit", async () => {
+	const newerUnrelated = Array.from({ length: 10 }, (_, index) => documentVersionRow({
+		documentId: `doc-newer-${index}`,
+		versionId: `ver-newer-${index}`,
+		title: `Unrelated newer document ${index}`,
+	}));
+	const huawei = documentVersionRow({
+		documentId: "doc-huawei-960",
+		versionId: "ver-huawei-960",
+		title: "Huawei Ascend 960 Hi-ONE official announcement",
+	});
+	const adapter = new remote.CollectorResearchRemoteAdapter(storageFrom(...newerUnrelated, huawei), {
+		visibility: "PUBLIC",
+	});
+	const views = await adapter.searchDocuments("960", 10);
+	assert.equal(views.length, 1);
+	assert.equal(views[0].payload.document.document_id, "doc-huawei-960");
 });
 
 test("C8 WITHDRAWAL-only document is never servable on either read face", async () => {
