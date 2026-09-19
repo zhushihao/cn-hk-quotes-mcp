@@ -20,6 +20,7 @@ const { default: worker } = await import("../src/index.ts");
 const { computeLiveUniverseHash, writeLiveUniverse } = await import("../src/live-universe.ts");
 const { writePortfolioStatus } = await import("../src/portfolio-status.ts");
 const { readPortfolioUniverseDelta } = await import("../src/portfolio-delta.ts");
+const { quoteCatalogFromSnapshot, writeQuoteCatalog } = await import("../src/quote-catalog.ts");
 
 const MANIFEST_HASH = `sha256:${"b".repeat(64)}`;
 
@@ -131,6 +132,7 @@ function memoryKv() {
 
 async function liveEnv(active) {
 	const kv = memoryKv();
+	await writeQuoteCatalog(kv, quoteCatalogFromSnapshot(catalog()));
 	const contentHash = await computeLiveUniverseHash(active);
 	const now = new Date().toISOString();
 	await writeLiveUniverse(kv, {
@@ -236,10 +238,13 @@ test("new legal LIVE identity is fetched dynamically then passes the unchanged c
 	const env = await liveEnv([{ market: "CN", exchange: "SZ", code: "002409" }]);
 	const response = await privateDynamicRequest(env, async (input) => {
 		const url = String(input);
+		if (url.includes("qt.gtimg.cn/q=sz300308")) {
+			return new Response(tencentRecord("sz300308", "300308"), { status: 200 });
+		}
 		if (url.includes("qt.gtimg.cn/q=sz002409")) {
 			return new Response(tencentRecord("sz002409", "002409"), { status: 200 });
 		}
-		return new Response(JSON.stringify(catalog()), { status: 200 });
+		return new Response("", { status: 503 });
 	});
 	assert.equal(response.status, 200);
 	const body = await response.json();
@@ -270,11 +275,14 @@ test("partial dynamic provider failure never returns a partial active universe",
 	]);
 	const response = await privateDynamicRequest(env, async (input) => {
 		const url = String(input);
+		if (url.includes("qt.gtimg.cn/q=sz300308")) {
+			return new Response(tencentRecord("sz300308", "300308"), { status: 200 });
+		}
 		if (url.includes("qt.gtimg.cn/q=sz002409")) {
 			return new Response(tencentRecord("sz002409", "002409"), { status: 200 });
 		}
 		if (url.includes("qt.gtimg.cn/q=sz002975")) return new Response("", { status: 503 });
-		return new Response(JSON.stringify(catalog()), { status: 200 });
+		return new Response("", { status: 503 });
 	});
 	assert.equal(response.status, 502);
 	const body = await response.json();

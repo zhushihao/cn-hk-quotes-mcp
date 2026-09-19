@@ -37,6 +37,13 @@ import {
 import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portfolio-validation";
 import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
 import {
+	fetchQuoteSnapshotFromCatalog,
+	quoteCatalogFromSnapshot,
+	readQuoteCatalog,
+	writeQuoteCatalog,
+	type StoredQuoteCatalog,
+} from "./quote-catalog.ts";
+import {
 	FORWARDED_SCOPES_HEADER,
 	FORWARDED_PRINCIPAL_HEADER,
 	FORWARDED_ISSUER_HEADER,
@@ -365,6 +372,67 @@ async function completeMissingLiveQuotes(
 	}
 }
 
+async function ensurePrivateQuoteCatalog(
+	context: BridgeStageContext,
+	env: Env,
+): Promise<StoredQuoteCatalog> {
+	if (!env.PORTFOLIO_UNIVERSE) {
+		throw new BridgeError("quote_catalog", "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED");
+	}
+	const existing = await readQuoteCatalog(env.PORTFOLIO_UNIVERSE);
+	if (existing) return existing;
+
+	// #7 migration bridge: seed classification metadata exactly once from the
+	// Access-protected legacy source. quoteCatalogFromSnapshot intentionally
+	// strips runtime holding state / quantity before the catalog reaches KV.
+	const seed = await fetchUpstreamSnapshot([PORTFOLIO_QUOTES_URL], context, env);
+	const catalog = quoteCatalogFromSnapshot(seed.snapshot);
+	await writeQuoteCatalog(env.PORTFOLIO_UNIVERSE, catalog);
+	logBridgeStage(context, "quote_catalog_seeded", {
+		catalog_rows: catalog.items.length,
+	});
+	return catalog;
+}
+
+async function fetchPrivateCatalogSnapshot(
+	context: BridgeStageContext,
+	env: Env,
+	options: UpstreamFetchOptions = {},
+): Promise<UpstreamSnapshotResult> {
+	const catalog = await ensurePrivateQuoteCatalog(context, env);
+	let snapshot: QuoteSnapshot;
+	try {
+		snapshot = await fetchQuoteSnapshotFromCatalog(catalog);
+	} catch (error) {
+		if (error instanceof DynamicQuoteError) {
+			throw new BridgeError("dynamic_quote_fetch", error.code);
+		}
+		throw error;
+	}
+
+	const liveOverlayStatus = options.liveOverlayStatus ?? "SKIPPED_UNAUTHORIZED";
+	let projectedSnapshot = snapshot;
+	if (env.PORTFOLIO_UNIVERSE && isLiveOverlayEnabled(liveOverlayStatus)) {
+		const live = await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date());
+		const snapshotForOverlay =
+			live.universe && live.presentation.apply_overlay
+				? await completeMissingLiveQuotes(snapshot, live.universe)
+				: snapshot;
+		projectedSnapshot = projectCallerSnapshot({
+			snapshot: snapshotForOverlay,
+			liveOverlayStatus,
+			universeBound: true,
+			universe: live.universe,
+			applyOverlay: live.presentation.apply_overlay,
+		}).snapshot;
+	}
+	logBridgeStage(context, "private_catalog_quote_refresh", {
+		catalog_rows: catalog.items.length,
+		live_overlay_status: liveOverlayStatus,
+	});
+	return { snapshot: projectedSnapshot, source: "PRIVATE_KV_DIRECT_TENCENT" };
+}
+
 /**
  * `fetchUpstreamSnapshot()` 的 LIVE 叠加门（D-1 选项 A）。
  *
@@ -525,13 +593,8 @@ async function fetchPublicQuoteSnapshot(
 	context: BridgeStageContext,
 	env?: Env,
 ): Promise<PublicQuoteSnapshot> {
-	// 公开行情统一从受 Cloudflare Access 保护的 quote proxy 取数，
-	// 再投影为 quote-only 后外发；旧 Site 不再参与运行链。
-	const upstream = await fetchUpstreamSnapshot(
-		[PORTFOLIO_QUOTES_URL],
-		context,
-		env,
-	);
+	if (!env) throw new BridgeError("quote_catalog", "runtime env is required");
+	const upstream = await fetchPrivateCatalogSnapshot(context, env);
 	return toPublicQuoteSnapshot(upstream.snapshot);
 }
 
@@ -579,11 +642,7 @@ export async function updateQuoteBridge(
 	try {
 		// env 仅用于受保护 quote proxy 的 Access 服务令牌；不传叠加门参，
 		// 叠加（LIVE overlay / KV 读取）在 cron 路径结构上仍不可能发生。
-		const upstream = await fetchUpstreamSnapshot(
-			[PORTFOLIO_QUOTES_URL],
-			context,
-			env,
-		);
+		const upstream = await fetchPrivateCatalogSnapshot(context, env);
 		payload = {
 			schema_version: "1.0",
 			bridge: {
@@ -742,8 +801,8 @@ export function createServer(
 		async () => {
 			const context = bridgeContext("mcp:get_portfolio_quotes");
 			try {
-				const upstream = await fetchUpstreamSnapshot(
-					[PORTFOLIO_QUOTES_URL],
+				if (!env) throw new BridgeError("quote_catalog", "runtime env is required");
+				const upstream = await fetchPrivateCatalogSnapshot(
 					context,
 					env,
 					{ liveOverlayStatus },
@@ -1625,8 +1684,7 @@ async function handleDynamicPortfolioQuotes(request: Request, env: Env): Promise
 				503,
 			);
 		}
-		const upstream = await fetchUpstreamSnapshot(
-			[PORTFOLIO_QUOTES_URL],
+		const upstream = await fetchPrivateCatalogSnapshot(
 			context,
 			env,
 			// 本端点已在上面用同一入口鉴权（未授权直接 401），故门必为放行态。

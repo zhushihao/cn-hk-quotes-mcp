@@ -611,17 +611,14 @@ test("Issue #8 wiring: external MCP market:read and internal universe auth are s
 	// 4. 叠加出口唯一，且其缺省是 fail-closed。
 	assert.match(source, /liveOverlayStatus \?\? "SKIPPED_UNAUTHORIZED"/);
 	assert.match(source, /liveOverlayStatus: LiveOverlayStatus = "SKIPPED_UNAUTHORIZED"/);
-	// 5. 旧行情桥（cron）不传门（liveOverlayStatus），结构上不可能叠加；
-	//    env 仅用于受保护 quote proxy 的 Access 服务令牌。
+	// 5. 公开桥（cron）不传门（liveOverlayStatus），结构上不可能叠加；
+	//    基础行情来自私有 catalog + direct provider。
 	const bridgeBody = source.slice(
 		source.indexOf("export async function updateQuoteBridge"),
 		source.lastIndexOf("/**", source.indexOf("function createServer")),
 	);
 	assert.doesNotMatch(bridgeBody, /liveOverlayStatus/);
-	assert.match(
-		bridgeBody,
-		/fetchUpstreamSnapshot\(\s*\[PORTFOLIO_QUOTES_URL\],\s*context,\s*env,\s*\);/,
-	);
+	assert.match(bridgeBody, /fetchPrivateCatalogSnapshot\(context, env\)/);
 	assert.doesNotMatch(source, /chatgpt\.site|PORTFOLIO_QUOTES_PUBLIC_FALLBACK_URL/);
 });
 

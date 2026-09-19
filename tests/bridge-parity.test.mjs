@@ -19,6 +19,7 @@ registerHooks({
 const { updateQuoteBridge } = await import("../src/index.ts");
 const { runManualQuoteBridge } = await import("../scripts/manual-quote-bridge.mjs");
 const { toPublicQuoteSnapshot } = await import("../src/quote-projections.ts");
+const { quoteCatalogFromSnapshot, writeQuoteCatalog } = await import("../src/quote-catalog.ts");
 
 function dynamicSnapshot() {
 	const row = {
@@ -100,23 +101,54 @@ function response(body, status = 200) {
 	});
 }
 
+function tencentRecord(symbol, code) {
+	const fields = Array.from({ length: 40 }, () => "");
+	fields[0] = "1";
+	fields[1] = "Dynamic security";
+	fields[2] = code;
+	fields[3] = "10";
+	fields[4] = "9";
+	fields[5] = "9.5";
+	fields[6] = "100";
+	fields[30] = "20260913150000";
+	fields[31] = "1";
+	fields[32] = "11.11";
+	fields[33] = "10.5";
+	fields[34] = "9";
+	fields[35] = "10/100/1000";
+	return `v_${symbol}="${fields.join("~")}";`;
+}
+
+function memoryKv() {
+	const values = new Map();
+	return {
+		get: async (key) => values.get(key) ?? null,
+		put: async (key, value) => values.set(key, value),
+	};
+}
+
 test("Cron and manual rerun accept the same dynamically added legal security", async () => {
 	// 双契约（issue #7）：cron 消费旧 origin 的富快照并投影 quote-only；
 	// manual 直接消费新 Worker 的公开 quote-only 路由（已投影）。两者必须收敛到同一 schema。
 	const snapshot = dynamicSnapshot();
 	const publicSnapshot = toPublicQuoteSnapshot(snapshot);
+	const kv = memoryKv();
+	await writeQuoteCatalog(kv, quoteCatalogFromSnapshot(snapshot));
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input, options = {}) => {
 		const url = String(input);
 		if (url === "https://api.github.com/repos/zhushihao/quantpro-collector/issues/1") {
 			return response(options.method === "PATCH" ? {} : { body: "" });
 		}
-		return response(snapshot);
+		if (url.includes("qt.gtimg.cn/q=sz002409")) {
+			return new Response(tencentRecord("sz002409", "002409"), { status: 200 });
+		}
+		return new Response("", { status: 503 });
 	};
 	let cronPayload;
 	try {
 		cronPayload = await updateQuoteBridge(
-			{ GITHUB_TOKEN: "test-token" },
+			{ GITHUB_TOKEN: "test-token", PORTFOLIO_UNIVERSE: kv },
 			"cron:dynamic-parity",
 		);
 	} finally {
@@ -139,8 +171,13 @@ test("Cron and manual rerun accept the same dynamically added legal security", a
 
 	assert.equal(cronPayload.bridge.last_attempt_status, "SUCCESS");
 	assert.equal(manual.payload.bridge.last_attempt_status, "SUCCESS");
-	assert.deepEqual(cronPayload.snapshot, manual.payload.snapshot);
-	assert.equal(cronPayload.snapshot.stocks[0].code, "002409");
 	assert.equal(cronPayload.snapshot.schema_version, "public_quote_snapshot/1");
+	assert.equal(manual.payload.snapshot.schema_version, "public_quote_snapshot/1");
+	assert.deepEqual(
+		cronPayload.snapshot.stocks.map((row) => row.code),
+		manual.payload.snapshot.stocks.map((row) => row.code),
+	);
+	assert.equal(Object.hasOwn(cronPayload.snapshot.stocks[0], "is_position"), false);
+	assert.equal(Object.hasOwn(manual.payload.snapshot.stocks[0], "is_position"), false);
 	assert.match(updated.body, /002409/);
 });

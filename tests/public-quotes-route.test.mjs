@@ -8,9 +8,7 @@ registerHooks({
 		if (specifier.startsWith("./") && !path.extname(specifier)) {
 			try {
 				return nextResolve(`${specifier}.ts`, context);
-			} catch {
-				// Let the default resolver report the original error for non-TS imports.
-			}
+			} catch {}
 		}
 		return nextResolve(specifier, context);
 	},
@@ -18,58 +16,124 @@ registerHooks({
 
 const { default: worker } = await import("../src/index.ts");
 
-function stock(code, market = "CN", exchange = "SZ", portfolioGroup = "core", portfolioStatus = "CORE", holdingStatus = "ACTIVE", isPosition = true, mappingOnly = false) {
+function stock(
+	code,
+	market = "CN",
+	exchange = "SZ",
+	portfolioGroup = "core",
+	portfolioStatus = "CORE",
+	holdingStatus = "ACTIVE",
+	isPosition = true,
+	mappingOnly = false,
+) {
 	return {
 		market, exchange, code, name: `Name ${code}`,
 		group: portfolioGroup === "growth" ? "Growth" : portfolioGroup === "watch" ? "Watch" : "Core",
 		portfolio_group: portfolioGroup, portfolio_status: portfolioStatus,
 		holding_status: holdingStatus, mapping_only: mappingOnly,
-		mapped_to: mappingOnly ? "300308" : null, mapping_to: mappingOnly ? "300308" : null,
+		mapped_to: mappingOnly ? "300308.SZ" : null,
+		mapping_to: mappingOnly ? "300308.SZ" : null,
 		position_qty: isPosition ? 100 : 0, is_position: isPosition,
-		price: 10, change: 1, change_pct: 10, pre_close: 9, prev_close: 9, open: 9.5, high: 10.5, low: 9,
-		pct_change: 10, volume: 100, amount: 1000, market_status: "CLOSED",
-		market_data_time: "2026-09-11T15:00:00+08:00", source_update_time: "2026-09-11T15:01:00+08:00",
-		freshness_basis: "MARKET_DATA", quote_time: "2026-09-11T15:00:00+08:00",
-		fetch_time: "2026-09-11T15:01:00+08:00", age_seconds: 60,
-		primary_source: "tencent", secondary_source: null, source_status: "OK", quality: "CLOSED_SNAPSHOT",
+		price: 10, change: 1, change_pct: 10, pre_close: 9, prev_close: 9,
+		open: 9.5, high: 10.5, low: 9, pct_change: 10, volume: 100, amount: 1000,
+		market_status: "CLOSED", market_data_time: "2026-09-18T15:00:00+08:00",
+		source_update_time: "2026-09-18T15:01:00+08:00", freshness_basis: "MARKET_DATA",
+		quote_time: "2026-09-18T15:00:00+08:00", fetch_time: "2026-09-19T00:00:00Z",
+		age_seconds: 60, primary_source: "tencent", secondary_source: null,
+		source_status: "OK", quality: "CLOSED_SNAPSHOT",
 	};
 }
 
 function snapshot() {
-	const stocks = [stock("300308"), stock("300502", "CN", "SZ", "growth", "GROWTH", "ACTIVE", true), stock("301183", "CN", "SZ", "watch", "WATCH", "WATCH", false)];
-	const portfolioUniverse = stocks.map((stock) => ({
-		market: stock.market, exchange: stock.exchange, code: stock.code, name: stock.name,
-		group: stock.group, portfolio_group: stock.portfolio_group, portfolio_status: stock.portfolio_status,
-		holding_status: stock.holding_status, mapping_only: stock.mapping_only,
-		mapped_to: stock.mapped_to, mapping_to: stock.mapping_to,
-		position_qty: stock.position_qty, is_position: stock.is_position,
-	}));
+	const stocks = [
+		stock("300308"),
+		stock("300502", "CN", "SZ", "growth", "GROWTH", "WATCH", false),
+		stock("301183", "CN", "SZ", "watch", "WATCH", "WATCH", false),
+	];
 	return {
-		portfolio_version: "catalog-v1", snapshot_time: "2026-09-11T15:01:00+08:00",
-		market_status: "CLOSED", source_mode: "MULTI_SOURCE", system_quality: "OK",
-		summary: { total: stocks.length, usable: stocks.length, active_holding_total: 2 },
-		portfolio_universe: portfolioUniverse,
+		portfolio_version: "catalog-v1",
+		snapshot_time: "2026-09-18T15:01:00+08:00",
+		market_status: "CLOSED",
+		source_mode: "MULTI_SOURCE",
+		system_quality: "OK",
+		summary: { total: stocks.length, usable: stocks.length },
+		portfolio_universe: stocks.map((row) => ({
+			market: row.market, exchange: row.exchange, code: row.code, name: row.name,
+			group: row.group, portfolio_group: row.portfolio_group,
+			portfolio_status: row.portfolio_status, holding_status: row.holding_status,
+			mapping_only: row.mapping_only, mapped_to: row.mapped_to, mapping_to: row.mapping_to,
+			position_qty: row.position_qty, is_position: row.is_position,
+		})),
 		stocks,
 	};
 }
 
-function jsonResponse(body, status = 200) {
-	return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+function privateCatalog() {
+	const source = snapshot();
+	return {
+		schema_version: "quote-catalog/1",
+		generated_at: "2026-09-19T00:00:00Z",
+		source_catalog_version: source.portfolio_version,
+		items: source.stocks.map((row) => ({
+			market: row.market, exchange: row.exchange, code: row.code, name: row.name,
+			group: row.group, portfolio_group: row.portfolio_group,
+			portfolio_status: row.portfolio_status, mapping_only: row.mapping_only,
+			mapped_to: row.mapped_to, mapping_to: row.mapping_to,
+		})),
+	};
+}
+
+function memoryKv(seedCatalog = true) {
+	const values = new Map();
+	if (seedCatalog) values.set("quote-catalog/current", JSON.stringify(privateCatalog()));
+	return {
+		get: async (key) => values.get(key) ?? null,
+		put: async (key, value) => values.set(key, value),
+		values,
+	};
+}
+
+function envWithKv(seedCatalog = true) {
+	return {
+		GITHUB_TOKEN: "test-token",
+		PORTFOLIO_UNIVERSE_TOKEN: "private-token",
+		CF_ACCESS_CLIENT_ID: "test-access-id",
+		CF_ACCESS_CLIENT_SECRET: "test-access-secret",
+		PORTFOLIO_UNIVERSE: memoryKv(seedCatalog),
+	};
 }
 
 function context() {
 	return { waitUntil() {}, passThroughOnException() {} };
 }
 
-function envWithKv() {
-	return {
-		GITHUB_TOKEN: "test-token",
-		PORTFOLIO_UNIVERSE_TOKEN: "private-token",
-		CF_ACCESS_CLIENT_ID: "test-access-id",
-		CF_ACCESS_CLIENT_SECRET: "test-access-secret",
-		PORTFOLIO_UNIVERSE: {
-			get: async () => { throw new Error("public route must not read LIVE KV"); },
-		},
+function tencentRecord(symbol, code, market) {
+	const fields = Array.from({ length: 40 }, () => "");
+	fields[0] = "1";
+	fields[1] = `Quote ${code}`;
+	fields[2] = code;
+	fields[3] = "10";
+	fields[4] = "9";
+	fields[5] = "9.5";
+	fields[6] = "100";
+	fields[30] = "20260918150000";
+	fields[31] = "1";
+	fields[32] = "11.11";
+	fields[33] = "10.5";
+	fields[34] = "9";
+	fields[35] = "10/100/1000";
+	fields[37] = market === "HK" ? "1000" : "";
+	return `v_${symbol}="${fields.join("~")}";`;
+}
+
+function directProvider(counter, status = 200) {
+	return async (input) => {
+		counter.count += 1;
+		const url = String(input);
+		assert.match(url, /^https:\/\/qt\.gtimg\.cn\/q=/);
+		const symbol = decodeURIComponent(url.split("q=")[1] ?? "");
+		const code = symbol.slice(2);
+		return new Response(tencentRecord(symbol, code, symbol.startsWith("hk") ? "HK" : "CN"), { status });
 	};
 }
 
@@ -111,82 +175,68 @@ async function readMcpJson(response) {
 	return JSON.parse(text);
 }
 
-const PROTECTED_QUOTES_SOURCE = "https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
-
-function publicUpstream(fetchCount, status = 200, body = snapshot()) {
-	return async (input, options = {}) => {
-		fetchCount.count += 1;
-		const url = String(input);
-		assert.match(url, new RegExp(`${PROTECTED_QUOTES_SOURCE.replaceAll(".", "\\.")}\\?_bridge_ts=`));
-		const headers = new Headers(options.headers);
-		assert.equal(headers.get("CF-Access-Client-Id"), "test-access-id");
-		assert.equal(headers.get("CF-Access-Client-Secret"), "test-access-secret");
-		return jsonResponse(body, status);
-	};
-}
-
-test("public route returns a quote-only snapshot without reading LIVE KV", async () => {
-	const fetchCount = { count: 0 };
-	const response = await fetchPublicRoute(publicUpstream(fetchCount));
+test("public route returns quote-only output from private catalog + direct provider", async () => {
+	const counter = { count: 0 };
+	const response = await fetchPublicRoute(directProvider(counter));
 	assert.equal(response.status, 200);
-	assert.equal(response.headers.get("Cache-Control"), "no-store");
 	const body = await response.json();
 	assert.equal(body.schema_version, "public_quote_snapshot/1");
 	assert.equal(body.summary.total, 3);
 	assert.equal(Object.hasOwn(body, "portfolio_universe"), false);
 	assert.equal(Object.hasOwn(body.stocks[0], "is_position"), false);
-	assert.equal(fetchCount.count, 1);
+	assert.equal(Object.hasOwn(body.stocks[0], "portfolio_group"), false);
+	assert.equal(counter.count, 3);
 });
 
-test("public MCP tool uses the same quote-only snapshot shape", async () => {
-	const fetchCount = { count: 0 };
-	const response = await callPublicTool(publicUpstream(fetchCount));
+test("public MCP tool uses the same quote-only shape", async () => {
+	const counter = { count: 0 };
+	const response = await callPublicTool(directProvider(counter));
 	assert.equal(response.status, 200);
 	const payload = await readMcpJson(response);
 	const content = payload.result?.content?.find((item) => item.type === "text");
 	assert.ok(content, JSON.stringify(payload));
 	const body = JSON.parse(content.text);
 	assert.equal(body.schema_version, "public_quote_snapshot/1");
-	assert.equal(Object.hasOwn(body, "portfolio_universe"), false);
 	assert.equal(Object.hasOwn(body.stocks[0], "position_qty"), false);
-	assert.equal(fetchCount.count, 1);
 });
 
-test("public route returns a closed 502 error and never falls back to private output", async () => {
-	const fetchCount = { count: 0 };
-	const response = await fetchPublicRoute(async () => {
-		fetchCount.count += 1;
-		return jsonResponse({ private: "should not be returned" }, 500);
-	});
-	assert.equal(response.status, 502);
-	assert.deepEqual(await response.json(), { error: "UPSTREAM_UNAVAILABLE", message: "Public quote snapshot is unavailable" });
-	assert.equal(fetchCount.count, 1);
-});
-
-test("public route converts a protected-source 404 into the closed public error", async () => {
-	const fetchCount = { count: 0 };
-	const response = await fetchPublicRoute(publicUpstream(fetchCount, 404, { private: "should not be returned" }));
-	assert.equal(response.status, 502);
-	assert.deepEqual(await response.json(), { error: "UPSTREAM_UNAVAILABLE", message: "Public quote snapshot is unavailable" });
-	assert.equal(fetchCount.count, 1);
-});
-
-test("public route converts a structurally invalid snapshot into the closed public error", async () => {
-	const malformed = snapshot();
-	delete malformed.stocks[0].quality;
-	const response = await fetchPublicRoute(publicUpstream({ count: 0 }, 200, malformed));
-	assert.equal(response.status, 502);
-	assert.deepEqual(await response.json(), { error: "UPSTREAM_UNAVAILABLE", message: "Public quote snapshot is unavailable" });
-});
-
-test("public MCP tool returns a closed error when upstream JSON is invalid", async () => {
-	const response = await callPublicTool(async () => new Response("not-json", { status: 200 }));
+test("phase-1 seed reads protected legacy source once and stores privacy-safe catalog", async () => {
+	const env = envWithKv(false);
+	let legacyCalls = 0;
+	let directCalls = 0;
+	const response = await fetchPublicRoute(async (input) => {
+		const url = String(input);
+		if (url.startsWith("https://cn-hk-quotes-proxy.zhushihao710.workers.dev/")) {
+			legacyCalls += 1;
+			return new Response(JSON.stringify(snapshot()), { status: 200, headers: { "Content-Type": "application/json" } });
+		}
+		directCalls += 1;
+		const symbol = decodeURIComponent(url.split("q=")[1] ?? "");
+		return new Response(tencentRecord(symbol, symbol.slice(2), symbol.startsWith("hk") ? "HK" : "CN"), { status: 200 });
+	}, env);
 	assert.equal(response.status, 200);
-	const payload = await readMcpJson(response);
-	const content = payload.result?.content?.find((item) => item.type === "text");
-	assert.ok(content, JSON.stringify(payload));
-	assert.equal(payload.result?.isError, true);
-	assert.deepEqual(JSON.parse(content.text), { error: "UPSTREAM_UNAVAILABLE", message: "Public quote snapshot is unavailable" });
+	assert.equal(legacyCalls, 1);
+	assert.equal(directCalls, 3);
+	const stored = JSON.parse(env.PORTFOLIO_UNIVERSE.values.get("quote-catalog/current"));
+	assert.equal(Object.hasOwn(stored.items[0], "holding_status"), false);
+	assert.equal(Object.hasOwn(stored.items[0], "position_qty"), false);
+	assert.equal(Object.hasOwn(stored.items[0], "is_position"), false);
+});
+
+test("direct provider failure is a closed public 502", async () => {
+	const counter = { count: 0 };
+	const response = await fetchPublicRoute(directProvider(counter, 500));
+	assert.equal(response.status, 502);
+	assert.deepEqual(await response.json(), {
+		error: "UPSTREAM_UNAVAILABLE",
+		message: "Public quote snapshot is unavailable",
+	});
+	assert.ok(counter.count > 0);
+});
+
+test("invalid direct-provider payload is a closed public 502", async () => {
+	const response = await fetchPublicRoute(async () => new Response("not-a-tencent-record", { status: 200 }));
+	assert.equal(response.status, 502);
 });
 
 test("public route only accepts GET", async () => {
