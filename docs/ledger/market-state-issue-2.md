@@ -70,6 +70,9 @@ PREOPEN 的 records 还必须含 1–2 个 Action Gate；每个 Gate 保存不�
    没有上一个 checkpoint 时，不能声称严格 Fresh-Delta。
 5. CLOSE 必须回读原始 PREOPEN Gate 和完整同日链。PREOPEN 缺失、链冲突、mapping
    version 变化或分页不完整时，Gate 结果只能 `INCONCLUSIVE`。
+6. 自然交易日结束后，可将 Issue #2 全量 comments API JSON 保存到临时文件并运行
+   `python automation/validate_holding_day.py --comments-json <file> --trade-date YYYY-MM-DD`；
+   只有输出 `HOLDING_DAY_LOOP=PASS` 才能作为 QuantPro#30 的自然日状态链验收证据。
 
 ## 硬边界
 
