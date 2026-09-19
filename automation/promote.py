@@ -12,8 +12,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -125,13 +123,6 @@ def promote(ref: str, *, apply: bool, control_path: Path = CONTROL, opener=urlli
         entry["production_ref"] = ref
     if apply:
         _atomic_write(control_path, updated)
-        if control_path.resolve() == CONTROL.resolve():
-            result = subprocess.run(
-                [sys.executable, str(ROOT / "automation" / "build_runtime_bundle.py")],
-                cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
-            )
-            if result.returncode != 0:
-                raise PromotionError("runtime bundle generation failed after control update")
     return updated
 
 
