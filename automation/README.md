@@ -22,6 +22,8 @@
 3. 运行 `python automation/promote.py --ref <40位候选SHA>`；该门禁必须从公开 raw exact-ref 通道实际读到所有将被引用的 Prompt/Guidance，并校验 Prompt 头部合同；
 4. 只有第 3 步 `PROMOTION_GATE=PASS` 后，才允许运行 `python automation/promote.py --ref <40位候选SHA> --apply` 写入 `production.json`；
 5. 单独 commit + push control 变更，并再次从公开 raw 读取 `main/automation/control/production.json` 与其中 exact refs 验证。
+6. 运行 `python automation/build_runtime_bundle.py`，把当前 production registry 的 exact refs 用 `git show <ref>:<path>` 机械编译进 `src/automation-control-bundle.generated.ts`；禁止从工作区正文替代 exact object。
+7. 提交生成 bundle 并部署 Collector Worker。Scheduled Task 生产运行只调用 Collector `get_automation_control_bundle`；公开 raw 仅保留为发布阶段验收，不再是 Automation 运行时依赖。
 
 这样 main 上尚未切生产的新 Prompt 不会被 Scheduled Task 自动采用，也不会出现 control 先指向 raw exact-ref 尚不可见内容的发布竞态。
 同一业务 Prompt 可以被多个 registry key 复用；例如持仓助手的盘中任务与盘前+收盘任务共享同一个 mode-aware Prompt，但拥有不同调度与独立 Bootstrap key。

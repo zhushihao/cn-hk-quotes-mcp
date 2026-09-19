@@ -63,6 +63,11 @@ import {
 import { ingestResearchReplicaRecord, type ResearchReplicaStorage } from "./research-replica.ts";
 import { CollectorResearchRemoteAdapter } from "./research-remote-adapter.ts";
 import { ResearchBoundaryError } from "./research-outbound-v2.ts";
+import {
+	AUTOMATION_CONTROL_BUNDLES,
+	AUTOMATION_REGISTRY_KEYS,
+	type AutomationRegistryKey,
+} from "./automation-control-bundle.generated.ts";
 
 const GITHUB_REPOSITORY = "zhushihao/quantpro-collector";
 const GITHUB_ISSUE_NUMBER = 1;
@@ -756,6 +761,23 @@ export function createServer(
 				},
 			],
 		}),
+	);
+
+	server.registerTool(
+		"get_automation_control_bundle",
+		{
+			description:
+				"读取 Collector Worker 内嵌的生产 Automation exact-ref bundle。返回 registry metadata、业务 Prompt、Automation Guidance 与 Research Guidance；运行时不访问 GitHub/Web/D1，不修改任何状态。",
+			inputSchema: z.object({
+				registry_key: z.enum(AUTOMATION_REGISTRY_KEYS),
+			}),
+		},
+		async ({ registry_key }) => {
+			const bundle = AUTOMATION_CONTROL_BUNDLES[registry_key as AutomationRegistryKey];
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify(bundle, null, 2) }],
+			};
+		},
 	);
 
 	// C7: these tools deliberately use only the Collector-owned C5 replica.
