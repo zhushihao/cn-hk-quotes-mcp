@@ -149,7 +149,7 @@ test("failed manual fetch updates Issue with the previous successful snapshot", 
 	assert.match(github.updated.body, /temporarily unavailable/);
 });
 
-test("manual and Worker/Cron paths point to the same production validator", () => {
+test("manual and Worker/Cron paths preserve the same public quote-only contract", () => {
 	const manualSource = readFileSync(
 		new URL("../scripts/manual-quote-bridge.mjs", import.meta.url),
 		"utf8",
@@ -164,8 +164,13 @@ test("manual and Worker/Cron paths point to the same production validator", () =
 		manualSource,
 		/await import\("\.\.\/src\/quote-projections\.ts"\)/,
 	);
-	assert.match(workerSource, /from ["']\.\/portfolio-validation["']/);
-	assert.match(workerSource, /validateSnapshot\(snapshot\)/);
+	assert.match(workerSource, /fetchQuoteSnapshotFromCatalog/);
+	assert.match(workerSource, /readQuoteCatalog/);
+	assert.match(workerSource, /PRIVATE_QUOTE_CATALOG_MISSING/);
+	assert.doesNotMatch(
+		workerSource,
+		/cn-hk-quotes-proxy|PORTFOLIO_QUOTES_URL|CF_ACCESS_CLIENT_ID|CF_ACCESS_CLIENT_SECRET|fetchUpstreamSnapshot/,
+	);
 	assert.match(workflowSource, /actions\/checkout@v4/);
 	assert.match(
 		workflowSource,

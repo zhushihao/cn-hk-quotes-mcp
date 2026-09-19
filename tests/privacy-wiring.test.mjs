@@ -34,13 +34,14 @@ test("anonymous get_portfolio_quotes is projected quote-only; authorized keeps f
 	assert.match(toolBody, /\{ \.\.\.displaySnapshot, control_plane_status: controlPlaneStatus \}/);
 });
 
-test("upstream fetch carries CF Access service-token headers when bindings are set", async () => {
+test("legacy proxy and CF Access runtime dependency are absent after decommission", async () => {
 	const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
-	assert.match(source, /accessHeaders\["CF-Access-Client-Id"\]/);
-	assert.match(source, /accessHeaders\["CF-Access-Client-Secret"\]/);
-	assert.match(source, /\.\.\.accessHeaders,/);
-	// 绑定未配置时不得硬卡（Access 开启前保持匿名兼容）。
-	assert.match(source, /env\?\.CF_ACCESS_CLIENT_ID && env\?\.CF_ACCESS_CLIENT_SECRET/);
+	assert.doesNotMatch(source, /cn-hk-quotes-proxy/);
+	assert.doesNotMatch(source, /PORTFOLIO_QUOTES_URL/);
+	assert.doesNotMatch(source, /CF_ACCESS_CLIENT_ID|CF_ACCESS_CLIENT_SECRET/);
+	assert.doesNotMatch(source, /fetchUpstreamSnapshot/);
+	assert.match(source, /PRIVATE_QUOTE_CATALOG_MISSING/);
+	assert.match(source, /PRIVATE_KV_DIRECT_TENCENT/);
 });
 
 test("private LIVE surface is preserved alongside the public one (dual contract)", async () => {

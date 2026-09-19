@@ -42,7 +42,7 @@ import type { QuoteSnapshot } from "./portfolio-validation";
  * LIVE 叠加门的三态判定结果。命名即语义，取值同时用于：
  *
  * - `control_plane_status.live_overlay_status`（面向调用方的降级标注）；
- * - `fetchUpstreamSnapshot()` 的 `liveOverlayStatus` 入参（是否应用叠加）；
+ * - 私有 catalog 行情入口的 `liveOverlayStatus` 入参（是否应用叠加）；
  * - 结构化日志字段 `live_overlay_status`。
  */
 export type LiveOverlayStatus =

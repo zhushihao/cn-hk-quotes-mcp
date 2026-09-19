@@ -97,8 +97,6 @@ function envWithKv(seedCatalog = true) {
 	return {
 		GITHUB_TOKEN: "test-token",
 		PORTFOLIO_UNIVERSE_TOKEN: "private-token",
-		CF_ACCESS_CLIENT_ID: "test-access-id",
-		CF_ACCESS_CLIENT_SECRET: "test-access-secret",
 		PORTFOLIO_UNIVERSE: memoryKv(seedCatalog),
 	};
 }
@@ -200,27 +198,15 @@ test("public MCP tool uses the same quote-only shape", async () => {
 	assert.equal(Object.hasOwn(body.stocks[0], "position_qty"), false);
 });
 
-test("phase-1 seed reads protected legacy source once and stores privacy-safe catalog", async () => {
+test("missing private catalog fails closed without touching any legacy source", async () => {
 	const env = envWithKv(false);
-	let legacyCalls = 0;
-	let directCalls = 0;
-	const response = await fetchPublicRoute(async (input) => {
-		const url = String(input);
-		if (url.startsWith("https://cn-hk-quotes-proxy.zhushihao710.workers.dev/")) {
-			legacyCalls += 1;
-			return new Response(JSON.stringify(snapshot()), { status: 200, headers: { "Content-Type": "application/json" } });
-		}
-		directCalls += 1;
-		const symbol = decodeURIComponent(url.split("q=")[1] ?? "");
-		return new Response(tencentRecord(symbol, symbol.slice(2), symbol.startsWith("hk") ? "HK" : "CN"), { status: 200 });
+	let calls = 0;
+	const response = await fetchPublicRoute(async () => {
+		calls += 1;
+		return new Response("", { status: 500 });
 	}, env);
-	assert.equal(response.status, 200);
-	assert.equal(legacyCalls, 1);
-	assert.equal(directCalls, 3);
-	const stored = JSON.parse(env.PORTFOLIO_UNIVERSE.values.get("quote-catalog/current"));
-	assert.equal(Object.hasOwn(stored.items[0], "holding_status"), false);
-	assert.equal(Object.hasOwn(stored.items[0], "position_qty"), false);
-	assert.equal(Object.hasOwn(stored.items[0], "is_position"), false);
+	assert.equal(response.status, 502);
+	assert.equal(calls, 0);
 });
 
 test("direct provider failure is a closed public 502", async () => {

@@ -38,9 +38,7 @@ import { getSnapshotCounts, validateSnapshot, type QuoteSnapshot } from "./portf
 import { toPublicQuoteSnapshot, type PublicQuoteSnapshot } from "./quote-projections";
 import {
 	fetchQuoteSnapshotFromCatalog,
-	quoteCatalogFromSnapshot,
 	readQuoteCatalog,
-	writeQuoteCatalog,
 	type StoredQuoteCatalog,
 } from "./quote-catalog.ts";
 import {
@@ -66,8 +64,6 @@ import { ingestResearchReplicaRecord, type ResearchReplicaStorage } from "./rese
 import { CollectorResearchRemoteAdapter } from "./research-remote-adapter.ts";
 import { ResearchBoundaryError } from "./research-outbound-v2.ts";
 
-const PORTFOLIO_QUOTES_URL =
-	"https://cn-hk-quotes-proxy.zhushihao710.workers.dev/api/portfolio-quotes";
 const GITHUB_REPOSITORY = "zhushihao/quantpro-collector";
 const GITHUB_ISSUE_NUMBER = 1;
 const GITHUB_API_VERSION = "2022-11-28";
@@ -91,9 +87,6 @@ interface Env {
 	COLLECTOR_MCP_CLIENT_ID?: string;
 	/** 空格或逗号分隔的批准 scopes；LIVE overlay 至少要求 market:read。 */
 	COLLECTOR_MCP_CLIENT_SCOPES?: string;
-	/** 受保护行情 origin（cn-hk-quotes-proxy）启用 Cloudflare Access 后注入。 */
-	CF_ACCESS_CLIENT_ID?: string;
-	CF_ACCESS_CLIENT_SECRET?: string;
 	RESEARCH_REPLICA?: D1Database;
 	RESEARCH_OBJECTS?: R2Bucket;
 	/** RESEARCH 私有 transport credential；ingest 与 receipts 共用，不与 market/research OAuth scopes 混用。 */
@@ -380,18 +373,8 @@ async function ensurePrivateQuoteCatalog(
 		throw new BridgeError("quote_catalog", "PORTFOLIO_UNIVERSE_KV_NOT_CONFIGURED");
 	}
 	const existing = await readQuoteCatalog(env.PORTFOLIO_UNIVERSE);
-	if (existing) return existing;
-
-	// #7 migration bridge: seed classification metadata exactly once from the
-	// Access-protected legacy source. quoteCatalogFromSnapshot intentionally
-	// strips runtime holding state / quantity before the catalog reaches KV.
-	const seed = await fetchUpstreamSnapshot([PORTFOLIO_QUOTES_URL], context, env);
-	const catalog = quoteCatalogFromSnapshot(seed.snapshot);
-	await writeQuoteCatalog(env.PORTFOLIO_UNIVERSE, catalog);
-	logBridgeStage(context, "quote_catalog_seeded", {
-		catalog_rows: catalog.items.length,
-	});
-	return catalog;
+	if (!existing) throw new BridgeError("quote_catalog", "PRIVATE_QUOTE_CATALOG_MISSING");
+	return existing;
 }
 
 async function fetchPrivateCatalogSnapshot(
@@ -433,161 +416,10 @@ async function fetchPrivateCatalogSnapshot(
 	return { snapshot: projectedSnapshot, source: "PRIVATE_KV_DIRECT_TENCENT" };
 }
 
-/**
- * `fetchUpstreamSnapshot()` 的 LIVE 叠加门（D-1 选项 A）。
- *
- * 缺省 `SKIPPED_UNAUTHORIZED` 是**有意的 fail-closed**：只有显式传入 `ENABLED`
- * 的调用方才可能应用 LIVE 叠加。`updateQuoteBridge()`（旧行情桥）本就不传 `env`，
- * 叠加在结构上不可能发生（见 `PORTFOLIO_SYNC.md`「与旧桥的兼容」）。
- */
+/** 私有 catalog 刷新默认不应用 LIVE overlay；只有显式 ENABLED 的调用方可叠加。 */
 type UpstreamFetchOptions = {
 	liveOverlayStatus?: LiveOverlayStatus;
 };
-
-async function fetchUpstreamSnapshot(
-	sources: string[],
-	context: BridgeStageContext,
-	env?: Env,
-	options: UpstreamFetchOptions = {},
-): Promise<UpstreamSnapshotResult> {
-	const liveOverlayStatus = options.liveOverlayStatus ?? "SKIPPED_UNAUTHORIZED";
-	let lastError: BridgeError | null = null;
-
-	for (const [index, source] of sources.entries()) {
-		logBridgeStage(context, "upstream_fetch_start", {
-			source_url: source,
-		});
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 15000);
-
-		try {
-			const separator = source.includes("?") ? "&" : "?";
-			// 受保护行情 origin（proxy）启用 Cloudflare Access 服务令牌后，
-			// 内部抓取凭 CF-Access-Client-Id/Secret 通过边（issue #7 Step 3）；
-			// 绑定未配置时保持匿名（本地 dev / Access 未开启阶段），凭据不进日志。
-			const accessHeaders: Record<string, string> = {};
-			if (env?.CF_ACCESS_CLIENT_ID && env?.CF_ACCESS_CLIENT_SECRET) {
-				accessHeaders["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
-				accessHeaders["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
-			}
-			const response = await fetch(`${source}${separator}_bridge_ts=${Date.now()}`, {
-				method: "GET",
-				headers: {
-					Accept: "application/json",
-					"Cache-Control": "no-cache",
-					"User-Agent": "cn-hk-quotes-cloudflare-bridge/1.0",
-					...accessHeaders,
-				},
-				signal: controller.signal,
-			});
-			const raw = await response.text();
-
-			if (!response.ok) {
-				throw new BridgeError(
-					"upstream_fetch",
-					`upstream request failed with HTTP ${response.status}`,
-					response.status,
-				);
-			}
-
-			let snapshot: unknown;
-			try {
-				snapshot = JSON.parse(raw);
-			} catch {
-				throw new BridgeError("upstream_fetch", "upstream returned invalid JSON");
-			}
-
-			logBridgeStage(context, "upstream_fetch_success", {
-				http_status: response.status,
-				source_url: source,
-			});
-			validateSnapshot(snapshot);
-			let projectedSnapshot = snapshot;
-			let liveUniverseHash: string | null = null;
-			let liveUniverseCoverage = "NOT_CONFIGURED";
-			let liveUniverseState: string | null = null;
-			let liveUniverseAnchor: string | null = null;
-			let liveUniverseAnchorFallback: boolean | null = null;
-			if (env?.PORTFOLIO_UNIVERSE) {
-				// D-1 选项 A（issue #15）：门未放行（匿名 / 错带 token / 服务端未配置 token）时
-				// **不读 KV、不判三态、不报错** —— 与「无 universe」同路径（legacy 目录视图），
-				// 降级原因随 `control_plane_status.live_overlay_status` 外发。
-				const live = isLiveOverlayEnabled(liveOverlayStatus)
-					? await resolveLivePresentation(env.PORTFOLIO_UNIVERSE, new Date())
-					: null;
-				// C-4：新鲜度锚已迁到状态件 LRCCA（缺失/不可读时回退 generated_at）。
-				liveUniverseState = live?.presentation.portfolio_state ?? null;
-				liveUniverseAnchor = live?.presentation.freshness_anchor ?? null;
-				liveUniverseAnchorFallback = live?.presentation.freshness_anchor_fallback ?? null;
-				liveUniverseHash = live?.universe?.content_hash ?? null;
-				const snapshotForOverlay =
-					live?.universe && live.presentation.apply_overlay
-						? await completeMissingLiveQuotes(snapshot, live.universe)
-						: snapshot;
-				const projected = projectCallerSnapshot({
-					snapshot: snapshotForOverlay,
-					liveOverlayStatus,
-					universeBound: true,
-					universe: live?.universe ?? null,
-					// C-5 / J-11：PORTFOLIO_UNKNOWN 不应用 LIVE overlay——回退静态目录，
-					// 不把旧投影当「当前持仓」用，也不报错（由 control_plane_status 标记）。
-					applyOverlay: live?.presentation.apply_overlay ?? false,
-				});
-				projectedSnapshot = projected.snapshot;
-				liveUniverseCoverage = projected.coverage;
-			}
-			const counts = getSnapshotCounts(projectedSnapshot);
-			logBridgeStage(context, "payload_validation_success", {
-				stock_count: counts.total,
-				active_quote_count: counts.activeQuoteTotal,
-				active_holding_count: counts.activeHoldingTotal,
-				watch_count: counts.watchTotal,
-				portfolio_version: projectedSnapshot.portfolio_version,
-				live_overlay_status: liveOverlayStatus,
-				live_universe_hash: liveUniverseHash,
-				live_universe_coverage: liveUniverseCoverage,
-				live_universe_state: liveUniverseState,
-				live_universe_anchor: liveUniverseAnchor,
-				live_universe_anchor_fallback: liveUniverseAnchorFallback,
-				exited_watch_count: counts.exitedWatchTotal,
-				mapping_count: counts.mappingTotal,
-				core_count: counts.coreTotal,
-				growth_count: counts.growthTotal,
-			});
-			return { snapshot: projectedSnapshot, source };
-		} catch (error) {
-			if (error instanceof LiveCoverageError) {
-				// D-1 要求 2：面向调用方的文本只出数量（error.message 已是数量文本），
-				// 逐代码明细只进服务端结构化日志。
-				logBridgeStage(context, "live_universe_coverage_incomplete", {
-					active_count: error.activeCount,
-					quoted_active_count: error.quotedActiveCount,
-					missing_active_count: error.missingCount,
-					missing_active: error.missingActive,
-				});
-				throw new BridgeError("live_universe_coverage", error.message);
-			}
-			lastError =
-				error instanceof BridgeError
-					? error
-					: new BridgeError("upstream_fetch", safeErrorMessage(error));
-			const canRetryWithNextSource =
-				lastError.httpStatus === 404 && index < sources.length - 1;
-			if (!canRetryWithNextSource) {
-				throw lastError;
-			}
-			logBridgeStage(context, "upstream_fetch_retry", {
-				failed_source_url: source,
-				http_status: lastError.httpStatus,
-				next_source_url: sources[index + 1],
-			});
-		} finally {
-			clearTimeout(timer);
-		}
-	}
-
-	throw lastError ?? new BridgeError("upstream_fetch", "no upstream source configured");
-}
 
 async function fetchPublicQuoteSnapshot(
 	context: BridgeStageContext,
@@ -670,7 +502,7 @@ export async function updateQuoteBridge(
 				last_success_at: previous.lastSuccessAt,
 				workflow_run_id: workflowRunId,
 				workflow_run_attempt: workflowRunAttempt,
-				source: PORTFOLIO_QUOTES_URL,
+				source: "PRIVATE_KV_DIRECT_TENCENT",
 				error: `${upstreamError.name}: ${upstreamError.message}`,
 			},
 			// 失败回退的历史快照同样投影，防止把身份字段重新写回公开 issue。
