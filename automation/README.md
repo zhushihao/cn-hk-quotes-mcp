@@ -5,7 +5,7 @@
 - `control/production.json`：当前生产注册表，按 Scheduled Task 的固定 `REGISTRY_KEY` 记录 Prompt 路径、exact `production_ref`、`WRITE_SCOPE` 与 Guidance 路径。
 - `prompts/*.md`：唯一可执行的业务 Prompt。
 - `../automation_guidance/` / `../research_guidance/`：只补充方法、复盘、判断标准与专项规则；不得覆盖 Prompt、安全边界、WRITE_SCOPE、工具权限、Research Job 协议或调度。
-- `bootstrap-template.md`：Scheduled Task 唯一允许保留的薄 Bootstrap 模板；任务本身不得承载业务规则。
+- `bootstrap-template.md`：Scheduled Task 唯一允许保留的薄 Bootstrap 模板；任务本身不得承载业务规则，但必须静态声明运行时 connector 依赖。所有生产任务预声明 `QuantPro Collector`，holding-assistant 另外预声明 `GitHub`，避免调度器在远程 Prompt 加载后才发现工具依赖。
 
 ## 读取合同
 
