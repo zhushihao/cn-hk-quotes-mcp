@@ -468,6 +468,29 @@ const PYTHON_FLOAT_PATHS = new Set([
 	"volume_price_structure.pullback_volume_ratio_5d",
 ]);
 
+/**
+ * Match CPython's JSON spelling for the explicitly typed Python float paths.
+ *
+ * Both runtimes use shortest-roundtrip digits, but their presentation rules
+ * differ: Python keeps ``.0`` on integral floats and switches to scientific
+ * notation when the decimal exponent is below -4 or at least 16.  JavaScript
+ * drops ``.0`` and keeps values such as 1e-5 in fixed notation.  Since the
+ * spelling participates in the immutable message id, the consumer restores
+ * Python's representation only on this closed path whitelist.
+ */
+function pythonFloatJson(value: number): string {
+	if (Object.is(value, -0)) return "-0.0";
+	const absolute = Math.abs(value);
+	if (absolute !== 0 && (absolute < 1e-4 || absolute >= 1e16)) {
+		const [mantissa, rawExponent] = value.toExponential().split("e");
+		const exponent = Number(rawExponent);
+		const sign = exponent < 0 ? "-" : "+";
+		return `${mantissa}e${sign}${Math.abs(exponent).toString().padStart(2, "0")}`;
+	}
+	if (Number.isInteger(value)) return `${value}.0`;
+	return JSON.stringify(value);
+}
+
 function canonicalJson(value: unknown, path: readonly string[] = []): string {
 	if (Array.isArray(value))
 		return `[${value.map((item) => canonicalJson(item, path)).join(",")}]`;
@@ -477,12 +500,8 @@ function canonicalJson(value: unknown, path: readonly string[] = []): string {
 			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key], [...path, key])}`)
 			.join(",")}}`;
 	}
-	if (
-		typeof value === "number" &&
-		Number.isInteger(value) &&
-		PYTHON_FLOAT_PATHS.has(path.join("."))
-	) {
-		return `${value}.0`;
+	if (typeof value === "number" && PYTHON_FLOAT_PATHS.has(path.join("."))) {
+		return pythonFloatJson(value);
 	}
 	return JSON.stringify(value);
 }
@@ -596,14 +615,24 @@ function validateMarketSignalPayload(payload: Record<string, unknown>): void {
 	for (const key of ["snapshot_hash", "snapshot_as_of"]) if (payload.source[key] !== null && typeof payload.source[key] !== "string") fail("INTEGRITY_FAILED");
 	for (const key of MARKET_SIGNAL_QUALITY_KEYS) if (typeof payload.quality[key] !== "number" || !Number.isInteger(payload.quality[key]) || payload.quality[key] < 0) fail("INTEGRITY_FAILED");
 	const relative = payload.relative_strength as Record<string, Record<string, unknown>>;
+	if (!isRecord(relative.primary_pct_points) || !isRecord(relative.secondary_pct_points)) {
+		fail("INTEGRITY_FAILED");
+	}
+	const legacyNoBenchmark = payload.status === "NO_VALID_BENCHMARK";
 	for (const window of ["1D", "3D", "5D", "10D"]) {
 		const value = payload.returns[window];
 		if (!isRecord(value)) fail("INTEGRITY_FAILED");
 		exactKeys(value, MARKET_SIGNAL_RETURN_KEYS);
 		if (typeof value.window_complete !== "boolean" || typeof value.valid_trading_days !== "number" || !Number.isInteger(value.valid_trading_days) || value.valid_trading_days < 0) fail("INTEGRITY_FAILED");
 		for (const key of ["subject_return", "primary_benchmark_return", "secondary_benchmark_return"]) finiteOrNull(value[key]);
-		finiteOrNull(relative.primary_pct_points?.[window]);
-		finiteOrNull(relative.secondary_pct_points?.[window]);
+		const primaryRelative = relative.primary_pct_points[window];
+		const secondaryRelative = relative.secondary_pct_points[window];
+		// Early v1 NO_VALID_BENCHMARK records used empty relative maps.  The
+		// current producer emits explicit nulls for all four windows, but those
+		// historical immutable messages remain semantically equivalent.  Keep
+		// this compatibility limited to the no-benchmark downgrade state.
+		if (!(legacyNoBenchmark && primaryRelative === undefined)) finiteOrNull(primaryRelative);
+		if (!(legacyNoBenchmark && secondaryRelative === undefined)) finiteOrNull(secondaryRelative);
 	}
 	for (const key of ["up_volume_ratio_5d", "pullback_volume_ratio_5d"]) finiteOrNull(payload.volume_price_structure[key]);
 	for (const key of ["volume_up", "pullback_volume_contraction"]) if (payload.volume_price_structure[key] !== null && typeof payload.volume_price_structure[key] !== "boolean") fail("INTEGRITY_FAILED");

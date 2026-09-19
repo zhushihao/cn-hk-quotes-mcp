@@ -190,6 +190,40 @@ test("C5 preserves Python market-signal 0.0 and 1.0 spellings in the message id"
 	await assert.doesNotReject(() => outbound.verifyOutboundV2Record(record));
 });
 
+test("C5 preserves Python market-signal scientific notation in the message id", async () => {
+	const record = await marketSignalRecord("market:canonical-scientific.SZ");
+	record.payload.mapping_id = "canonical-scientific-v1";
+	record.payload.returns["5D"].subject_return = 1.0000100000961964e-5;
+	// This id was independently computed with Python json.dumps(sort_keys=True,
+	// separators=(",", ":")); JS JSON.stringify would expand the number to
+	// 0.000010000100000961964 and therefore produce a different immutable id.
+	record.message_id = "outbound_461811327524e95c7f8ce11dd364488e6e073e3f";
+	const computed = await outbound.computeOutboundV2MessageId(record);
+	assert.equal(computed, record.message_id);
+	await assert.doesNotReject(() => outbound.verifyOutboundV2Record(record));
+});
+
+test("C5 accepts legacy NO_VALID_BENCHMARK records with empty relative maps only", async () => {
+	const legacy = await marketSignalRecord("market:legacy-no-benchmark.SZ");
+	legacy.payload.status = "NO_VALID_BENCHMARK";
+	legacy.payload.benchmark_mapping_version = null;
+	legacy.payload.mapping_id = null;
+	legacy.payload.primary_benchmark = null;
+	legacy.payload.secondary_benchmark = null;
+	for (const window of ["1D", "3D", "5D", "10D"]) {
+		legacy.payload.returns[window].primary_benchmark_return = null;
+		legacy.payload.returns[window].secondary_benchmark_return = null;
+	}
+	legacy.payload.relative_strength = { primary_pct_points: {}, secondary_pct_points: {} };
+	legacy.message_id = await outbound.computeOutboundV2MessageId(legacy);
+	await assert.doesNotReject(() => outbound.verifyOutboundV2Record(legacy));
+
+	const strict = structuredClone(legacy);
+	strict.payload.status = "READY";
+	strict.message_id = await outbound.computeOutboundV2MessageId(strict);
+	await assert.rejects(() => outbound.verifyOutboundV2Record(strict));
+});
+
 test("C5 stores path-free metadata, document links, and an immutable recovery journal", async () => {
 	const store = storage();
 	const document = (await fixture("metadata_document_version.public.json"))[0];
