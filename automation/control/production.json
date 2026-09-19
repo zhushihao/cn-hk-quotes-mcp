@@ -1,41 +1,77 @@
 {
-  "schema_version": "quantpro-automation-control-v1",
+  "schema_version": "quantpro-automation-control-v2",
   "status": "PRODUCTION",
   "repository": "zhushihao/quantpro-collector",
-  "migrated_from": {
-    "repository": "zhushihao/QuantPro",
-    "issue": 28,
-    "production_ref": "b70000520052b8e6595a72cd0702e402500fe9d2"
-  },
+  "content_ref": "adde0cb5f275d1f43654a1d0d0423b8674e9d7fe",
   "registry": {
-    "holding-assistant": {
+    "holding-assistant-intraday": {
+      "prompt_id": "holding-assistant",
       "path": "automation/prompts/holding-assistant.md",
-      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
+      "production_ref": "adde0cb5f275d1f43654a1d0d0423b8674e9d7fe",
       "write_scope": "READ_ONLY",
-      "schedule": "工作日 09:10 / 09:50 / 10:50 / 11:50 / 13:50 / 14:50 / 16:45"
+      "mode": "INTRADAY",
+      "automation_guidance": [
+        "automation_guidance/holding-assistant/mode-discipline.md"
+      ],
+      "research_guidance": [],
+      "schedule": "工作日 09:50 / 10:50 / 11:50 / 13:50 / 14:50"
+    },
+    "holding-assistant-preclose": {
+      "prompt_id": "holding-assistant",
+      "path": "automation/prompts/holding-assistant.md",
+      "production_ref": "adde0cb5f275d1f43654a1d0d0423b8674e9d7fe",
+      "write_scope": "READ_ONLY",
+      "mode": "PREOPEN_CLOSE",
+      "automation_guidance": [
+        "automation_guidance/holding-assistant/mode-discipline.md"
+      ],
+      "research_guidance": [],
+      "schedule": "工作日 09:10 / 16:45"
     },
     "industry-research": {
+      "prompt_id": "industry-research",
       "path": "automation/prompts/industry-research.md",
-      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
+      "production_ref": "adde0cb5f275d1f43654a1d0d0423b8674e9d7fe",
       "write_scope": "RESEARCH_JOB_ONLY",
+      "automation_guidance": [
+        "automation_guidance/industry-research/system-bom-fresh-delta.md"
+      ],
+      "research_guidance": [
+        "research_guidance/industry-research/fresh-delta-event-time.md"
+      ],
       "schedule": "每小时 :25"
     },
     "company-facts": {
+      "prompt_id": "company-facts",
       "path": "automation/prompts/company-facts.md",
-      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
+      "production_ref": "adde0cb5f275d1f43654a1d0d0423b8674e9d7fe",
       "write_scope": "READ_ONLY",
+      "automation_guidance": [
+        "automation_guidance/company-facts/capital-action-milestones.md"
+      ],
+      "research_guidance": [],
       "schedule": "每小时"
     },
     "central-policy": {
+      "prompt_id": "central-policy",
       "path": "automation/prompts/central-policy.md",
-      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
+      "production_ref": "adde0cb5f275d1f43654a1d0d0423b8674e9d7fe",
       "write_scope": "READ_ONLY",
+      "automation_guidance": [
+        "automation_guidance/central-policy/authority-narrative-fresh-delta.md"
+      ],
+      "research_guidance": [],
       "schedule": "每小时"
     },
     "ai-financing-rates": {
+      "prompt_id": "ai-financing-rates",
       "path": "automation/prompts/ai-financing-rates.md",
-      "production_ref": "7e03b519a409720072b5332cb2dcbcc4543a8d49",
+      "production_ref": "adde0cb5f275d1f43654a1d0d0423b8674e9d7fe",
       "write_scope": "READ_ONLY",
+      "automation_guidance": [
+        "automation_guidance/ai-financing-rates/causal-discipline.md"
+      ],
+      "research_guidance": [],
       "schedule": "每 4 小时"
     }
   }
